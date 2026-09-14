@@ -1,0 +1,6 @@
+/dist/
+/obj/
+*.o
+/scratch/
+tools/atomic_probe
+tools/getfb

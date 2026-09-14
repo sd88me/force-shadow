@@ -1,0 +1,186 @@
+# force-shadow — a real on-device "shadow mode" GUI for addons on the Akai Force
+
+## Goal
+
+Let an addon take over the Force's own physical touchscreen with its own
+custom-rendered GUI — a button combo (e.g. an unused `SHIFT+<pad>` shortcut,
+via MidiLoop) toggles into "shadow mode" showing the addon's controls
+(knobs, a maze/acid-specific layout, etc.), and toggles back to MPC's own
+UI on a second press. The Move-hardware equivalent is Ableton's Schwung
+shadow-display API; the Force has no such official mechanism, so this is
+original R&D, not a port of anything.
+
+**Status as of 2026-09-14: scoping/feasibility research only, no code
+written yet.** This document records what's been confirmed live on real
+hardware, the exact numbers a real implementation needs, and the discovery
+methodology — before committing to actually writing the interposer.
+
+## Why this needs the same class of technique as `force-audioin`
+
+Confirmed live (see `~/.claude/skills/mockbamod-module-creator`'s
+`references/audio-injection.md` and
+[`force-audioin`](https://github.com/sd88me/force-audioin)'s own
+`DESIGN.md` for the audio side of this): the Force's main app
+(`/usr/bin/MPC`, a JUCE binary) does NOT run inside any compositor — there
+is no Xorg, no Wayland, nothing. It is the sole process holding
+`/dev/dri/card0` open, doing direct DRM/KMS scanout. A second process
+cannot page-flip a competing buffer through the normal DRM API while MPC
+holds mode-setting control — the only seam is interposing the exact
+library call MPC itself uses to submit frames, **inside MPC's own
+process**, the same way `forceAudioIn.so` interposes `snd_pcm_readi`
+rather than fighting ALSA for the audio device from outside.
+
+## Confirmed, live on real hardware (2026-09-14)
+
+| Question | Answer | How confirmed |
+|---|---|---|
+| Which call submits frames? | `DRM_IOCTL_MODE_ATOMIC` (`drmModeAtomicCommit()` in libdrm) | `strace -f -p <MPC pid> -e trace=ioctl` — **100%** of all `/dev/dri/card0` ioctls across two independent multi-second captures were this exact request code, no other DRM ioctl ever appeared |
+| Real panel resolution | **800×1280** (portrait) | Decoded from a live `drm_mode_atomic` struct's `SRC_W`/`SRC_H`/`CRTC_W`/`CRTC_H` property values, cross-confirmed by a completely independent `DRM_IOCTL_MODE_GETFB` query — both agree exactly. (The `800×3840` reported by `/sys/class/graphics/fb0/virtual_size` is stale/wrong — that legacy `rockchipdrmfb` fbdev-compat node is orphaned once MPC takes over KMS itself; confirmed separately by writing test bytes to `/dev/fb0` live and observing zero effect on the physical screen.) |
+| Primary plane object | `0x21` (33) | Only object in the atomic commit with 10 properties (the others have 1-2, consistent with CRTC/connector) |
+| `FB_ID` property | property `#17` on object `0x21`, live value **50** | Value matched exactly against an independent `DRM_IOCTL_MODE_GETFB fb_id=50` query (width/height/format all agreed) |
+| `CRTC_ID` property | property `#20`, live value **37** | Object `0x25` (the CRTC, inferred from its own `ACTIVE=1`/`MODE_ID=48` properties) and object `0x2b` (the connector) both reference `37` via their own `CRTC_ID` |
+| Buffer format | 800×1280, 32bpp, pitch **3200 bytes/row**, depth 24 → **XRGB8888** | `DRM_IOCTL_MODE_GETFB` response |
+| Commit cadence (idle screen) | ~5/sec | Counted over a bounded multi-second capture |
+
+**Property IDs are driver/kernel-assigned at runtime, not a stable UAPI
+constant** — `#17`/`#20` are what this exact kernel/driver build handed out
+on this boot, not a portable constant. A real implementation should walk
+`DRM_IOCTL_MODE_OBJ_GETPROPERTIES` + `DRM_IOCTL_MODE_GETPROPERTY` once at
+load time to resolve `"FB_ID"`/`"CRTC_ID"` by *name* to whatever IDs this
+particular boot assigned, rather than hardcoding `17`/`20`.
+
+## Discovery methodology (reusable — re-run this if the kernel/driver ever changes)
+
+1. **`ps`/`ls /dev/dri`/`/proc/<pid>/fd`** — established MPC is the sole
+   holder of `/dev/dri/card0`, no compositor exists anywhere on the device.
+2. **`strace -f -p <MPC pid> -e trace=ioctl`**, bounded to a few seconds via
+   background+`sleep`+`kill` (this BusyBox userland has no `timeout`
+   applet) — found every `card0` ioctl request code. `strace 4.10` (what's
+   on-device) can't decode DRM ioctl argument *structs*, only the raw
+   request code, so this only gets you "which call," not "what's in it."
+3. **First attempt at reading struct contents, `/proc/<pid>/mem` well after
+   the fact via `dd`: unreliable.** MPC's main thread issues thousands of
+   syscalls/sec; even a ~0.3s gap between the traced call and the read let
+   the same stack slot get overwritten by unrelated later frames. Don't
+   trust this — the values looked plausible-ish (small numbers) but were
+   actually garbage (a `count_objs` in the billions).
+4. **Real fix: catch the syscall synchronously.** No `gdb` on-device, and
+   the on-device Python's `ctypes` module is missing (`_ctypes.so` was
+   never built into this Python distribution, confirmed — `libffi` itself
+   *is* present, just not CPython's binding to it), and there's no Perl
+   either. Cross-compiled a small C tool (`tools/atomic_probe.c`) using
+   this project's existing Docker+QEMU armhf toolchain (same
+   `arm32v7/debian:stretch` image `force-maze`/`force-acid` already use) —
+   raw `PTRACE_ATTACH` + `PTRACE_SYSCALL` single-stepping, stopping exactly
+   at the `ioctl` syscall entry (register `r7`=54=`__NR_ioctl` on ARM EABI,
+   `r0`=fd, `r1`=request, `r2`=pointer), reading `/proc/<pid>/mem` **while
+   the tracee is genuinely ptrace-stopped** — no race, since it can't run
+   again until the tracer calls `ptrace()` again.
+   - **First version had a real bug**: used buffered `fopen()`+`fseek()`+
+     `fread()` on `/proc/<pid>/mem`. `fseek()`'s offset is a signed `long`;
+     a userspace stack address like `0xbefff3b0` is `>0x7fffffff`, so it
+     silently wraps negative, the seek silently no-ops, and `fread()`
+     serves whatever was already sitting in stdio's internal buffer.
+     Produced exactly the kind of "looks plausible at first, then garbage"
+     output that's easy to misdiagnose. **Fix: `pread(fd, buf, n, off)`
+     with an explicit, unsigned 64-bit offset and every return value
+     checked** — no shared buffering state, no sign issues.
+   - Hard-capped at a wall-clock deadline (not just an iteration count) and
+     wrapped in `try`/`finally`-equivalent cleanup (always `PTRACE_DETACH`,
+     even on an early-exit path) so a bug in the probe can't leave MPC
+     permanently frozen.
+5. **Independent cross-check**: a completely separate, ordinary read-only
+   `DRM_IOCTL_MODE_GETFB` query (`tools/getfb.c`) against the `FB_ID` value
+   the probe found — agreed exactly on width/height with what the atomic
+   struct's `SRC_W`/`SRC_H` said. Two independent methods landing on the
+   same numbers is real confirmation, not coincidence.
+
+**Operational notes from doing this live**, worth remembering before
+re-running any of it:
+- `strace -f -p <pid>` (following all threads) attaches/detaches cleanly
+  and fast (compiled binary, minimal per-stop overhead) — safe to use
+  freely for short bounded captures.
+- The custom Python/C single-step probe is **much slower per syscall**
+  than `strace` itself (interpreted/simple-compiled single-step loop vs.
+  `strace`'s own optimized internals) — MPC's traced thread visibly runs
+  in slow motion for the whole capture window. Expect a real, if brief,
+  touch/audio stutter each time this runs. Always keep the wall-clock cap
+  tight (this project used 4s).
+- MPC's PID is **not stable across `acvs` restarts** (observed 3 different
+  PIDs across one research session) — always re-check `ps` immediately
+  before pointing a tool at a specific PID.
+- Auto-mode permission classifiers reasonably flag both raw device-file
+  writes (the `/dev/fb0` test) and live `ptrace` attach as needing explicit
+  human approval — this is correct, not a bug to route around; hand the
+  exact command to a human to run directly when blocked.
+
+## What a real interposer would need to do
+
+Runs as an `LD_PRELOAD`'d `.so` inside MPC's own process (like
+`forceAudioIn.so`) — **no ptrace needed in the real implementation**; that
+machinery above was purely an outside-looking-in research technique. Once
+code is loaded into MPC's own address space via `dlsym(RTLD_NEXT,
+"drmModeAtomicCommit")`, it has ordinary, direct access to whatever struct
+MPC's own code passes it.
+
+1. **At load** (library constructor): open `/dev/dri/card0` (already open
+   by MPC; the interposer can just reuse MPC's own fd, or open its own),
+   resolve `FB_ID`/`CRTC_ID` property IDs by name via
+   `DRM_IOCTL_MODE_OBJ_GETPROPERTIES`+`DRM_IOCTL_MODE_GETPROPERTY` (don't
+   hardcode `17`/`20` — see above), and create one reusable 800×1280
+   XRGB8888 dumb buffer (`drmModeCreateDumbBuffer` + `drmModeAddFB2`) sized
+   to exactly match the confirmed live format.
+2. **On the interposed `drmModeAtomicCommit()` call**: while shadow mode is
+   toggled off, pass straight through unmodified (fail-closed, same
+   principle as `forceAudioIn.so`'s "zero voices" baseline). While toggled
+   on, rewrite the `FB_ID` property's value in the request (found by
+   matching the plane object + property ID resolved at load time) to point
+   at the addon's own buffer before letting the real ioctl through — reuses
+   MPC's own already-correct CRTC/plane/mode state, just redirects which
+   buffer gets scanned out.
+3. **Rendering into the buffer**: no EGL/GBM symbols were seen loaded in
+   MPC's own process, consistent with plain dumb-buffer KMS — so this is
+   software rasterization into a raw 3200-byte-stride XRGB8888 buffer, not
+   GPU-composited rendering.
+4. **Touch input while in shadow mode**: `DrmVncServer` (already installed
+   on this device) proves reading `/dev/input/<touchscreen-event>` directly
+   works safely alongside MPC. The interposer's own control logic would
+   need to read that same input device — and probably `EVIOCGRAB` it while
+   shadow mode is active, so MPC's own (now-hidden) UI doesn't also react
+   to the same touches underneath.
+5. **Toggle mechanism**: a MidiLoop button-combo shortcut (already a proven
+   pattern — see its own docs for the `SHIFT+LAUNCH-1`-style example)
+   flips a shared flag (e.g. a byte in a small `shm_open`'d region, same
+   general pattern as `forceAudioInject.h`'s ring) that the interposer
+   checks on every commit.
+
+## Risk, carried forward from `force-audioin`'s own hard-won lessons
+
+- **Toggle-off must be unconditionally reliable.** `force-audioin`'s own
+  incident history (still-unresolved "pads dead" bug) is a reminder that
+  anything touching MPC's rendering/input path can interact with this
+  device in ways that are hard to predict and hard to debug blind. A video
+  interposer that gets stuck "on" (or crashes mid-substitution) means a
+  hung or garbage screen with no independent recovery path — worse than
+  any audio failure mode, since it's the one process controlling the
+  entire visible UI.
+- **Fail closed on every error path**, exactly like `forceAudioIn.so`: any
+  unexpected condition (buffer alloc failure, unexpected atomic request
+  shape, property-resolution failure at load) should mean "pass through
+  unmodified," never "substitute anyway and hope."
+- **Never restart `acvs` while shadow mode could be active** — same hard
+  rule `force-audioin` already established for voice attachment, likely
+  applies here too (unconfirmed, but the underlying "something about this
+  device doesn't like `acvs` restarts under certain LD_PRELOAD states"
+  pattern is exactly why this rule exists there).
+
+## Not yet done
+
+- Writing any of the actual interposer code (`.so`, constructor,
+  hook implementation) — this document is scoping only.
+- Confirming property-ID *name* resolution actually works as described
+  (steps above are based on standard DRM UAPI behavior, not yet tested
+  live on this device).
+- Confirming a software-rasterized buffer swap doesn't itself trigger the
+  same class of "restart-adjacent" instability `force-audioin` hit.
+- Touch-input grab/routing design and MidiLoop combo wiring.
