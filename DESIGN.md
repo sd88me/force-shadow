@@ -208,6 +208,64 @@ need to replicate that landscape-then-rotate pipeline at all — it can
 render directly into an 800×1280 portrait buffer (the format already
 confirmed via `GETFB`) and hand that straight to the swapped `FB_ID`.
 
+## RESUME HERE (2026-09-14): next step is a live load test, not yet done
+
+`src/force_shadow.c` / `dist/force_shadow.so` exist and are built
+(pass-through-only: hooks libc `ioctl()`, filters
+`DRM_IOCTL_MODE_ATOMIC`, logs a throttled heartbeat to
+`/tmp/force_shadow.log`, always calls the real `ioctl()` unmodified —
+changes nothing about what's displayed). **It has never been loaded onto
+the live device.** That's the next step, and it's the single riskiest
+thing attempted in this project so far — read this whole section before
+doing it.
+
+**The plan, agreed but not yet executed:**
+1. Push `dist/force_shadow.so` to `/tmp/force_shadow.so` on the device (no
+   `AddOns/` install, no boot script — a pure one-off test with zero
+   persistent footprint).
+2. Current live `LD_PRELOAD` state (confirmed 2026-09-14): the file is
+   `/dev/shm/.LD_PRELOAD` (get the exact path via `cat /dev/shm/.mmPath`
+   then `. $mmPath/MockbaMod/env.sh; echo $mmLD_PRELOAD_VAR` — it can
+   differ by device/mount). Its content right now:
+   ```
+   /media/662522/AddOns/ForceAudioIn/forceAudioIn.so /media/662522/AddOns/mockbaMagic/mockbaMagic.so /media/662522/AddOns/MidiLoop/tkgl_anyctrl_lt.so
+   ```
+   Manually rewrite it to prepend ours, keeping the existing three in
+   their original order (load order has mattered before — don't reshuffle
+   them):
+   ```
+   /tmp/force_shadow.so /media/662522/AddOns/ForceAudioIn/forceAudioIn.so /media/662522/AddOns/mockbaMagic/mockbaMagic.so /media/662522/AddOns/MidiLoop/tkgl_anyctrl_lt.so
+   ```
+3. `systemctl restart acvs` — **the genuinely risky step.** This exact
+   action, combined with certain already-loaded `LD_PRELOAD` libraries, is
+   what `force-audioin`'s own still-unresolved incident history is about.
+   We're now adding a brand-new, never-loaded-before library into that
+   same mix.
+4. Verify: find the new MPC PID (`ps | grep -i mpc` — it changes on every
+   restart, don't assume the old one), confirm `force_shadow.so` shows up
+   in `/proc/<pid>/maps`, tail `/tmp/force_shadow.log` for the heartbeat
+   lines (proves the interposition is actively seeing real commits), and —
+   most important — **physically check pads/buttons/touchscreen/audio
+   all still respond normally** on the device itself. This can't be
+   verified remotely; matches this project's own established "verify
+   live" convention for exactly this class of change.
+
+**Why the risk is real but bounded, and the recovery plan:**
+`/dev/shm/.LD_PRELOAD` lives in RAM (`tmpfs`), and step 2 above is a
+one-off manual edit, not a persistent boot-time addon script (no
+`AddOns/ForceShadow/run_*.sh` was created). That means:
+- **Fast recovery** (SSH still reachable): rewrite the file back to just
+  the original three libraries, `systemctl restart acvs` again.
+- **Guaranteed recovery** (SSH unreachable / device unresponsive): a
+  plain power cycle. Since `force_shadow.so` was never written into any
+  boot script, a fresh boot reconstructs `/dev/shm/.LD_PRELOAD` with only
+  the original three — automatically, no manual cleanup needed. Worst
+  case is "needs a power cycle," not "needs the SD card reflashed."
+
+**Do not skip the physical device check in step 4** before considering
+this test a pass, even if the log/maps checks look clean — that's exactly
+the gap that hid `force-audioin`'s own incident for a while.
+
 ## Not yet done
 
 - Writing any of the actual interposer code (`.so`, constructor,
