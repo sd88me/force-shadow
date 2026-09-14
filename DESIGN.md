@@ -174,6 +174,40 @@ MPC's own code passes it.
   device doesn't like `acvs` restarts under certain LD_PRELOAD states"
   pattern is exactly why this rule exists there).
 
+## Confirmed, live on real hardware (2026-09-14, part 2): touch grab is safe
+
+Tested `EVIOCGRAB` (`tools/grab_test.c`) on `/dev/input/event0` (`ILI2116
+Touchscreen`, confirmed via `/proc/bus/input/devices`) while MPC was
+running normally:
+
+- Grab acquired without error; **440 real multi-touch events** (tracking
+  IDs, `ABS_MT_POSITION_X/Y`, `BTN_TOUCH`) were received by the grabbing
+  process during an 8-second window of deliberate physical touching/
+  swiping — confirming exclusive ownership actually worked, not just that
+  the ioctl returned success.
+- **User-observed**: the touchscreen stopped responding to MPC's own UI
+  during the grab (expected — that's the mechanism working), and **came
+  back to normal immediately** once the grab released.
+- Grab released cleanly (`EVIOCGRAB(fd, 0)` succeeded); MPC's PID was
+  confirmed unchanged (no crash/restart) and `dmesg` showed nothing
+  unusual around the test window.
+- **This de-risks the touch-routing half of shadow mode significantly** —
+  unlike the video-interposer path (still genuinely untested), grabbing
+  input away from MPC during shadow mode now has a real, clean, live pass
+  on this exact hardware, not just "should work based on how evdev is
+  documented to behave."
+
+**Bonus finding while checking `dmesg` for side effects**: confirms the
+`rockchip-rga` (Rockchip 2D graphics/rotation engine) is doing a live 90°
+rotation as part of MPC's own render pipeline — `[CAPTURE] 800x1280
+(stride 3200)` ↔ `[OUTPUT] 1280x800 (stride 5120)`. This explains why
+`DrmVncServer` passes `-r 90`: MPC composes its UI in landscape (1280×800)
+internally, then RGA rotates it into the panel's actual portrait mounting
+before the DRM commit. **Useful simplification**: the interposer doesn't
+need to replicate that landscape-then-rotate pipeline at all — it can
+render directly into an 800×1280 portrait buffer (the format already
+confirmed via `GETFB`) and hand that straight to the swapped `FB_ID`.
+
 ## Not yet done
 
 - Writing any of the actual interposer code (`.so`, constructor,
@@ -182,5 +216,7 @@ MPC's own code passes it.
   (steps above are based on standard DRM UAPI behavior, not yet tested
   live on this device).
 - Confirming a software-rasterized buffer swap doesn't itself trigger the
-  same class of "restart-adjacent" instability `force-audioin` hit.
-- Touch-input grab/routing design and MidiLoop combo wiring.
+  same class of "restart-adjacent" instability `force-audioin` hit — this
+  is now the single biggest remaining unknown, since touch-grab (the other
+  major open question) is now confirmed safe.
+- MidiLoop combo wiring to actually toggle the shared flag.
