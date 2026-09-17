@@ -567,15 +567,54 @@ touch-grab section above), and the MidiLoop toggle wiring — is normal
 feature engineering on a now fully-proven mechanism, not open feasibility
 risk.
 
+## Step 3 build (2026-09-18, compiled offline, not yet loaded live): touch takeover
+
+`src/force_shadow.c` now also ties `EVIOCGRAB` of the touchscreen
+(`/dev/input/event0`, confirmed live as the "ILI2116 Touchscreen") to the
+same `shadow_on` flag as the buffer substitution, reusing the exact
+technique `tools/grab_test.c` already proved safe in isolation
+(see "touch grab is safe" above):
+
+- A dedicated background thread (started once from the constructor,
+  detached) sleeps while shadow mode is off, opens and grabs the
+  touchscreen the moment it turns on, and releases it the moment it turns
+  off — checked every 100ms via `poll()`'s timeout, so release is prompt
+  even with no incoming touch events, and it never blocks the DRM commit
+  path since it's on its own thread.
+- While grabbed, reads real touch events (`EV_ABS`/`EV_KEY`) and tracks
+  the latest x/y/down state in a small mutex-protected struct, for future
+  use by real rendering/hit-testing (not yet wired to anything — step 4).
+  Logs a throttled sample of raw events plus the acquire/release moments
+  themselves, numbered per grab session, so a live test can confirm grab
+  timing lines up with the toggle.
+- **Fails safe, never blocks the render path**: any failure to open or
+  grab the device just skips touch takeover for that on-cycle — shadow
+  mode's buffer substitution still works normally, it just won't hide
+  touches from MPC underneath that cycle. No new library dependency
+  (`<linux/input.h>` is header-only kernel UAPI, same class of local
+  struct/constant reliance as the DRM structs above).
+- Compiled clean (`-Wall -Wextra`, no warnings), `readelf` confirms both
+  `ioctl`/`__ioctl_time64` still resolve correctly and dependencies are
+  unchanged (`libc`/`libpthread`/`libdl` only — no new linked library).
+  **Not yet tested live.**
+
 ## Not yet done
 
+- **Live-test the step 3 build**: staged as before — load with the toggle
+  off first (should behave identically to step 2's confirmed-safe
+  behavior; the touch thread should just sleep harmlessly), confirm clean
+  logs and no crash loop, then toggle on and confirm both the magenta
+  screen (already proven) AND the touch grab log lines appear, and that a
+  touch during shadow mode does not reach MPC's hidden UI underneath, then
+  toggle off and confirm both revert (screen back to normal AND touch grab
+  released) together, promptly. Not yet attempted.
 - Real rendering into the shadow buffer (software rasterization of an
-  addon's actual UI) in place of the solid magenta test color.
-- `EVIOCGRAB`-ing the touchscreen input device while shadow mode is on, so
-  MPC's own (now-hidden) UI doesn't also react to the same touches
-  underneath (independently confirmed safe as its own mechanism — see
-  "touch grab is safe" above — but not yet wired together with shadow
-  mode).
+  addon's actual UI, using the tracked touch x/y/down state above for hit-
+  testing) in place of the solid magenta test color. Initial target: a
+  mockup page with a few controls for Maze voice, borrowing MPC's own
+  design language (page layout, knob sizing conventions) rather than
+  inventing a new visual style from scratch — a fuller design-language
+  pass comes once this initial mockup is in place.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.

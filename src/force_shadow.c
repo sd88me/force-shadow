@@ -48,6 +48,16 @@
  * live. While the file doesn't exist, or shadow_ready is false (setup
  * failed), behavior is identical to step 1: always pass straight through,
  * unmodified, no exceptions.
+ *
+ * Step 3: also EVIOCGRAB's the touchscreen (/dev/input/event0, confirmed
+ * live as the "ILI2116 Touchscreen" -- see DESIGN.md's "touch grab is
+ * safe" section) on a dedicated background thread while shadow mode is
+ * on, so MPC's own hidden UI doesn't also react to the same touches
+ * underneath -- and releases it immediately when shadow mode goes off.
+ * This reuses the exact technique tools/grab_test.c already proved safe
+ * in isolation on this device; this build just ties its lifecycle to the
+ * same shadow_on flag as the buffer substitution above, instead of a
+ * fixed test window.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -63,6 +73,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <linux/input.h>
 
 /* ---- Raw DRM UAPI structs (no libdrm/kernel headers available offline;
  * see file header comment). ---- */
@@ -384,16 +398,26 @@ static void create_shadow_buffer(int fd) {
              (unsigned long long)creq.size);
 }
 
+static void *touch_thread_fn(void *arg); /* defined below, started here */
+
 __attribute__((constructor))
 static void force_shadow_ctor(void) {
     real_ioctl = (ioctl_fn_t)dlsym(RTLD_NEXT, "ioctl");
     logf = fopen("/tmp/force_shadow.log", "a");
     if (logf) setvbuf(logf, NULL, _IOLBF, 0); /* line-buffered: survives a crash */
-    logline("force_shadow.so loaded -- step 2 (FB_ID substitution build), real_ioctl=%p",
+    logline("force_shadow.so loaded -- step 3 (FB_ID substitution + touch takeover build), real_ioctl=%p",
              (void*)real_ioctl);
     /* Deliberately does NOT touch /dev/dri/card0 here -- see file header
      * comment on live load test #3. Setup happens lazily, on MPC's own
      * fd, the first time we see a real atomic commit (below). */
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, touch_thread_fn, NULL) == 0) {
+        pthread_detach(tid);
+    } else {
+        logline("touch: pthread_create failed: %s -- shadow mode will still "
+                 "work but without touch takeover", strerror(errno));
+    }
 }
 
 /* Guards the one-time setup below so it runs exactly once even if more
@@ -472,6 +496,101 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
 static void poll_toggle(void) {
     struct stat st;
     shadow_on = (stat(SHADOW_TOGGLE_FILE, &st) == 0);
+}
+
+/* ---- Touch takeover (step 3) ----
+ *
+ * Confirmed live (DESIGN.md's "touch grab is safe" section, 2026-09-14):
+ * EVIOCGRAB on this exact device works cleanly, releases cleanly, and
+ * MPC's own UI simply stops/resumes seeing touches with no side effects.
+ * This just ties that already-proven mechanism to shadow_on instead of a
+ * fixed test window, on its own background thread so it never blocks the
+ * DRM commit path above. */
+
+#define TOUCH_DEVICE "/dev/input/event0"
+#define EVIOCGRAB_REQ _IOW('E', 0x90, int)
+
+static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
+static int touch_x = -1, touch_y = -1, touch_down = 0;
+
+static void update_touch_state(const struct input_event *ev) {
+    pthread_mutex_lock(&touch_mu);
+    if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
+        touch_x = ev->value;
+    } else if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_Y || ev->code == ABS_Y)) {
+        touch_y = ev->value;
+    } else if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
+        touch_down = ev->value;
+    }
+    pthread_mutex_unlock(&touch_mu);
+}
+
+/* Runs for the whole process lifetime: sleeps while shadow mode is off,
+ * grabs the touchscreen the moment it turns on, releases it the moment it
+ * turns off (checked every 100ms via poll()'s timeout, so release is
+ * prompt even with no incoming touch events), and repeats. Any failure to
+ * open/grab just skips touch takeover for that on-cycle -- shadow mode's
+ * buffer substitution still works, it just won't hide touches from MPC
+ * underneath that cycle -- never blocks or crashes the render path. */
+static void *touch_thread_fn(void *arg) {
+    (void)arg;
+    static uint64_t grab_session = 0;
+    for (;;) {
+        while (!shadow_on) {
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+
+        int fd = open(TOUCH_DEVICE, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            logline("touch: open(%s) failed: %s -- no touch takeover this cycle",
+                     TOUCH_DEVICE, strerror(errno));
+            while (shadow_on) { struct timespec ts = {0, 200*1000*1000}; nanosleep(&ts, NULL); }
+            continue;
+        }
+        char devname[128] = "?";
+        real_ioctl(fd, EVIOCGNAME(sizeof(devname)), devname);
+
+        if (real_ioctl(fd, EVIOCGRAB_REQ, (void *)(intptr_t)1) != 0) {
+            logline("touch: EVIOCGRAB(1) on %s (%s) failed: %s -- no touch takeover this cycle",
+                     TOUCH_DEVICE, devname, strerror(errno));
+            close(fd);
+            while (shadow_on) { struct timespec ts = {0, 200*1000*1000}; nanosleep(&ts, NULL); }
+            continue;
+        }
+        uint64_t session = __atomic_add_fetch(&grab_session, 1, __ATOMIC_RELAXED);
+        logline("touch: grab #%llu acquired on %s (%s)",
+                 (unsigned long long)session, TOUCH_DEVICE, devname);
+
+        uint64_t nevents = 0;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        while (shadow_on) {
+            int pr = poll(&pfd, 1, 100);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                struct input_event ev;
+                ssize_t r = read(fd, &ev, sizeof(ev));
+                if (r == (ssize_t)sizeof(ev)) {
+                    update_touch_state(&ev);
+                    nevents++;
+                    if (nevents % 20 == 1) {
+                        logline("touch: grab #%llu event #%llu type=%u code=%u value=%d (x=%d y=%d down=%d)",
+                                 (unsigned long long)session, (unsigned long long)nevents,
+                                 ev.type, ev.code, ev.value, touch_x, touch_y, touch_down);
+                    }
+                }
+            }
+        }
+
+        if (real_ioctl(fd, EVIOCGRAB_REQ, (void *)(intptr_t)0) != 0) {
+            logline("touch: grab #%llu EVIOCGRAB(0) release FAILED: %s -- device stays grabbed until fd closes",
+                     (unsigned long long)session, strerror(errno));
+        } else {
+            logline("touch: grab #%llu released cleanly (%llu events seen)",
+                     (unsigned long long)session, (unsigned long long)nevents);
+        }
+        close(fd); /* fallback release too, same as tools/grab_test.c */
+    }
+    return NULL;
 }
 
 int ioctl(int fd, unsigned long request, ...) {
