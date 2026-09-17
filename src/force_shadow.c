@@ -499,15 +499,34 @@ static void do_lazy_setup(void) {
  * so either caller reaches us. */
 int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioctl")));
 
-/* Rewrites the FB_ID property's value in-place inside atomic's own
- * objs/props/prop_values arrays -- these point into MPC's own already-
- * allocated memory, and we're running inside MPC's own process (LD_PRELOAD),
- * so this is a plain, direct pointer write, no ptrace needed. If the
- * target plane/property isn't present in this particular commit, or
- * shadow_ready is false, does nothing and the real ioctl proceeds with
- * the request completely unmodified. */
-static void maybe_substitute_fb(struct drm_mode_atomic *req) {
-    if (!shadow_ready || !shadow_on) return;
+/* Live load test #6 (2026-09-18) found: relying on "just stop rewriting
+ * and MPC's own next commit will naturally restore its own FB_ID" does
+ * NOT reliably revert the display -- confirmed live, screen stayed on
+ * the shadow buffer even after shadow_on went false and every commit
+ * logged as plain pass-through. Root cause (best-supported theory, see
+ * DESIGN.md): MPC very likely keeps a persistent, reused atomic-request
+ * object across frames rather than rebuilding the property value array
+ * from scratch every commit -- so the in-place write we make into that
+ * SAME memory during substitution doesn't just affect one commit, it
+ * corrupts MPC's own ongoing notion of "my current FB_ID" until MPC
+ * itself has an unrelated reason to rewrite that slot (which may not
+ * happen again for the rest of the session). The old maybe_substitute_fb
+ * only ever touched this array while shadow_on was true, so it had no
+ * way to detect or undo that corruption once toggled off.
+ *
+ * Fix: capture MPC's real FB_ID the first time we see it (before ever
+ * substituting), and run this on EVERY real atomic commit regardless of
+ * shadow_on -- while on, write our shadow_fb_id in (as before); while
+ * off, actively check whether the slot still holds our shadow_fb_id
+ * (i.e. is corrupted) and explicitly restore the captured real value if
+ * so, rather than passively hoping MPC rewrites it on its own. This is
+ * self-healing: it doesn't matter how or when the corruption happened,
+ * only that we notice and fix it on the very next commit we see. */
+static uint32_t real_fb_id = 0;
+static volatile int real_fb_id_known = 0;
+
+static void sync_fb(struct drm_mode_atomic *req) {
+    if (!shadow_ready) return;
     if (req->count_objs == 0) return;
 
     uint32_t *objs = (uint32_t *)(uintptr_t)req->objs_ptr;
@@ -521,10 +540,22 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
         uint32_t this_count = counts[i];
         if (objs[i] == plane_obj_id) {
             for (uint32_t j = 0; j < this_count; j++) {
-                if (props[offset + j] == fb_id_prop_id) {
-                    values[offset + j] = shadow_fb_id;
-                    return;
+                if (props[offset + j] != fb_id_prop_id) continue;
+                uint64_t *slot = &values[offset + j];
+                if (!real_fb_id_known) {
+                    real_fb_id = (uint32_t)*slot;
+                    real_fb_id_known = 1;
+                    logline("captured MPC's real FB_ID=%u (for restoration on toggle-off)",
+                             real_fb_id);
                 }
+                if (shadow_on) {
+                    *slot = shadow_fb_id;
+                } else if (real_fb_id_known && (uint32_t)*slot != real_fb_id) {
+                    logline("FB_ID slot was %u, not MPC's real %u -- restoring",
+                             (uint32_t)*slot, real_fb_id);
+                    *slot = real_fb_id;
+                }
+                return;
             }
             return; /* found the plane but not FB_ID in this commit -- leave alone */
         }
@@ -664,8 +695,8 @@ int ioctl(int fd, unsigned long request, ...) {
                 logline("shadow mode toggled %s", shadow_on ? "ON" : "off");
             }
         }
-        if (shadow_ready && shadow_on && argp) {
-            maybe_substitute_fb((struct drm_mode_atomic *)argp);
+        if (shadow_ready && argp) {
+            sync_fb((struct drm_mode_atomic *)argp);
         }
         if (logf && (c % 60 == 1)) {   /* ~once/12s at the observed ~5Hz commit rate */
             pthread_mutex_lock(&log_mu);

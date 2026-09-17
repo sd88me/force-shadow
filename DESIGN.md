@@ -659,8 +659,77 @@ live, working together.** The WiFi incident from the first attempt did
 not reproduce on retry, which is weak evidence (not proof) against a
 direct causal link — see the incident section above, which remains open.
 
+## Live load test #6 (2026-09-18): buffer orientation confirmed, and a real reversion bug found + fixed
+
+**Buffer orientation test.** Replaced the solid magenta fill with an
+asymmetric marker pattern (green square at buffer origin, red strip along
+buffer's y=0 edge, blue strip along buffer's x=0 edge, yellow square at
+buffer's opposite corner) and read the result directly off the physical
+screen: green top-right, yellow bottom-left, red on the physical right
+edge, blue on the physical top edge. Solved for the transform: treating
+the buffer as the panel's raw post-rotation scanout format (confirmed
+earlier via `GETFB`) and wanting to render into a natural
+1280×800-landscape virtual canvas (matching MPC's own internal
+composition size, before its own RGA rotation step — which this project's
+renderer bypasses entirely), the mapping from a desired landscape pixel
+`(px, py)` (px∈[0,1280) left→right, py∈[0,800) top→bottom) to actual
+buffer coordinates is:
+
+```
+buffer_x = py
+buffer_y = 1279 - px        /* SHADOW_H - 1 - px */
+```
+
+Verified against all four markers, fully consistent. This is now the
+known-correct basis for any future rendering code — no more guessing.
+
+**Reversion bug found live.** After toggling shadow mode off, the screen
+stayed stuck on the shadow buffer even though `/tmp/force_shadow.log`
+correctly showed every commit as plain `pass-through` — i.e., our own
+interposer had genuinely stopped rewriting anything, yet the wrong buffer
+kept displaying. Recovered via the standard full rollback + `acvs`
+restart (worked cleanly, as always).
+
+**Root cause (best-supported theory):** the old `maybe_substitute_fb`
+only ever inspected the atomic request's property arrays while
+`shadow_on` was true, and wrote `shadow_fb_id` directly into MPC's own
+already-allocated `prop_values` array in place. The best explanation
+fitting the evidence is that MPC keeps a persistent, reused atomic-request
+object across frames rather than rebuilding its property arrays from
+scratch every commit — so that in-place write didn't just affect one
+commit, it corrupted MPC's own ongoing notion of "my current `FB_ID`"
+until MPC itself had an unrelated reason to rewrite that exact memory
+slot (which, for a mostly-static UI, may never happen again in the rest
+of the session). Once `shadow_on` went false, nothing ever looked at that
+slot again to notice or fix the corruption.
+
+**Fix**: capture MPC's real `FB_ID` value the first time it's ever seen
+(on the very first real commit, before any substitution has happened),
+and run the sync logic on **every** commit regardless of `shadow_on` —
+while on, write `shadow_fb_id` in as before; while off, actively check
+whether the slot still holds `shadow_fb_id` (i.e. is corrupted) and
+explicitly restore the captured real value if so, rather than passively
+hoping MPC rewrites it on its own. Self-healing: doesn't matter how or
+when the corruption happened, only that the very next commit we see
+notices and fixes it. Compiled clean, `readelf`-verified. **Not yet
+tested live** — this is the next live test needed before any further
+rendering work, since a reliable toggle-off is a prerequisite for safely
+iterating on real content.
+
+**Known limitation of this fix, worth remembering**: it captures the real
+`FB_ID` exactly once and treats it as permanently correct. If MPC ever
+legitimately changes its own real `FB_ID` later in a session (e.g. an
+actual internal double-buffer swap under some condition not yet observed),
+this fix would incorrectly force it back to the stale captured value. No
+evidence of that happening in any test so far, but flagging it as an
+assumption, not a proven invariant.
+
 ## Not yet done
 
+- **Live-test the FB_ID restoration fix** (live load test #6's fix) before
+  anything else — confirm toggle-off reliably restores the real display
+  every time, including after repeated on/off cycles, before trusting the
+  toggle mechanism enough to build real rendering on top of it.
 - **Real rendering into the shadow buffer** (software rasterization of an
   addon's actual UI, using the tracked touch x/y/down state for hit-
   testing) in place of the solid magenta test color. This is the current
