@@ -382,14 +382,53 @@ static void create_shadow_buffer(int fd) {
         logline("mmap of dumb buffer failed: %s", strerror(errno));
         return;
     }
-    /* Solid, deliberately-artificial magenta (XRGB8888: X=0xFF, R=0xFF,
-     * G=0x00, B=0xFF) -- a color MPC's own UI would never show, so if
-     * this appears on screen during a test it's unambiguous proof the
-     * substitution path is live, not a coincidence. */
+    /* ORIENTATION TEST PATTERN (temporary -- see DESIGN.md's "buffer
+     * orientation test" section). Our buffer is 800x1280, matching the
+     * panel's raw post-rotation scanout format directly (confirmed via
+     * GETFB) -- but MPC's own pipeline composes in 1280x800 landscape and
+     * has RGA rotate it 90 degrees before scanout, and we deliberately
+     * skip that step entirely, writing straight into the final buffer.
+     * A solid fill (the step-2/3 magenta test) can't reveal whether our
+     * buffer's x/y axes end up rotated relative to what the viewer
+     * actually sees, since a solid color looks identical either way.
+     * This asymmetric pattern can: four distinct markers, each anchored
+     * to a specific buffer corner/edge, so the mapping can be read
+     * straight off the physical screen.
+     *   - GREEN 60x60 square at buffer (0,0)      -- the origin corner
+     *   - RED strip along buffer's y=0 edge (rows 0..59, all columns)
+     *   - BLUE strip along buffer's x=0 edge (cols 0..59, all rows)
+     *   - YELLOW 60x60 square at buffer (max,max)  -- the opposite corner
+     *   - dark gray background elsewhere
+     * Paint order: background, then blue, then red (so the top-left
+     * overlap defaults to red), then green explicitly on top of that
+     * same corner so it's unambiguous, then yellow in the far corner. */
     uint32_t *px = (uint32_t *)map;
-    uint32_t color = 0xFFFF00FFu;
-    size_t npx = (creq.pitch / 4) * SHADOW_H;
-    for (size_t i = 0; i < npx; i++) px[i] = color;
+    uint32_t stride_px = creq.pitch / 4;
+    uint32_t bg     = 0xFF202020u;
+    uint32_t red    = 0xFFFF0000u;
+    uint32_t blue   = 0xFF0000FFu;
+    uint32_t green  = 0xFF00FF00u;
+    uint32_t yellow = 0xFFFFFF00u;
+    const uint32_t MARK = 60;
+
+    for (uint32_t y = 0; y < SHADOW_H; y++) {
+        uint32_t *row = px + (size_t)y * stride_px;
+        for (uint32_t x = 0; x < SHADOW_W; x++) row[x] = bg;
+    }
+    /* blue: left edge -- x in [0,MARK), all rows */
+    for (uint32_t y = 0; y < SHADOW_H; y++)
+        for (uint32_t x = 0; x < MARK; x++) (px + (size_t)y * stride_px)[x] = blue;
+    /* red: top edge -- y in [0,MARK), all columns (painted after blue, so
+     * the top-left overlap defaults to red) */
+    for (uint32_t y = 0; y < MARK; y++)
+        for (uint32_t x = 0; x < SHADOW_W; x++) (px + (size_t)y * stride_px)[x] = red;
+    /* green: explicitly marks the (0,0) corner, on top of both */
+    for (uint32_t y = 0; y < MARK; y++)
+        for (uint32_t x = 0; x < MARK; x++) (px + (size_t)y * stride_px)[x] = green;
+    /* yellow: marks the opposite (max,max) corner */
+    for (uint32_t y = SHADOW_H - MARK; y < SHADOW_H; y++)
+        for (uint32_t x = SHADOW_W - MARK; x < SHADOW_W; x++) (px + (size_t)y * stride_px)[x] = yellow;
+
     munmap(map, creq.size);
 
     shadow_fb_id = fbcmd.fb_id;
