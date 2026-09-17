@@ -376,21 +376,81 @@ that participates in the same kill/reload lifecycle instead of a one-off
 manual `scp`+edit, so it isn't racing against `boot.sh`'s own assumptions
 about how addons manage this file.
 
+## Step 2 build (2026-09-17, compiled offline, not yet loaded live): FB_ID substitution
+
+`src/force_shadow.c` now does real buffer substitution, gated behind a
+test-only toggle, instead of pure pass-through:
+
+- **At load**: opens its own fd on `/dev/dri/card0` (separate from MPC's
+  own — safe, since none of the setup calls below need DRM master, only
+  actual mode-setting/atomic-commit calls do, and this library never does
+  those on its own fd). Walks every plane object
+  (`DRM_IOCTL_MODE_GETPLANERESOURCES` + `DRM_IOCTL_MODE_OBJ_GETPROPERTIES`),
+  resolves each property's name (`DRM_IOCTL_MODE_GETPROPERTY`), and picks
+  the primary plane the portable way (a plane whose live `"type"` value
+  matches its own `"Primary"` enum entry), falling back to this exact
+  hardware's already-confirmed-live heuristic (most properties among
+  `FB_ID`+`CRTC_ID`-bearing planes — the original ptrace research found
+  object `0x21` this way, 10 properties) if no plane's `type` resolves
+  cleanly. Then allocates one reusable 800×1280 XRGB8888 dumb buffer
+  (`DRM_IOCTL_MODE_CREATE_DUMB` + `DRM_IOCTL_MODE_ADDFB2`), maps it
+  (`DRM_IOCTL_MODE_MAP_DUMB` + `mmap`), and fills it solid with a
+  deliberately-artificial magenta (`0xFFFF00FF`) — a color MPC's own UI
+  would never show, so if it ever appears on screen during a test that's
+  unambiguous proof the substitution path is live, not a coincidence.
+- **No libdrm/kernel headers were available** in this project's offline
+  armhf cross-compile environment (see README.md's Docker+QEMU toolchain),
+  so all of the DRM UAPI structs above are defined locally from the
+  long-stable public kernel ABI (unchanged for years). Every one of these
+  setup ioctls is read-only or inert — none touch live scanout by
+  themselves, and the kernel's own DRM ioctl dispatcher rejects any
+  struct-size mismatch with a plain `-EINVAL`, not undefined behavior — so
+  even a mistake in a hand-typed layout fails closed:
+  `shadow_ready` stays false and the build behaves exactly like the
+  step-1 pass-through-only prototype. `DRM_IOCTL_MODE_ATOMIC`'s own
+  encoding is cross-checked at **compile time** against the exact hex
+  value this project already confirmed live via `strace`
+  (`_assert_atomic_layout` — the build itself fails if `struct
+  drm_mode_atomic`'s size is wrong, rather than silently misbehaving live).
+- **On each intercepted commit**: if `shadow_ready` and the test toggle is
+  on, rewrites the `FB_ID` property's value in place inside the atomic
+  request's own `objs`/`props`/`prop_values` arrays — these point into
+  MPC's own already-allocated memory, and since we're running inside
+  MPC's own process via `LD_PRELOAD`, this is a plain direct pointer
+  write, no `ptrace` needed (unlike the original outside-looking-in
+  research technique). If the target plane/property isn't present in a
+  given commit, or the toggle is off, or setup failed, it does nothing —
+  the real ioctl proceeds with the request completely unmodified.
+- **Toggle mechanism (test-only, not the real one)**: presence of
+  `/tmp/force_shadow_on`, polled every ~30 commits (a few times/sec during
+  active use), logged whenever it flips. This is a deliberate stand-in for
+  the real MidiLoop button-combo mechanism (still not built — see below)
+  so the substitution mechanism itself can be tested over plain SSH
+  (`touch`/`rm` the file) before adding MidiLoop into the mix. While the
+  file doesn't exist, behavior is identical to step 1.
+- **Compiled and verified offline**: builds clean with `-Wall -Wextra`,
+  the compile-time atomic-layout assertion passes, `readelf --dyn-syms`
+  confirms both `ioctl` and `__ioctl_time64` still resolve to the same
+  address, dependencies unchanged (`libc`/`libpthread`/`libdl` only).
+  **Not yet loaded on the device** — this is materially higher-risk than
+  step 1's pure pass-through (a bug in the substitution path, not just the
+  interception path, could leave a stuck/garbage screen), so the next live
+  test should be staged: load first with the toggle file absent (should
+  behave identically to step 1, but now also logs plane/property
+  resolution and buffer-creation results — confirm those look sane before
+  ever touching the toggle), then only once that's clean, create the
+  toggle file and check for the magenta screen plus immediate, reliable
+  recovery on removing it.
+
 ## Not yet done
 
-- Writing the actual buffer-substitution interposer logic (dumb-buffer
-  creation, `FB_ID` rewrite while shadow mode is toggled on) — this is now
-  the next real implementation step, not scoping.
-- Rendering into the buffer (software rasterization, no GBM/EGL needed —
-  see above).
-- Confirming property-ID *name* resolution actually works as described
-  (steps above are based on standard DRM UAPI behavior, not yet tested
-  live on this device).
-- Confirming a software-rasterized buffer swap doesn't itself trigger the
-  same class of "restart-adjacent" instability `force-audioin` hit — this
-  is now the single biggest remaining *unblocked* unknown, since touch-grab
-  (the other major open question) is now confirmed safe.
-- MidiLoop combo wiring to actually toggle the shared flag.
+- **Live-testing the step 2 build** — see the staged plan just above.
+  Not yet attempted.
+- Rendering real content into the buffer (software rasterization) instead
+  of a solid test color — comes after the substitution mechanism itself is
+  confirmed stable live.
+- MidiLoop combo wiring to replace the test-only toggle file with the real
+  button-combo mechanism.
 - If any future test needs to edit `/dev/shm/.LD_PRELOAD` live again: use
   the `/dev/shm/.LD_PRELOAD.lock` `mkdir`-lock convention, per the incident
-  above.
+  documented under live load test #1.
