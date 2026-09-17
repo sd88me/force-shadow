@@ -499,103 +499,45 @@ static void do_lazy_setup(void) {
  * so either caller reaches us. */
 int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioctl")));
 
-/* Live load test #6 (2026-09-18) found two real bugs in turn here, both
- * from the same root mistake: mutating MPC's own already-allocated
- * props/prop_values arrays IN PLACE.
- *
- * Attempt 1 (plain in-place write, only while shadow_on): after toggling
- * off, the screen stayed stuck on the shadow buffer even though every
- * commit logged as plain pass-through -- best-supported theory: MPC
- * reuses a persistent atomic-request object across frames, so the
- * in-place write corrupted its ongoing state rather than affecting just
- * one commit, and nothing ever rewrote it back.
- *
- * Attempt 2 (capture-one-real-value-and-restore-if-different, running on
- * every commit): revealed something new live -- MPC actually alternates
- * between at least two DIFFERENT legitimate real FB_IDs as normal
- * double-buffering (confirmed live: saw both 49 and 50 naturally, with
- * shadow_on never having been toggled on yet). A single "the one real
- * value" model is wrong, and "restore to it whenever different" actively
- * fought MPC's own legitimate buffer rotation on every single commit,
- * unconditionally, even with the toggle fully off.
- *
- * Real fix: never mutate MPC's own arrays at all. Copy the small
- * props/prop_values arrays into our own thread-local buffers, patch only
- * our own copy's FB_ID entry, and temporarily repoint the request's
- * props_ptr/prop_values_ptr fields at our copies -- only for the
- * duration of the one real_ioctl() call this triggers. The kernel copies
- * everything it needs out of those arrays synchronously during the
- * ioctl() syscall itself (standard, required kernel-API practice -- no
- * DRM ioctl retains a reference to userspace pointers past the syscall
- * returning), so restoring the original pointers immediately after
- * real_ioctl() returns is safe. MPC's own memory is never touched, so
- * there is nothing to corrupt and nothing to restore: toggling off is
- * simply "don't do the swap this time," exactly as safe as step 1/2's
- * plain pass-through. */
-/* Plain static, not __thread: no evidence of more than one thread ever
- * calling through here (see DESIGN.md), and __thread would pull in a new
- * ld-linux-armhf.so.3 dependency (via __tls_get_addr) for no proven
- * safety benefit -- worst case on an actual race is one glitched frame
- * (self-correcting on the next commit), never persistent corruption,
- * since MPC's own memory is never touched by this design either way. */
-#define MAX_TOTAL_PROPS 4096
-static uint32_t tmp_props[MAX_TOTAL_PROPS];
-static uint64_t tmp_values[MAX_TOTAL_PROPS];
-
-/* Returns 1 and fills the two output params with req's ORIGINAL props_ptr
- * and prop_values_ptr (to restore after the real ioctl call) if it
- * substituted FB_ID via a temporary copy; returns 0 (req left completely
- * untouched) if the target plane/property wasn't found in this commit,
- * the arrays were too large for the fixed-size copy buffers, or any
- * pointer was invalid -- always fails closed to "don't touch anything". */
-static int try_substitute_fb(struct drm_mode_atomic *req,
-                              uint64_t *saved_props_ptr,
-                              uint64_t *saved_values_ptr) {
-    if (req->count_objs == 0) return 0;
+/* Live load test #6 (2026-09-18): the original simple in-place write
+ * (mutate MPC's own props/prop_values arrays directly, only while
+ * shadow_on) is CONFIRMED to work visually -- this is exactly what
+ * produced the working magenta/orientation-pattern results in every test
+ * through #5. A later attempt to fix toggle-off reliability replaced this
+ * with a copy-and-temporarily-repoint-the-pointers scheme instead; that
+ * data was verified fully correct at every step (right plane, right
+ * property, right before/after values, real non-test-only commit flags,
+ * no ioctl errors) but produced ZERO visible effect on screen for reasons
+ * not yet understood -- reverted back to the proven approach rather than
+ * keep chasing that live. Toggle-off reliability (restoring the real
+ * display without a full restart) remains unsolved -- see "Not yet done"
+ * in DESIGN.md -- so for now, treat toggling off as needing an `acvs`
+ * restart to guarantee a clean revert, same as the established recovery
+ * procedure already used throughout this project. */
+static void maybe_substitute_fb(struct drm_mode_atomic *req) {
+    if (!shadow_ready || !shadow_on) return;
+    if (req->count_objs == 0) return;
 
     uint32_t *objs = (uint32_t *)(uintptr_t)req->objs_ptr;
     uint32_t *counts = (uint32_t *)(uintptr_t)req->count_props_ptr;
-    uint32_t *orig_props = (uint32_t *)(uintptr_t)req->props_ptr;
-    uint64_t *orig_values = (uint64_t *)(uintptr_t)req->prop_values_ptr;
-    if (!objs || !counts || !orig_props || !orig_values) return 0;
+    uint32_t *props = (uint32_t *)(uintptr_t)req->props_ptr;
+    uint64_t *values = (uint64_t *)(uintptr_t)req->prop_values_ptr;
+    if (!objs || !counts || !props || !values) return;
 
-    uint32_t total = 0;
-    for (uint32_t i = 0; i < req->count_objs; i++) total += counts[i];
-    if (total == 0) return 0;
-    if (total > MAX_TOTAL_PROPS) {
-        static uint64_t oversize_count = 0;
-        if (__atomic_add_fetch(&oversize_count, 1, __ATOMIC_RELAXED) % 30 == 1) {
-            logline("commit had %u total props (> %d cap) -- skipped substitution "
-                     "this commit, not touching anything", total, MAX_TOTAL_PROPS);
-        }
-        return 0;
-    }
-
-    uint32_t offset = 0, found_at = UINT32_MAX;
+    uint32_t offset = 0;
     for (uint32_t i = 0; i < req->count_objs; i++) {
         uint32_t this_count = counts[i];
         if (objs[i] == plane_obj_id) {
             for (uint32_t j = 0; j < this_count; j++) {
-                if (orig_props[offset + j] == fb_id_prop_id) {
-                    found_at = offset + j;
-                    break;
+                if (props[offset + j] == fb_id_prop_id) {
+                    values[offset + j] = shadow_fb_id;
+                    return;
                 }
             }
-            break;
+            return; /* found the plane but not FB_ID in this commit -- leave alone */
         }
         offset += this_count;
     }
-    if (found_at == UINT32_MAX) return 0;
-
-    memcpy(tmp_props, orig_props, total * sizeof(uint32_t));
-    memcpy(tmp_values, orig_values, total * sizeof(uint64_t));
-    tmp_values[found_at] = shadow_fb_id;
-
-    *saved_props_ptr = req->props_ptr;
-    *saved_values_ptr = req->prop_values_ptr;
-    req->props_ptr = (uint64_t)(uintptr_t)tmp_props;
-    req->prop_values_ptr = (uint64_t)(uintptr_t)tmp_values;
-    return 1;
 }
 
 static void poll_toggle(void) {
@@ -731,28 +673,17 @@ int ioctl(int fd, unsigned long request, ...) {
             }
         }
 
-        int swapped = 0;
-        uint64_t saved_props_ptr = 0, saved_values_ptr = 0;
-        struct drm_mode_atomic *req = (struct drm_mode_atomic *)argp;
-        if (shadow_ready && shadow_on && req) {
-            swapped = try_substitute_fb(req, &saved_props_ptr, &saved_values_ptr);
-        }
-
-        int ret = real_ioctl(fd, request, argp);
-
-        if (swapped) {
-            req->props_ptr = saved_props_ptr;
-            req->prop_values_ptr = saved_values_ptr;
+        if (shadow_ready && shadow_on && argp) {
+            maybe_substitute_fb((struct drm_mode_atomic *)argp);
         }
 
         if (logf && (c % 60 == 1)) {   /* ~once/12s at the observed ~5Hz commit rate */
             pthread_mutex_lock(&log_mu);
             fprintf(logf, "[%ld] atomic commit #%llu seen on fd=%d (%s)\n",
                     (long)time(NULL), (unsigned long long)c, fd,
-                    swapped ? "SUBSTITUTING" : "pass-through");
+                    (shadow_ready && shadow_on) ? "SUBSTITUTING" : "pass-through");
             pthread_mutex_unlock(&log_mu);
         }
-        return ret;
     }
 
     return real_ioctl(fd, request, argp);

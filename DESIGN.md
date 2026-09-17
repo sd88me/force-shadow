@@ -757,12 +757,29 @@ Compiled clean (`-Wall -Wextra`, no warnings), `readelf`-verified.
 further rendering work, since a reliable toggle-off is a prerequisite for
 safely iterating on real content.
 
+## Live load test #7 (2026-09-18): the pointer-swap fix didn't work, reverted to proven in-place write
+
+Tried the pointer-swap fix from #6 live: toggle-on produced zero visible
+effect despite diagnostics confirming everything about the substitution
+was structurally correct (`flags=0x1` — a real, non-test-only commit;
+`orig_val=50 -> patched_val=65`; no ioctl errors; correct plane/property
+found). Root cause of *why the correct data had no visible effect* was
+not found. Reverted `maybe_substitute_fb` to the original simple in-place
+write (proven visually working in tests #4/#5) rather than keep
+debugging live — forward substitution is more foundational to get right
+than toggle-off, and chasing this further live was costing more than it
+was worth. **Toggle-off reliability is now explicitly unsolved and
+parked** — treat it as needing a full `acvs` restart for now, using the
+same established recovery procedure as every other test in this project.
+
 ## Not yet done
 
-- **Live-test the FB_ID restoration fix** (live load test #6's fix) before
-  anything else — confirm toggle-off reliably restores the real display
-  every time, including after repeated on/off cycles, before trusting the
-  toggle mechanism enough to build real rendering on top of it.
+- **Live-test that the reverted in-place write actually shows visible
+  substitution again** (this is now the most basic open question — confirm
+  before anything else).
+- **Solve toggle-off reliability** (parked from live load test #6/#7) —
+  needs a fresh angle, not more iteration on the two approaches already
+  tried and abandoned.
 - **Real rendering into the shadow buffer** (software rasterization of an
   addon's actual UI, using the tracked touch x/y/down state for hit-
   testing) in place of the solid magenta test color. This is the current
