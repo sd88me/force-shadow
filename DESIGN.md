@@ -442,10 +442,59 @@ test-only toggle, instead of pure pass-through:
   toggle file and check for the magenta screen plus immediate, reliable
   recovery on removing it.
 
+## Live load test #3 (2026-09-17/18): crash loop found, root cause identified, fix pending
+
+Attempted the staged test above (toggle file absent, load only). Result:
+MPC crash-looped — `journalctl -u acvs` showed **61 restarts in under 4
+minutes**, each one printing MPC's own
+`Failed to initialise display (another process running?), aborting!`
+followed by `Aborted (core dumped)` (a clean self-detected abort, not a
+segfault — nothing in `dmesg`, consistent with `exit-code 127` in
+`systemd`'s own log, not a signal). Rolled back immediately (same
+lock-based restore as before) and confirmed clean recovery: stable MPC
+process, correct 3-library `LD_PRELOAD`, physical checks (screen/pads/
+audio) all normal afterward.
+
+**Root cause identified (high confidence, not yet re-tested):** the step-2
+constructor opens its *own* independent fd on `/dev/dri/card0` and holds
+it open for the process's entire lifetime, before MPC's own `main()` ever
+touches the display. On this driver, DRM master status appears to go to
+the *first* opener of the primary node — since our constructor runs
+before MPC's own DRM setup (LD_PRELOAD constructors always run before
+`main()`), our early open() most likely became master, and MPC's own
+subsequent attempt to acquire it failed — which is exactly the "another
+process running?" message MPC prints as its own defensive check for that
+exact condition.
+
+**Fix (designed, not yet implemented/tested):** never open a competing
+fd. Defer all setup (plane/property resolution, buffer creation) from the
+constructor to the *first* real `DRM_IOCTL_MODE_ATOMIC` call seen in the
+interposed `ioctl()`, and reuse **MPC's own fd** — the one passed into
+that very call — instead of a second one. That fd is guaranteed to
+already be fully initialized and mastered, since MPC is actively issuing
+commits on it by the time we see it. Needs a thread-safety guard around
+the one-time setup (e.g. `pthread_once`) in case multiple threads ever
+call through `ioctl()` for `DRM_IOCTL_MODE_ATOMIC` — not observed so far
+(all evidence points to a single "MPC Main Thread" doing this), but worth
+guarding against rather than assuming.
+
+**This was a good outcome for a bad-case scenario**: MPC failed *before*
+ever touching the screen, every single time, with a clean diagnostic
+message and a fast, complete recovery via the already-established
+rollback procedure — not the "stuck garbage screen with no independent
+recovery path" DESIGN.md's own risk section warned about as the worst
+case for this class of bug. The fail-closed design (a fresh MPC process
+either starts clean or aborts immediately) held up under a real failure.
+
 ## Not yet done
 
-- **Live-testing the step 2 build** — see the staged plan just above.
-  Not yet attempted.
+- **Fix and re-test live**: rewrite `force_shadow_ctor()` to drop its own
+  `/dev/dri/card0` open entirely; move plane/property resolution and
+  buffer creation to a `pthread_once`-guarded one-time setup on the first
+  intercepted `DRM_IOCTL_MODE_ATOMIC` call, using that call's own `fd`.
+  Re-run the same staged live-test plan (toggle off first, confirm clean
+  setup logs, only then create the toggle file) from scratch once that's
+  done — this is the very next step for the next session.
 - Rendering real content into the buffer (software rasterization) instead
   of a solid test color — comes after the substitution mechanism itself is
   confirmed stable live.
