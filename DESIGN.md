@@ -11,16 +11,16 @@ shadow-display API; the Force has no such official mechanism, so this is
 original R&D, not a port of anything.
 
 **Status as of 2026-09-18: the core mechanism works, confirmed live,
-end-to-end, in both directions.** `src/force_shadow.c` substitutes its own
-rendered buffer onto the Force's real physical screen on command, and
-cleanly reverts to MPC's own UI on command — both directions
-user-confirmed by direct visual observation on real hardware (see "Live
-load test #4, phase B" below), not just inferred from logs. What's left is
-normal feature engineering on a now fully-proven mechanism: real rendering
-instead of a solid test color, wiring up `EVIOCGRAB` touch takeover
-(already independently confirmed safe on its own), and replacing the
-test-only toggle file with the real MidiLoop button-combo mechanism — not
-open feasibility risk. This document still records the full discovery
+end-to-end, in both directions, with touch takeover wired in.**
+`src/force_shadow.c` substitutes its own rendered buffer onto the Force's
+real physical screen on command, takes over the touchscreen from MPC at
+the same moment, and cleanly reverts both together on command — all
+user-confirmed by direct observation on real hardware (see "Live load
+test #4, phase B" and "Live load test #5" below), not just inferred from
+logs. What's left is normal feature engineering on a now fully-proven
+mechanism: real rendering instead of a solid test color, and replacing
+the test-only toggle file with the real MidiLoop button-combo mechanism —
+not open feasibility risk. This document still records the full discovery
 methodology and the exact numbers a real implementation needs, including
 three non-obvious platform/driver gotchas hit along the way (a glibc
 symbol-versioning trap, a pre-existing `boot.sh` addon race, and a DRM
@@ -635,23 +635,39 @@ explicitly include confirming WiFi/SSH connectivity is still healthy, not
 just screen/pads/audio — add this to the standard verification checklist
 for every future live test in this project, not only step 3's.
 
+## Live load test #5 (2026-09-18): touch takeover confirmed live, working together with buffer substitution
+
+Re-ran the staged plan after the WiFi incident above (new device IP,
+192.168.1.44 — DHCP had reassigned it). **Phase A** (toggle off): stable
+single-launch MPC process, clean setup log identical in shape to test #4,
+SSH/WiFi held steady throughout and after — the incident did not
+reproduce. **Phase B** (toggle on): magenta screen appeared again
+(user-confirmed), and the log showed both mechanisms active
+simultaneously —
+`touch: grab #1 event #661 type=3 code=54 value=362 (x=626 y=362 down=1)`
+interleaved with `atomic commit #661 seen on fd=15 (SUBSTITUTING)` in the
+same second, across 818 real touch events captured during the test.
+Removing the toggle file produced `touch: grab #1 released cleanly (818
+events seen)` immediately followed by a return to `pass-through` logging,
+and the user confirmed the screen and touch response both returned to
+normal together. Physical checks (screen, pads, audio, **and WiFi/SSH**,
+per the incident above's new checklist item) all passed clean throughout
+and after the final rollback.
+
+**Step 3 (buffer substitution + touch takeover) is now fully confirmed
+live, working together.** The WiFi incident from the first attempt did
+not reproduce on retry, which is weak evidence (not proof) against a
+direct causal link — see the incident section above, which remains open.
+
 ## Not yet done
 
-- **Live-test the step 3 build**: staged as before — load with the toggle
-  off first (should behave identically to step 2's confirmed-safe
-  behavior; the touch thread should just sleep harmlessly), confirm clean
-  logs and no crash loop, then toggle on and confirm both the magenta
-  screen (already proven) AND the touch grab log lines appear, and that a
-  touch during shadow mode does not reach MPC's hidden UI underneath, then
-  toggle off and confirm both revert (screen back to normal AND touch grab
-  released) together, promptly. Not yet attempted.
-- Real rendering into the shadow buffer (software rasterization of an
-  addon's actual UI, using the tracked touch x/y/down state above for hit-
-  testing) in place of the solid magenta test color. Initial target: a
-  mockup page with a few controls for Maze voice, borrowing MPC's own
-  design language (page layout, knob sizing conventions) rather than
-  inventing a new visual style from scratch — a fuller design-language
-  pass comes once this initial mockup is in place.
+- **Real rendering into the shadow buffer** (software rasterization of an
+  addon's actual UI, using the tracked touch x/y/down state for hit-
+  testing) in place of the solid magenta test color. This is the current
+  focus: an initial mockup page with a few controls for Maze voice,
+  borrowing MPC's own design language (page layout, knob sizing
+  conventions) rather than inventing a new visual style from scratch — a
+  fuller design-language pass comes once this initial mockup is in place.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
@@ -660,11 +676,9 @@ for every future live test in this project, not only step 3's.
   kill scripts) instead of the current one-off manual `scp`+edit test
   workflow — worth doing once the remaining feature work above is closer
   to done, to stop repeating the manual edit/lock dance on every test.
-- Rendering real content into the buffer (software rasterization) instead
-  of a solid test color — comes after the substitution mechanism itself is
-  confirmed stable live.
-- MidiLoop combo wiring to replace the test-only toggle file with the real
-  button-combo mechanism.
 - If any future test needs to edit `/dev/shm/.LD_PRELOAD` live again: use
   the `/dev/shm/.LD_PRELOAD.lock` `mkdir`-lock convention, per the incident
   documented under live load test #1.
+- Per the WiFi incident above: every future live test's physical checklist
+  should include confirming WiFi/SSH connectivity, not just screen/pads/
+  audio.

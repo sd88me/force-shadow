@@ -9,14 +9,15 @@ none, so this is original R&D against the Force's actual DRM/KMS display
 stack, not a port of anything.
 
 **Status: the core mechanism works, confirmed live end-to-end, in both
-directions — a second process's own rendered buffer has been substituted
-onto the Force's real physical screen on command, and cleanly reverted to
-MPC's own UI on command, both user-confirmed by direct visual observation
-on real hardware.** See [DESIGN.md](DESIGN.md) for everything confirmed
-live (the exact `libdrm` call to hook, the live buffer format,
-object/property IDs, the full discovery methodology, and three non-obvious
-platform gotchas found along the way), and for what's left to build (real
-rendering, `EVIOCGRAB` touch takeover, the MidiLoop toggle mechanism).
+directions, with touch takeover wired in — a second process's own
+rendered buffer has been substituted onto the Force's real physical
+screen on command, the touchscreen taken over at the same moment, and
+both cleanly reverted to MPC's own UI on command, all user-confirmed on
+real hardware.** See [DESIGN.md](DESIGN.md) for everything confirmed live
+(the exact `libdrm` call to hook, the live buffer format, object/property
+IDs, the full discovery methodology, and the platform gotchas found along
+the way), and for what's left to build (real rendering, the MidiLoop
+toggle mechanism).
 
 ## Layout
 
