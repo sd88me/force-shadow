@@ -8,13 +8,15 @@ equivalent has an official shadow-display API from Ableton; the Force has
 none, so this is original R&D against the Force's actual DRM/KMS display
 stack, not a port of anything.
 
-**Status: feasibility confirmed live end-to-end — a pass-through-only
-interposer has been loaded into MPC on real hardware and correctly
-intercepts every real DRM atomic commit.** See [DESIGN.md](DESIGN.md) for
-everything confirmed live (the exact `libdrm` call to hook, the live
-buffer format, object/property IDs, the full discovery methodology, and
-two non-obvious platform gotchas found along the way), and for what's left
-to build (buffer substitution, the toggle mechanism).
+**Status: the core mechanism works, confirmed live end-to-end, in both
+directions — a second process's own rendered buffer has been substituted
+onto the Force's real physical screen on command, and cleanly reverted to
+MPC's own UI on command, both user-confirmed by direct visual observation
+on real hardware.** See [DESIGN.md](DESIGN.md) for everything confirmed
+live (the exact `libdrm` call to hook, the live buffer format,
+object/property IDs, the full discovery methodology, and three non-obvious
+platform gotchas found along the way), and for what's left to build (real
+rendering, `EVIOCGRAB` touch takeover, the MidiLoop toggle mechanism).
 
 ## Layout
 

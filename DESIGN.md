@@ -10,16 +10,21 @@ UI on a second press. The Move-hardware equivalent is Ableton's Schwung
 shadow-display API; the Force has no such official mechanism, so this is
 original R&D, not a port of anything.
 
-**Status as of 2026-09-17: feasibility confirmed live end-to-end.** A
-pass-through-only interposer (`src/force_shadow.c`) has been loaded into
-MPC's own process twice on real hardware, safely, and confirmed to
-correctly intercept every real `DRM_IOCTL_MODE_ATOMIC` commit (see "Live
-load test #2" below). What's left is building the actual buffer
-substitution and the toggle mechanism, not further feasibility scoping.
-This document still records the full discovery methodology and the exact
-numbers a real implementation needs, including two non-obvious platform
-gotchas (a glibc symbol-versioning trap and a pre-existing `boot.sh` addon
-race) hit along the way.
+**Status as of 2026-09-18: the core mechanism works, confirmed live,
+end-to-end, in both directions.** `src/force_shadow.c` substitutes its own
+rendered buffer onto the Force's real physical screen on command, and
+cleanly reverts to MPC's own UI on command — both directions
+user-confirmed by direct visual observation on real hardware (see "Live
+load test #4, phase B" below), not just inferred from logs. What's left is
+normal feature engineering on a now fully-proven mechanism: real rendering
+instead of a solid test color, wiring up `EVIOCGRAB` touch takeover
+(already independently confirmed safe on its own), and replacing the
+test-only toggle file with the real MidiLoop button-combo mechanism — not
+open feasibility risk. This document still records the full discovery
+methodology and the exact numbers a real implementation needs, including
+three non-obvious platform/driver gotchas hit along the way (a glibc
+symbol-versioning trap, a pre-existing `boot.sh` addon race, and a DRM
+master-acquisition race from an early independently-opened fd).
 
 ## Why this needs the same class of technique as `force-audioin`
 
@@ -534,17 +539,51 @@ layout exactly. Physical checks (screen/pads/audio) all normal with the
 toggle still off — behavior identical to step 1, as designed. **This
 confirms the crash-loop fix works and setup is fully correct.**
 
+## Live load test #4, phase B (2026-09-18): buffer substitution confirmed live — the project's central milestone
+
+Created `/tmp/force_shadow_on` while the fixed, armed build was loaded and
+stable. **The solid magenta test buffer appeared on the physical
+screen**, user-confirmed by direct visual observation ("I see the
+magenta") — not just inferred from logs. `/tmp/force_shadow.log` showed
+hundreds of consecutive commits logged `SUBSTITUTING` while the toggle was
+on. Removing the toggle file **reverted the display to MPC's normal UI
+immediately** on the next touch/commit, user-confirmed
+("Yes ui back to normal"), and the log showed a clean return to
+`pass-through` logging. Physical checks (screen, pads, audio) passed
+clean throughout both directions of the toggle and after the final
+rollback. Rolled back to the exact original `LD_PRELOAD` state afterward
+(same zero-persistent-footprint protocol as every prior test); confirmed
+clean via `/proc/<pid>/environ` and a final physical check.
+
+**This is the project's central feasibility question, now fully answered
+live, end-to-end, in both directions:** a second process's own
+custom-rendered buffer can be substituted onto the Force's real physical
+screen via `LD_PRELOAD`-interposing `DRM_IOCTL_MODE_ATOMIC`, cleanly,
+reversibly, and safely, using only fail-closed, name-resolved (not
+hardcoded) property lookups. Everything downstream from here — real
+rendering instead of a solid test color, `EVIOCGRAB` touch takeover
+during shadow mode (already independently confirmed safe, see the
+touch-grab section above), and the MidiLoop toggle wiring — is normal
+feature engineering on a now fully-proven mechanism, not open feasibility
+risk.
+
 ## Not yet done
 
-- **Live load test #4, phase B**: the actual untested piece — create
-  `/tmp/force_shadow_on` while the fixed build (now confirmed armed and
-  stable) is loaded, check for the expected solid magenta screen, then
-  remove the file and confirm clean, immediate, reliable reversion. This
-  is the single biggest remaining unknown in the whole project: unlike
-  every failure mode hit so far, a bug in the substitution path itself
-  (not just the interception/setup path) is the one DESIGN.md's own risk
-  section flagged as potentially unrecoverable without a power cycle
-  (stuck/garbage screen). Not yet attempted.
+- Real rendering into the shadow buffer (software rasterization of an
+  addon's actual UI) in place of the solid magenta test color.
+- `EVIOCGRAB`-ing the touchscreen input device while shadow mode is on, so
+  MPC's own (now-hidden) UI doesn't also react to the same touches
+  underneath (independently confirmed safe as its own mechanism — see
+  "touch grab is safe" above — but not yet wired together with shadow
+  mode).
+- Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
+  MidiLoop button-combo mechanism, flipping a shared flag the interposer
+  checks on every commit.
+- Packaging this as a real `AddOns/ForceShadow` addon (`run_*.sh`,
+  `NSMODULE.json`, proper `/dev/shm/.LD_PRELOAD.lock`-respecting install/
+  kill scripts) instead of the current one-off manual `scp`+edit test
+  workflow — worth doing once the remaining feature work above is closer
+  to done, to stop repeating the manual edit/lock dance on every test.
 - Rendering real content into the buffer (software rasterization) instead
   of a solid test color — comes after the substitution mechanism itself is
   confirmed stable live.
