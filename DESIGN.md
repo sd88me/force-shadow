@@ -10,10 +10,16 @@ UI on a second press. The Move-hardware equivalent is Ableton's Schwung
 shadow-display API; the Force has no such official mechanism, so this is
 original R&D, not a port of anything.
 
-**Status as of 2026-09-14: scoping/feasibility research only, no code
-written yet.** This document records what's been confirmed live on real
-hardware, the exact numbers a real implementation needs, and the discovery
-methodology — before committing to actually writing the interposer.
+**Status as of 2026-09-17: feasibility confirmed live end-to-end.** A
+pass-through-only interposer (`src/force_shadow.c`) has been loaded into
+MPC's own process twice on real hardware, safely, and confirmed to
+correctly intercept every real `DRM_IOCTL_MODE_ATOMIC` commit (see "Live
+load test #2" below). What's left is building the actual buffer
+substitution and the toggle mechanism, not further feasibility scoping.
+This document still records the full discovery methodology and the exact
+numbers a real implementation needs, including two non-obvious platform
+gotchas (a glibc symbol-versioning trap and a pre-existing `boot.sh` addon
+race) hit along the way.
 
 ## Why this needs the same class of technique as `force-audioin`
 
@@ -313,15 +319,34 @@ completely invisible to LD_PRELOAD interposition of the old name. This is
 a known class of gotcha for `ioctl`/`fcntl`/similar interposers on
 glibc ≥2.34, not a flaw in the interposition approach itself.
 
-**Fixed and rebuilt (not yet tested live):** `src/force_shadow.c` now also
-exports `__ioctl_time64` as a hard alias (`__attribute__((alias("ioctl")))`)
-of the same hook function, mirroring exactly how libc itself exposes the
-same code under both names. `readelf --dyn-syms dist/force_shadow.so`
-confirms both `ioctl` and `__ioctl_time64` now resolve to the same address
-in the rebuilt `.so`. **This has not yet been loaded on the device** — the
-live test needed to confirm the heartbeat actually fires now is the
-obvious next step, but is a fresh live-load event and should go through
-the same care as before (see the locking lesson below).
+**Fixed, rebuilt, and now confirmed live (2026-09-17, live load test #2):**
+`src/force_shadow.c` now also exports `__ioctl_time64` as a hard alias
+(`__attribute__((alias("ioctl")))`) of the same hook function, mirroring
+exactly how libc itself exposes the same code under both names. This test
+used `/dev/shm/.LD_PRELOAD.lock` (the same `mkdir`-based lock
+`run_ForceAudioIn.sh` uses) for both the prepend and the later rollback,
+instead of test #1's raw overwrite — and this time **all four libraries
+(`forceAudioIn.so`, `force_shadow.so`, `mockbaMagic.so`, `MidiLoop.so`)
+were present in the real running process's `/proc/<pid>/environ`**, no
+drop. The fix works: `/tmp/force_shadow.log` showed
+`atomic commit #1 seen on fd=15` within 6 seconds of launch. It then went
+quiet for ~99 seconds (screen genuinely idle — the DESIGN.md-recorded
+"~5/sec idle" cadence doesn't hold for every screen/state, apparently),
+then picked back up immediately and precisely in step with live touch
+input the moment physical interaction resumed (commits #61 through #481 in
+rapid succession, ~15/sec during active use) — proof the hook is correctly
+seeing every real atomic commit, not just the first one. Physical checks
+(touchscreen, pads, audio) passed clean throughout, both during the test
+and after rollback. Rolled back to the exact original `LD_PRELOAD` state
+afterward (same zero-persistent-footprint protocol as test #1); confirmed
+clean via `/proc/<pid>/environ` and a final physical check.
+
+**This closes out the interposition-feasibility question.** The pieces now
+independently confirmed live: the right ioctl to hook (and now, the right
+*symbol names* to export), safe load/unload via `LD_PRELOAD`, correct real
+buffer/property IDs (from the original research), and safe touch-grab.
+What's left is building the actual feature (buffer substitution + toggle),
+not further feasibility scoping.
 
 **Incidental finding — a real, pre-existing platform race, not caused by
 this project but triggered by how this test edited state:**
@@ -353,13 +378,11 @@ about how addons manage this file.
 
 ## Not yet done
 
-- **Live-testing the `__ioctl_time64` alias fix** — root cause found and
-  fixed offline (see above), but not yet confirmed live. Next live test
-  should check the heartbeat log actually increments this time, using the
-  `/dev/shm/.LD_PRELOAD.lock` convention (see below) rather than a raw
-  file overwrite.
-- Writing any of the actual buffer-substitution interposer logic — blocked
-  on confirming the hook fires live first.
+- Writing the actual buffer-substitution interposer logic (dumb-buffer
+  creation, `FB_ID` rewrite while shadow mode is toggled on) — this is now
+  the next real implementation step, not scoping.
+- Rendering into the buffer (software rasterization, no GBM/EGL needed —
+  see above).
 - Confirming property-ID *name* resolution actually works as described
   (steps above are based on standard DRM UAPI behavior, not yet tested
   live on this device).
