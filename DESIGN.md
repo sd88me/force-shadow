@@ -659,7 +659,7 @@ live, working together.** The WiFi incident from the first attempt did
 not reproduce on retry, which is weak evidence (not proof) against a
 direct causal link — see the incident section above, which remains open.
 
-## Live load test #6 (2026-09-18): buffer orientation confirmed, and a real reversion bug found + fixed
+## Live load test #6 (2026-09-18): buffer orientation confirmed, and a reversion bug found + fixed after one wrong attempt
 
 **Buffer orientation test.** Replaced the solid magenta fill with an
 asymmetric marker pattern (green square at buffer origin, red strip along
@@ -703,26 +703,59 @@ slot (which, for a mostly-static UI, may never happen again in the rest
 of the session). Once `shadow_on` went false, nothing ever looked at that
 slot again to notice or fix the corruption.
 
-**Fix**: capture MPC's real `FB_ID` value the first time it's ever seen
-(on the very first real commit, before any substitution has happened),
-and run the sync logic on **every** commit regardless of `shadow_on` —
-while on, write `shadow_fb_id` in as before; while off, actively check
-whether the slot still holds `shadow_fb_id` (i.e. is corrupted) and
-explicitly restore the captured real value if so, rather than passively
-hoping MPC rewrites it on its own. Self-healing: doesn't matter how or
-when the corruption happened, only that the very next commit we see
-notices and fixes it. Compiled clean, `readelf`-verified. **Not yet
-tested live** — this is the next live test needed before any further
-rendering work, since a reliable toggle-off is a prerequisite for safely
-iterating on real content.
+**Fix attempt 1 (tried live, made things worse): capture-one-real-value-
+and-restore-if-different.** Captured MPC's real `FB_ID` the first time it
+was seen, then ran the check on every commit regardless of `shadow_on`,
+restoring the captured value whenever the live slot didn't match it.
+Loaded live with the toggle still off (no substitution had happened yet
+this run) — and the log immediately showed `FB_ID slot was 49, not MPC's
+real 50 -- restoring`, repeatedly, unconditionally. This revealed
+something new: **MPC legitimately alternates between at least two real
+`FB_ID`s (49 and 50) as normal double-buffering** — the "one real value"
+model was simply wrong, and "restore to it whenever different" was
+actively fighting MPC's own legitimate buffer rotation on *every* commit,
+even with the toggle fully off. No visible glitch was observed during the
+brief live check, but this was rolled back immediately rather than left
+running, since it's plainly incorrect and was corrupting the intended
+"off means fully hands-off" property this whole exercise was supposed to
+restore.
 
-**Known limitation of this fix, worth remembering**: it captures the real
-`FB_ID` exactly once and treats it as permanently correct. If MPC ever
-legitimately changes its own real `FB_ID` later in a session (e.g. an
-actual internal double-buffer swap under some condition not yet observed),
-this fix would incorrectly force it back to the stale captured value. No
-evidence of that happening in any test so far, but flagging it as an
-assumption, not a proven invariant.
+**Real fix: never mutate MPC's own arrays at all.** Both prior attempts
+shared the same mistake — writing values in place into memory MPC itself
+owns and keeps reusing. The actual fix copies the small `props`/
+`prop_values` arrays into this library's own local buffers, patches only
+*that copy's* `FB_ID` entry, and temporarily repoints the atomic
+request's `props_ptr`/`prop_values_ptr` fields at those copies — only for
+the duration of the one `real_ioctl()` call this triggers, then restores
+the original pointers immediately after that call returns (the kernel
+copies everything it needs out of those arrays synchronously during the
+`ioctl()` syscall itself, so nothing is left dangling). MPC's own memory
+is **never written to**, so there is nothing to corrupt and nothing to
+restore — toggling off is simply "don't do the pointer swap this time,"
+exactly as safe as step 1/2's plain pass-through, with no dependency on
+guessing how many real buffers MPC rotates through or what their values
+are.
+
+One implementation wrinkle worth recording: the first version of this fix
+used `static __thread` buffers for the temporary copies (defensive
+thread-safety, since two threads racing on a shared static buffer could
+interleave their copies). `readelf -d` showed this pulled in a new
+`ld-linux-armhf.so.3` dependency via `__tls_get_addr` — TLS in a shared
+library needs the dynamic linker's help to resolve. There's no evidence
+of more than one thread ever calling through this path (see the discovery
+methodology above — every capture has shown a single "MPC Main Thread"
+issuing all atomic commits), and even a genuine race under this new
+design would only cause one glitched frame (self-correcting on the next
+commit), never persistent corruption, since MPC's memory still isn't
+touched either way. Switched to plain `static` to avoid introducing a new
+dependency for no proven safety benefit — `readelf -d` now matches every
+previous build's exact three-library dependency profile again
+(`libdl`/`libpthread`/`libc` only).
+
+Compiled clean (`-Wall -Wextra`, no warnings), `readelf`-verified.
+**Not yet tested live** — this is the next live test needed before any
+further rendering work, since a reliable toggle-off is a prerequisite for
+safely iterating on real content.
 
 ## Not yet done
 
