@@ -598,6 +598,43 @@ technique `tools/grab_test.c` already proved safe in isolation
   unchanged (`libc`/`libpthread`/`libdl` only — no new linked library).
   **Not yet tested live.**
 
+## Incident (2026-09-18): WiFi dropped during step 3's first live test, cause unconfirmed
+
+During the very first live-test attempt of the step 3 (touch takeover)
+build — toggle file absent, same as every previous phase-A load — the
+device's WiFi dropped and did not recover after five `acvs`/service
+restarts. SSH became fully unreachable (even `ping` timed out). The user
+had to boot the device without the MockbaMod SD card entirely to get WiFi
+back (on stock firmware, confirming the WiFi *hardware* itself was fine,
+not a full device failure), then reinsert the SD card and boot normally —
+which came back up with WiFi working and a clean, correct baseline
+(`LD_PRELOAD` had only the original three libraries, no leftover
+`force_shadow*` files anywhere, since everything this project touches is
+`tmpfs`/RAM-resident and wiped by any reboot).
+
+**No plausible causal mechanism was found in the new step 3 code.** At the
+moment WiFi dropped, `/tmp/force_shadow_on` had never been created, so
+`shadow_on` was false throughout — meaning the new touch-grab background
+thread was only ever sitting in its idle `nanosleep(100ms)` wait loop and
+had never once called `open()`/`EVIOCGRAB` on `/dev/input/event0`. Nothing
+in this project's code touches networking, WiFi configuration, or
+persistent storage. This makes a direct causal link unlikely, but not
+ruled out with confidence — the timing is at minimum suspicious, and this
+should be treated as an open, unresolved question, not a cleared one.
+
+**Recovery path confirmed to work in practice, not just in theory**: this
+was the first time this project's documented "guaranteed recovery: a
+power cycle" claim was actually tested under real duress, and it held —
+though it took a full SD-card-out boot plus WiFi credential re-entry to
+get there, more friction than the DESIGN.md recovery section previously
+implied. Worth remembering: recovery may require more than a quick
+power-cycle-and-done in practice.
+
+**Going forward**: physical device checks after any live test should now
+explicitly include confirming WiFi/SSH connectivity is still healthy, not
+just screen/pads/audio — add this to the standard verification checklist
+for every future live test in this project, not only step 3's.
+
 ## Not yet done
 
 - **Live-test the step 3 build**: staged as before — load with the toggle
