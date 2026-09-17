@@ -486,15 +486,31 @@ recovery path" DESIGN.md's own risk section warned about as the worst
 case for this class of bug. The fail-closed design (a fresh MPC process
 either starts clean or aborts immediately) held up under a real failure.
 
+## Step 2 fix (2026-09-18, compiled offline, not yet loaded live): lazy setup on MPC's own fd
+
+Implemented the fix designed after live load test #3: `force_shadow_ctor()`
+no longer touches `/dev/dri/card0` at all. Plane/property resolution and
+buffer creation now happen exactly once, `pthread_once`-guarded, triggered
+from inside the interposed `ioctl()` the first time a real
+`DRM_IOCTL_MODE_ATOMIC` call is seen — using **that call's own `fd`**
+(guaranteed already fully initialized and mastered by MPC, since MPC is
+actively issuing commits on it) instead of a second independently-opened
+one. The one-time setup work (a handful of synchronous ioctl round-trips)
+runs inline before that first real commit is passed through, adding a
+small, one-time, one-call delay — negligible next to the DESIGN.md-
+confirmed ~5Hz idle commit rate, and that first commit still passes
+through completely unmodified regardless of setup's outcome, since the
+toggle is off by default. Compiled clean (`-Wall -Wextra`, no warnings),
+`readelf` confirms both `ioctl`/`__ioctl_time64` still resolve correctly
+and dependencies are unchanged. **Not yet tested live.**
+
 ## Not yet done
 
-- **Fix and re-test live**: rewrite `force_shadow_ctor()` to drop its own
-  `/dev/dri/card0` open entirely; move plane/property resolution and
-  buffer creation to a `pthread_once`-guarded one-time setup on the first
-  intercepted `DRM_IOCTL_MODE_ATOMIC` call, using that call's own `fd`.
-  Re-run the same staged live-test plan (toggle off first, confirm clean
-  setup logs, only then create the toggle file) from scratch once that's
-  done — this is the very next step for the next session.
+- **Re-test the fixed step 2 build live**: same staged plan as before
+  (toggle file absent first — confirm clean setup logs and a stable,
+  non-crash-looping process — only then create `/tmp/force_shadow_on` and
+  check for the magenta screen plus clean recovery on removing it). This
+  is the next step for the next session.
 - Rendering real content into the buffer (software rasterization) instead
   of a solid test color — comes after the substitution mechanism itself is
   confirmed stable live.

@@ -7,12 +7,24 @@
  * libdrm.so.2.4.0 links against the newer name only on this device --
  * confirmed live via readelf -r; see the comment on the alias below).
  *
- * At load, resolves the live primary plane object and its FB_ID/CRTC_ID
- * property IDs BY NAME -- never hardcoded, since DESIGN.md already
- * confirmed these are driver/kernel-assigned per boot, not a stable UAPI
- * constant -- then allocates one reusable 800x1280 XRGB8888 dumb buffer +
- * framebuffer, filled with a solid, deliberately-artificial test color
- * (bright magenta, never a color MPC's own UI would show).
+ * On the FIRST real DRM_IOCTL_MODE_ATOMIC call seen (never at load time --
+ * see "live load test #3" in DESIGN.md), resolves the live primary plane
+ * object and its FB_ID/CRTC_ID property IDs BY NAME -- never hardcoded,
+ * since DESIGN.md already confirmed these are driver/kernel-assigned per
+ * boot, not a stable UAPI constant -- then allocates one reusable
+ * 800x1280 XRGB8888 dumb buffer + framebuffer, filled with a solid,
+ * deliberately-artificial test color (bright magenta, never a color
+ * MPC's own UI would show). Deliberately reuses MPC's OWN fd from that
+ * call for all of this setup, rather than opening a second one: live
+ * load test #3 crash-looped MPC 61 times in under 4 minutes because an
+ * earlier version of this file opened its own independent
+ * /dev/dri/card0 fd in the constructor (before MPC's own main() ever
+ * touches the display) and most likely won DRM master before MPC could
+ * -- MPC's own "Failed to initialise display (another process running?),
+ * aborting!" is a defensive check for exactly that condition. Using the
+ * fd from an already-happening real atomic commit sidesteps this
+ * entirely: by definition MPC is already fully initialized and mastered
+ * on that fd by the time we see it.
  *
  * No libdrm/kernel headers are available in this project's offline armhf
  * cross-compile environment (see README.md), so the DRM UAPI structs
@@ -48,7 +60,6 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -380,26 +391,25 @@ static void force_shadow_ctor(void) {
     if (logf) setvbuf(logf, NULL, _IOLBF, 0); /* line-buffered: survives a crash */
     logline("force_shadow.so loaded -- step 2 (FB_ID substitution build), real_ioctl=%p",
              (void*)real_ioctl);
+    /* Deliberately does NOT touch /dev/dri/card0 here -- see file header
+     * comment on live load test #3. Setup happens lazily, on MPC's own
+     * fd, the first time we see a real atomic commit (below). */
+}
 
-    if (!real_ioctl) return; /* nothing safe to do; shadow_ready stays false */
+/* Guards the one-time setup below so it runs exactly once even if more
+ * than one thread ever calls through ioctl() for DRM_IOCTL_MODE_ATOMIC
+ * (not observed so far -- all evidence points to a single "MPC Main
+ * Thread" doing this -- but cheap to guard against rather than assume). */
+static pthread_once_t setup_once = PTHREAD_ONCE_INIT;
+static int setup_fd = -1; /* set just before triggering setup_once */
 
-    int fd = open("/dev/dri/card0", O_RDWR);
-    if (fd < 0) {
-        logline("open(/dev/dri/card0) failed: %s -- shadow mode unavailable, "
-                 "pass-through only", strerror(errno));
-        return;
-    }
-
+static void do_lazy_setup(void) {
+    int fd = setup_fd;
+    logline("first real atomic commit seen on fd=%d -- running one-time setup", fd);
     resolve_plane_and_props(fd);
     if (plane_obj_id && fb_id_prop_id) {
         create_shadow_buffer(fd);
     }
-
-    /* Deliberately leave fd open for the process lifetime (used only for
-     * the one-time setup above; the actual FB_ID rewrite happens on
-     * MPC's own already-open fd inside the intercepted ioctl() call, not
-     * this one). */
-
     if (plane_obj_id && fb_id_prop_id && shadow_fb_id) {
         shadow_ready = 1;
         logline("setup complete: plane=0x%x FB_ID_prop=%u shadow_fb_id=%u "
@@ -485,6 +495,10 @@ int ioctl(int fd, unsigned long request, ...) {
     if (request == DRM_IOCTL_MODE_ATOMIC) {
         static uint64_t count = 0;
         uint64_t c = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
+        if (c == 1) {
+            setup_fd = fd;
+            pthread_once(&setup_once, do_lazy_setup);
+        }
         if (shadow_ready && (c % SHADOW_TOGGLE_CHECK_EVERY == 1)) {
             int was_on = shadow_on;
             poll_toggle();
