@@ -43,6 +43,22 @@ static void force_shadow_ctor(void) {
     }
 }
 
+/* On glibc >= 2.34, ioctl() and __ioctl_time64() are the exact same
+ * function at the same address, exported under two different dynamic
+ * symbol names (__ioctl_time64@GLIBC_2.34 is the newer one, part of the
+ * Y2038 64-bit time_t ABI rework -- confirmed live: readelf on this
+ * device's own libc.so.6 shows both names resolving to the identical
+ * address). A caller linked against the newer name (confirmed live:
+ * libdrm.so.2.4.0's drmIoctl() is -- readelf -r shows its PLT relocation
+ * is against __ioctl_time64@GLIBC_2.34, not plain ioctl) never looks up
+ * the plain "ioctl" symbol at all, so an LD_PRELOAD that only defines
+ * "ioctl" is silently invisible to it -- confirmed live 2026-09-17: this
+ * build's own ioctl() hook loaded fine but never saw a single real
+ * DRM_IOCTL_MODE_ATOMIC call that strace independently proved was
+ * happening on the same fd in the same process at the same time. Export
+ * both names pointing at the same code so either caller reaches us. */
+int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioctl")));
+
 int ioctl(int fd, unsigned long request, ...) {
     va_list ap;
     va_start(ap, request);

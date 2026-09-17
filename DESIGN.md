@@ -297,15 +297,31 @@ process's own `/dev/dri/card0` fd — and that `_IOC(...)` decodes to exactly
 on. So the real calls are unambiguously happening, with the expected
 request code, on the expected fd, inside the expected process, while our
 hook is loaded — and our hook still isn't seeing them.
-**Root cause not yet found.** Leading hypothesis: `libdrm.so.2.4.0`'s
-`drmIoctl()` (or something else in MPC's call path) isn't going through the
-dynamically-linked libc `ioctl()` symbol at all for this call — e.g. a raw
-`syscall(SYS_ioctl, ...)`, a statically-inlined variant, or some other path
-LD_PRELOAD symbol interposition can't reach. Not yet confirmed; would need
-pulling `libdrm.so.2.4.0` off the device and disassembling `drmIoctl()`
-(the existing Docker+QEMU armhf toolchain can do this) rather than more
-live restarts. **This is now the single biggest open blocker** — there's
-no point building buffer-substitution logic into a hook that never runs.
+**Root cause found (2026-09-17, offline, no device risk):** pulled
+`libdrm.so.2.4.0` and `libc.so.6` off the device (`scp`, read-only) and
+inspected them with `readelf` on the host, no QEMU/live device needed for
+this part. `readelf -r libdrm.so.2.4.0` shows `drmIoctl()`'s own PLT
+relocation is against `__ioctl_time64@GLIBC_2.34` — **not** plain `ioctl`.
+`readelf --dyn-syms -V libc.so.6` confirms both `ioctl@@GLIBC_2.4` and
+`__ioctl_time64@@GLIBC_2.34` exist in this libc build, at the exact same
+address (`0xebc84`) — same function, two different exported dynamic symbol
+names, a side effect of glibc's Y2038 64-bit-time_t ABI rework in 2.34+.
+Our interposer only ever defined a symbol literally named `ioctl`, so
+`drmIoctl()`'s call — linked against the newer name — never looked it up
+at all; it resolved straight through to glibc's own implementation,
+completely invisible to LD_PRELOAD interposition of the old name. This is
+a known class of gotcha for `ioctl`/`fcntl`/similar interposers on
+glibc ≥2.34, not a flaw in the interposition approach itself.
+
+**Fixed and rebuilt (not yet tested live):** `src/force_shadow.c` now also
+exports `__ioctl_time64` as a hard alias (`__attribute__((alias("ioctl")))`)
+of the same hook function, mirroring exactly how libc itself exposes the
+same code under both names. `readelf --dyn-syms dist/force_shadow.so`
+confirms both `ioctl` and `__ioctl_time64` now resolve to the same address
+in the rebuilt `.so`. **This has not yet been loaded on the device** — the
+live test needed to confirm the heartbeat actually fires now is the
+obvious next step, but is a fresh live-load event and should go through
+the same care as before (see the locking lesson below).
 
 **Incidental finding — a real, pre-existing platform race, not caused by
 this project but triggered by how this test edited state:**
@@ -337,12 +353,13 @@ about how addons manage this file.
 
 ## Not yet done
 
-- **Diagnosing why `DRM_IOCTL_MODE_ATOMIC` calls never reach the
-  interposed `ioctl()`** — now the single biggest blocker, see above.
-  Needs static disassembly of `libdrm.so.2.4.0`'s `drmIoctl()`, not more
-  live restarts.
+- **Live-testing the `__ioctl_time64` alias fix** — root cause found and
+  fixed offline (see above), but not yet confirmed live. Next live test
+  should check the heartbeat log actually increments this time, using the
+  `/dev/shm/.LD_PRELOAD.lock` convention (see below) rather than a raw
+  file overwrite.
 - Writing any of the actual buffer-substitution interposer logic — blocked
-  on the above; no point substituting a buffer in a hook that never fires.
+  on confirming the hook fires live first.
 - Confirming property-ID *name* resolution actually works as described
   (steps above are based on standard DRM UAPI behavior, not yet tested
   live on this device).
