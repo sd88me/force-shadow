@@ -266,15 +266,91 @@ one-off manual edit, not a persistent boot-time addon script (no
 this test a pass, even if the log/maps checks look clean — that's exactly
 the gap that hid `force-audioin`'s own incident for a while.
 
+## Live load test #1 (2026-09-17): loaded safely, but the hook never fired
+
+Ran the plan from the previous section for real: pushed `dist/force_shadow.so`
+to `/tmp` on the device, manually rewrote `/dev/shm/.LD_PRELOAD` to prepend
+it (backed up the original first), `systemctl restart acvs`, verified, then
+rolled back cleanly. Full sequence and both outcomes below.
+
+**Result 1 — the load itself is safe.** After restart, `force_shadow.so`
+showed up correctly in the live MPC process's `/proc/<pid>/maps`, and
+physical on-device checks (touchscreen response, pad/button response,
+standard audio) all came back normal, twice — once right after loading,
+once again after rollback. No crash, no hang, no garbage screen. This
+de-risks "can a brand-new never-loaded-before library be LD_PRELOAD'd into
+MPC at all" — yes, cleanly, at least for this pass-through-only build.
+
+**Result 2 — the interposed `ioctl()` never actually caught a single
+`DRM_IOCTL_MODE_ATOMIC` call, despite being loaded correctly.** The
+library's constructor ran (log line present), `ioctl` is confirmed present
+as a `GLOBAL DEFAULT` dynamic symbol in the compiled `.so` (`readelf
+--dyn-syms`), and the library needs exactly `libc.so.6`/`libpthread.so.0`/
+`libdl.so.2` — nothing unusual. But `/tmp/force_shadow.log` never printed a
+single "atomic commit" heartbeat line, even though the heartbeat is
+designed to fire on the very *first* match (`c=1, 1%60==1`), and a bounded
+4-second `strace -f -p <pid> -e trace=ioctl` against the same live process
+in the same window independently caught **92** real
+`ioctl(15, _IOC(_IOC_READ|_IOC_WRITE, 0x64, 0xbc, 0x38), ...)` calls on the
+process's own `/dev/dri/card0` fd — and that `_IOC(...)` decodes to exactly
+`0xc03864bc`, the same `DRM_IOCTL_MODE_ATOMIC` constant this build filters
+on. So the real calls are unambiguously happening, with the expected
+request code, on the expected fd, inside the expected process, while our
+hook is loaded — and our hook still isn't seeing them.
+**Root cause not yet found.** Leading hypothesis: `libdrm.so.2.4.0`'s
+`drmIoctl()` (or something else in MPC's call path) isn't going through the
+dynamically-linked libc `ioctl()` symbol at all for this call — e.g. a raw
+`syscall(SYS_ioctl, ...)`, a statically-inlined variant, or some other path
+LD_PRELOAD symbol interposition can't reach. Not yet confirmed; would need
+pulling `libdrm.so.2.4.0` off the device and disassembling `drmIoctl()`
+(the existing Docker+QEMU armhf toolchain can do this) rather than more
+live restarts. **This is now the single biggest open blocker** — there's
+no point building buffer-substitution logic into a hook that never runs.
+
+**Incidental finding — a real, pre-existing platform race, not caused by
+this project but triggered by how this test edited state:**
+`/dev/shm/.LD_PRELOAD` isn't a static file — `boot.sh` (which reruns in
+full on every `systemctl restart acvs`, not just cold boot) kills every
+`AddOns/*.sh` script, reloads them all **backgrounded**
+(`"$f" &` in a loop), waits a single `sleep 1`, then reads the file and
+execs MPC. `AddOns/run_ForceAudioIn.sh` owns re-inserting its own
+`forceAudioIn.so` entry on reload, and — per its own header comment, citing
+a live 2026-09-13 incident — is the only addon script with any locking
+around this file at all (`mkdir`-based lock at `/dev/shm/.LD_PRELOAD.lock`,
+~5s bounded retry, fails open). This test's manual `cat`/rewrite of the
+file used **no locking**, exactly the unsafe pattern that comment warns
+about. Result: after this test's `acvs` restart, the *running* MPC
+process's actual `LD_PRELOAD` (checked via `/proc/<pid>/environ`) was
+missing `forceAudioIn.so` entirely — `run_ForceAudioIn.sh`'s backgrounded
+re-arm apparently hadn't won the lock and rewritten itself back in before
+boot.sh's `sleep 1` elapsed and MPC launched. Confirmed this wasn't a
+lasting problem: rollback (restore the pre-test file content, restart
+`acvs` again) produced a clean process whose `/proc/<pid>/environ` showed
+all three original libraries correctly present, and physical checks passed
+again. **Lesson for next time**: any future manual edit of
+`/dev/shm/.LD_PRELOAD` should take `/dev/shm/.LD_PRELOAD.lock` the same way
+`run_ForceAudioIn.sh` does, not do a raw overwrite — or better, do the test
+through a real (even if throwaway) `AddOns/run_ForceShadow.sh`-style script
+that participates in the same kill/reload lifecycle instead of a one-off
+manual `scp`+edit, so it isn't racing against `boot.sh`'s own assumptions
+about how addons manage this file.
+
 ## Not yet done
 
-- Writing any of the actual interposer code (`.so`, constructor,
-  hook implementation) — this document is scoping only.
+- **Diagnosing why `DRM_IOCTL_MODE_ATOMIC` calls never reach the
+  interposed `ioctl()`** — now the single biggest blocker, see above.
+  Needs static disassembly of `libdrm.so.2.4.0`'s `drmIoctl()`, not more
+  live restarts.
+- Writing any of the actual buffer-substitution interposer logic — blocked
+  on the above; no point substituting a buffer in a hook that never fires.
 - Confirming property-ID *name* resolution actually works as described
   (steps above are based on standard DRM UAPI behavior, not yet tested
   live on this device).
 - Confirming a software-rasterized buffer swap doesn't itself trigger the
   same class of "restart-adjacent" instability `force-audioin` hit — this
-  is now the single biggest remaining unknown, since touch-grab (the other
-  major open question) is now confirmed safe.
+  is now the single biggest remaining *unblocked* unknown, since touch-grab
+  (the other major open question) is now confirmed safe.
 - MidiLoop combo wiring to actually toggle the shared flag.
+- If any future test needs to edit `/dev/shm/.LD_PRELOAD` live again: use
+  the `/dev/shm/.LD_PRELOAD.lock` `mkdir`-lock convention, per the incident
+  above.
