@@ -538,7 +538,7 @@ int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioc
  * safety benefit -- worst case on an actual race is one glitched frame
  * (self-correcting on the next commit), never persistent corruption,
  * since MPC's own memory is never touched by this design either way. */
-#define MAX_TOTAL_PROPS 256
+#define MAX_TOTAL_PROPS 4096
 static uint32_t tmp_props[MAX_TOTAL_PROPS];
 static uint64_t tmp_values[MAX_TOTAL_PROPS];
 
@@ -561,7 +561,15 @@ static int try_substitute_fb(struct drm_mode_atomic *req,
 
     uint32_t total = 0;
     for (uint32_t i = 0; i < req->count_objs; i++) total += counts[i];
-    if (total == 0 || total > MAX_TOTAL_PROPS) return 0;
+    if (total == 0) return 0;
+    if (total > MAX_TOTAL_PROPS) {
+        static uint64_t oversize_count = 0;
+        if (__atomic_add_fetch(&oversize_count, 1, __ATOMIC_RELAXED) % 30 == 1) {
+            logline("commit had %u total props (> %d cap) -- skipped substitution "
+                     "this commit, not touching anything", total, MAX_TOTAL_PROPS);
+        }
+        return 0;
+    }
 
     uint32_t offset = 0, found_at = UINT32_MAX;
     for (uint32_t i = 0; i < req->count_objs; i++) {
