@@ -504,13 +504,47 @@ toggle is off by default. Compiled clean (`-Wall -Wextra`, no warnings),
 `readelf` confirms both `ioctl`/`__ioctl_time64` still resolve correctly
 and dependencies are unchanged. **Not yet tested live.**
 
+## Live load test #4, phase A (2026-09-18): lazy-setup fix confirmed live
+
+Re-ran the staged test with the fixed build, toggle file absent. **No
+crash loop this time** — a single, stable MPC process throughout,
+confirmed via a stable PID and `ps`. The lazy setup fired exactly once, on
+the first real commit, and succeeded cleanly:
+
+```
+first real atomic commit seen on fd=15 -- running one-time setup
+plane 0x21: 13 props, FB_ID=17 CRTC_ID=20 (type=Primary)
+plane 0x23: 13 props, FB_ID=17 CRTC_ID=20
+plane 0x26: 13 props, FB_ID=17 CRTC_ID=20
+plane 0x28: 13 props, FB_ID=17 CRTC_ID=20
+resolved primary plane via type=Primary: obj=0x21 FB_ID=17
+shadow buffer ready: handle=18 fb_id=64 pitch=3200 size=4096000
+setup complete: plane=0x21 FB_ID_prop=17 shadow_fb_id=64 -- shadow mode ARMED (still off)
+atomic commit #1 seen on fd=15 (pass-through)
+```
+
+Notable: the `type==Primary` check picked object `0x21` — the exact same
+object the original 2026-09-14 ptrace-based research found manually (by
+"most properties" heuristic back then) — and resolved `FB_ID=17`/
+`CRTC_ID=20`, the exact same property IDs found that day too. These
+apparently haven't changed across reboots on this device so far, though
+resolving by name (rather than trusting that) remains the right call.
+Shadow buffer's `pitch=3200`/format match the confirmed-live buffer
+layout exactly. Physical checks (screen/pads/audio) all normal with the
+toggle still off — behavior identical to step 1, as designed. **This
+confirms the crash-loop fix works and setup is fully correct.**
+
 ## Not yet done
 
-- **Re-test the fixed step 2 build live**: same staged plan as before
-  (toggle file absent first — confirm clean setup logs and a stable,
-  non-crash-looping process — only then create `/tmp/force_shadow_on` and
-  check for the magenta screen plus clean recovery on removing it). This
-  is the next step for the next session.
+- **Live load test #4, phase B**: the actual untested piece — create
+  `/tmp/force_shadow_on` while the fixed build (now confirmed armed and
+  stable) is loaded, check for the expected solid magenta screen, then
+  remove the file and confirm clean, immediate, reliable reversion. This
+  is the single biggest remaining unknown in the whole project: unlike
+  every failure mode hit so far, a bug in the substitution path itself
+  (not just the interception/setup path) is the one DESIGN.md's own risk
+  section flagged as potentially unrecoverable without a power cycle
+  (stuck/garbage screen). Not yet attempted.
 - Rendering real content into the buffer (software rasterization) instead
   of a solid test color — comes after the substitution mechanism itself is
   confirmed stable live.
