@@ -1152,6 +1152,72 @@ listening for audio stutter, before ever trying a fast drag or multiple
 rapid drags. Toggle-off reliability is still unsolved regardless of this
 test's outcome -- revert via `acvs` restart as always.
 
+## Live load test #10 (2026-09-18): drag math confirmed correct, but redraw never fires while touch is grabbed
+
+Ran the staged plan from the section above. Stage 1 (pass-through) and
+stage 2 (toggle-on, no touch, static and stable) both passed clean.
+Stage 3 (a deliberate slow drag on the VCO TUNE knob) surfaced a real
+design gap, not a bug in the new math.
+
+**The touch/drag pipeline is provably correct.** The log during the drag
+shows a clean, continuous trajectory: `px` held steady at 202–211
+(matching VCO TUNE's true center `cx=213`) while `py` fell steadily
+218→196→169→147→124→102→79→57 as the user dragged upward — exactly the
+expected shape for a real vertical drag starting inside that knob's hit
+circle. The underlying value math (traced by hand against this log) was
+moving the knob from 0% toward roughly 53% by the last sample.
+
+**But the pointer visually never moved.** Root cause, found from the
+same log: **zero `DRM_IOCTL_MODE_ATOMIC` commits happened during the
+entire drag.** `maybe_redraw_shadow()` only runs from inside
+`maybe_substitute_fb()`, which only runs when MPC itself submits a
+commit — and while shadow mode holds `EVIOCGRAB` on the touchscreen, MPC
+never sees the touch at all, and has no other reason to redraw its own
+(now-hidden, unchanged) UI. The redraw-cadence design in the previous
+section's writeup assumed MPC's own commit cadence would be available to
+piggyback on; it isn't, specifically in the one situation (active
+shadow-mode interaction) where redraws are actually needed. This is
+exactly the kind of thing the staged test plan was written to catch
+before it reached a full interactive build.
+
+**Open question this doesn't resolve, and shouldn't be guessed at**:
+does this panel need a *fresh atomic commit* to notice a pixel-only
+content change in an already-active `FB_ID` buffer, or does it scan
+continuously and would pick up the change passively once written? Live
+load test #7 already flagged this panel as possibly a **command-mode**
+DSI panel (its own internal GRAM, requiring an explicit push — as
+opposed to a video-mode panel, continuously fed from system memory each
+refresh) as a candidate explanation for an earlier, different bug. That
+question was never actually resolved (the specific `FB_DAMAGE_CLIPS`
+hypothesis tied to it was disproven, not the underlying video-mode-vs-
+command-mode question itself). This matters a lot for the right fix:
+- If **command-mode** (needs a fresh commit): the interposer would need
+  to actively drive its own periodic/on-demand atomic commits to force a
+  refresh — genuinely new territory. This project's own fd (opened
+  separately from MPC's at setup) is documented as deliberately never
+  doing atomic commits, only inert setup calls, because it doesn't hold
+  DRM master — only MPC's fd does. Submitting a commit would mean either
+  reusing MPC's fd from a second thread (concurrent atomic commits on one
+  fd from two threads of the same process — untested, real risk) or some
+  other mechanism not yet identified.
+- If **video-mode** (passive continuous scan): the fix is much simpler —
+  redraw eagerly from the touch thread the instant a value changes,
+  dropping the dependency on `maybe_substitute_fb()`/commits entirely.
+
+**Next step, not yet run**: a cheap diagnostic using only
+already-proven mechanisms, no new risky code. `EVIOCGRAB` only grabs the
+touchscreen (`event0`); the Force's physical transport buttons are a
+separate input device untouched by the grab. With a track loaded (as
+this session's test already had), starting playback via the physical
+PLAY button should make MPC generate its own regular commits (playhead/
+meter animation) independent of touch — even with shadow mode on and
+touch grabbed. If a knob dragged (but never visually updated) *snaps* to
+its dragged value the moment playback-driven commits resume, that
+confirms the "just needs any commit to hang off of" theory and rules
+out the command-mode/needs-content-aware-refresh concern. If it never
+updates even then, that points the other way. Either result is useful
+and neither requires writing new code first.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1179,16 +1245,20 @@ test's outcome -- revert via `acvs` restart as always.
   ~~The touch/landscape coordinate transform~~ is now derived,
   implemented, **and live-confirmed** (see "Touch coordinate calibration"
   above — a live tap landed 13px from a knob's true center) — trusted for
-  hit-testing now. Buffer persistence for redraw and a redraw-cadence strategy
-  (piggybacking on MPC's own commit cadence, most likely, but writing
-  into a live-scanned-out buffer synchronously on MPC's own commit thread
-  carries real tearing/latency risk not yet assessed) are both still
-  unbuilt — deliberately held back from this same pass, consistent with
-  this project's staged-testing discipline: the render primitives and the
-  touch transform were each risky/new enough on their own to earn their
-  own live check before being combined. A fuller design-language pass
-  (labels/text, closer match to MPC's own visual conventions) comes once
-  interactivity is in place.
+  hit-testing now. Interactive dragging was built and live-tested (live
+  load test #10): the drag/hit-test math is confirmed correct (a clean,
+  knob-centered trajectory in the log), but **the redraw never visually
+  fires while touch is grabbed**, because it's gated on MPC's own commit
+  cadence and MPC generates zero commits once it can't see the touch and
+  its own UI is otherwise static -- see live load test #10's writeup for
+  the full finding and the cheap, no-new-code diagnostic queued up next
+  (force an MPC-driven commit via a physical transport button during
+  playback, see whether a dragged-but-unshown value then snaps into
+  place) to determine whether this panel needs a fresh atomic commit to
+  notice pixel-only buffer changes at all, which decides what the actual
+  fix looks like. A fuller design-language pass (labels/text, closer
+  match to MPC's own visual conventions) still comes once interactivity
+  actually works end-to-end.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
