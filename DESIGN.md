@@ -772,14 +772,93 @@ was worth. **Toggle-off reliability is now explicitly unsolved and
 parked** — treat it as needing a full `acvs` restart for now, using the
 same established recovery procedure as every other test in this project.
 
+## Live load test #7, part 2 (2026-09-18): reverted-to-proven code STILL showed zero visible effect — traced to kernel debugfs
+
+Re-tested the reverted build (byte-for-byte identical to `ef62a6d`, the
+commit that showed colors successfully earlier — confirmed via
+`git diff ef62a6d HEAD -- src/force_shadow.c`, only comments differed).
+Toggle-on again produced continuous `SUBSTITUTING` log lines, real touch
+events, no errors — and the user still saw MPC's normal mixer page, not
+the color pattern. Since the code was provably identical to a working
+run, this ruled out a code regression and pointed at device/session state
+instead: this session had done dozens of `acvs` restarts without a single
+full power cycle (the crash loop alone was 61). A power cycle wasn't
+available to test that theory directly, so a different read-only
+diagnostic was used instead.
+
+**`/sys/kernel/debug/dri/display-subsystem/state`** (kernel DRM debugfs,
+completely read-only, no risk) turned out to be available on this device
+and gave a definitive answer:
+
+```
+plane[33]: plane-0        <- object 0x21 (33 decimal) -- our plane
+	crtc=crtc-0
+	fb=65                    <- our shadow_fb_id, confirmed live-active
+	format=XR24 little-endian (0x34325258)
+	size=800x1280
+	crtc-pos=800x1280+0+0
+	src-pos=800x1280+0+0
+	color-encoding=ITU-R BT.601 YCbCr
+	color-range=YCbCr limited range
+crtc[37]: crtc-0
+	active=1
+	planes_changed=1
+```
+
+**Substitution is definitively working at the kernel/software level** —
+the kernel's own tracked atomic state has our `FB_ID`, correct format,
+full-screen size and position, on the active CRTC. This isn't a
+kernel-state or corruption question at all; the disconnect is one layer
+lower, between "kernel's committed state" and "what's actually pushed to
+the physical panel."
+
+**Leading hypothesis: `FB_DAMAGE_CLIPS`.** Plane 0x21 has 13 properties
+total (confirmed at setup), of which only `FB_ID`/`CRTC_ID`/`type` have
+ever been inspected by name. Command-mode DSI panels (plausible for this
+device, given the DSI-1 connector shown above) commonly support a
+`FB_DAMAGE_CLIPS` blob property so the driver only needs to push the
+*changed* rectangular region to the panel each frame, for power/bandwidth
+savings, rather than the whole screen every time. If MPC's own real
+commits declare a small damage region (its own redraw area — a meter, a
+cursor, whatever's actually changing) and our interposer never touches
+that property, the driver may correctly update its own internal `fb=65`
+bookkeeping (matching what debugfs shows) while only ever transferring
+the small, MPC-declared damaged region to the panel — meaning our
+full-screen buffer could sit there at the kernel level indefinitely
+without ever actually reaching the glass outside that one small region,
+which could easily be imperceptible depending on what's in it.
+
+**Not yet fixed** — `FB_DAMAGE_CLIPS` is a blob property (its value is a
+blob ID referencing an array of rectangles, not a plain integer like
+`FB_ID`), so overriding it needs new code: resolve the property by name
+during setup (same pattern as `FB_ID`/`CRTC_ID`), create one reusable
+full-buffer damage-rect blob via `DRM_IOCTL_MODE_CREATEPROPBLOB` at setup
+time (a one-time, inert, read-adjacent operation — same safety class as
+the existing dumb-buffer creation), and substitute that blob's ID into
+the commit's damage-clips slot alongside the `FB_ID` swap. Worth
+confirming the property is actually present and named `FB_DAMAGE_CLIPS`
+first (log all 13 property names during setup, not just the three
+currently checked) before writing the blob-handling code, to avoid
+guessing at a property that might not even exist on this driver.
+
 ## Not yet done
 
-- **Live-test that the reverted in-place write actually shows visible
-  substitution again** (this is now the most basic open question — confirm
-  before anything else).
+- **Confirm `FB_DAMAGE_CLIPS` (or find the actual property) is really
+  what's blocking visibility** — log all property names found on plane
+  0x21 during setup (cheap, no new mechanism, just more logging) before
+  writing any blob-handling code.
+- **Implement and test the `FB_DAMAGE_CLIPS` override** if confirmed —
+  the next real code change once the property name is verified.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   needs a fresh angle, not more iteration on the two approaches already
-  tried and abandoned.
+  tried and abandoned. Worth revisiting once forward substitution is
+  actually visible again, since it may turn out to be related (e.g. if
+  reversion also needs damage-clips handling to be visible promptly).
+- Consider a full power cycle before the next live test regardless, given
+  this session's unusually high number of same-boot `acvs` restarts —
+  ruling out state drift as a contributing factor, even though the
+  debugfs evidence above points at damage-clips as the more likely single
+  explanation on its own.
 - **Real rendering into the shadow buffer** (software rasterization of an
   addon's actual UI, using the tracked touch x/y/down state for hit-
   testing) in place of the solid magenta test color. This is the current
