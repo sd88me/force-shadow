@@ -882,12 +882,27 @@ static int touch_x = -1, touch_y = -1, touch_down = 0;
 #define MAZE_CTRL_SOCK "/tmp/maze_ctrl.sock"
 #define MAZE_SEND_TIMEOUT_MS 50
 
+/* Live-tested 2026-09-18 and found to kill maze_host: an earlier version
+ * of this function closed the socket right after send(), never reading
+ * the "OK\n"/"ERR\n" reply. maze_host always writes that reply back
+ * before its own handler returns -- if this side's close() lands before
+ * that write completes, maze_host's own send() hits an already-closed
+ * socket, and if it doesn't handle/ignore SIGPIPE, that's a process-
+ * killing signal, not just a failed write. Confirmed by isolation: with
+ * nothing sending it SET commands, maze_host survived 45s untouched with
+ * no crash; it died within one interactive drag both times this
+ * function's earlier close-without-reading version was live. The
+ * reference client (force-maze/maze-voice/web/server.py's own
+ * ctrl_request()) always calls recv() before closing -- this now does
+ * the same, bounded by the same short timeout so a slow/hung reply still
+ * can't stall the touch thread for long. */
 static void send_maze_set(const char *key, float value) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return;
 
     struct timeval tv = { 0, MAZE_SEND_TIMEOUT_MS * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -897,13 +912,15 @@ static void send_maze_set(const char *key, float value) {
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
         char line[96];
         int n = snprintf(line, sizeof(line), "SET %s %.2f\n", key, value);
-        if (n > 0) send(fd, line, (size_t)n, MSG_NOSIGNAL);
+        if (n > 0 && send(fd, line, (size_t)n, MSG_NOSIGNAL) > 0) {
+            char reply[16];
+            recv(fd, reply, sizeof(reply), 0); /* result unused -- just
+                                                  * drains it so our close()
+                                                  * can never race ahead of
+                                                  * maze_host's own reply
+                                                  * write. */
+        }
     }
-    /* Reply intentionally not read -- shadow mode's own UI has nowhere
-     * to show it, and this keeps every call a bounded, fast fire-and-
-     * forget from the touch thread. Closing without reading is fine:
-     * the only leak load test web/server.py's own header comment warned
-     * about was skipping the close entirely, not skipping the read. */
     close(fd);
 }
 

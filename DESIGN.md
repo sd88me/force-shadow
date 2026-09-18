@@ -1368,6 +1368,67 @@ static toggle-on), then the actual test -- with `maze_host` running and
 a MIDI track routed so the real audio is audible, drag a knob and
 listen for the sound actually changing, not just watch the pointer move.
 
+## Live load test #13 (2026-09-18): closing the loop killed maze_host, root cause found and fixed offline
+
+First live test of the DSP-control wiring. Started `maze_host` manually
+via SSH (nodeServer's `/moduler` page, the documented way to start it,
+wasn't available from here) -- `NSMODULE.json`'s own `ARGUMENTS` gave the
+exact command line. First attempt used plain `nohup ... &`; it survived
+one immediate check but was gone by the next SSH command -- suspected at
+first to be session-cleanup killing a backgrounded child, fixed by using
+`setsid` instead (confirmed surviving a fresh SSH connection after that).
+
+**Sequencing constraint respected, worth recording explicitly**:
+`force-maze/maze-voice/DESIGN.md`'s own hard rule says an `acvs` restart
+while a voice is attached reliably kills pads/buttons. Stopped
+`maze_host` before this session's `acvs` restart (to load the new
+build), and only started it again once MPC was already back up --
+matching that project's own documented safe sequence ("always start it
+after boot, from this page"), not the order this test would have
+defaulted to otherwise.
+
+**The actual test**: routed a MIDI track to `Maze:In (Mockba)`, got a
+sequence playing and audible, toggled shadow mode on, dragged a knob.
+**Both attempts (RESO, then VCO TUNE) "killed the audio"** -- not a
+filter-closing-down effect, `maze_host` itself had stopped running each
+time (`/tmp/maze_ctrl.sock` refusing connections, process gone from
+`ps`).
+
+**Root cause, found through isolation rather than guessing**: started
+`maze_host` a third time with force_shadow.so **not loaded at all** and
+touched nothing for 45 seconds (via a backgrounded wait + check, not a
+blind assumption) -- it survived cleanly, undisturbed the whole time.
+This ruled out "maze_host is just generally unstable" and "the
+session-cleanup issue wasn't really fixed" as explanations, and pointed
+squarely at something specific to this project's own `SET`-sending code.
+Re-reading `send_maze_set()`: it sent the `SET` line and closed the
+socket immediately, **never reading `maze_host`'s own `OK\n`/`ERR\n`
+reply** -- a design choice the code's own comment justified as safe,
+reasoning by analogy to `web/server.py`'s documented fd-leak fix (whose
+actual lesson was "always close", not "reading is optional"). But
+`maze_host` (`src/maze_host.cpp`'s `handle_ctrl_line()`) always calls
+`send(fd, "OK\n", ...)` back before its handler returns. If this
+project's own `close()` lands before that write completes, `maze_host`'s
+own `send()` hits an already-closed socket -- and if that process
+doesn't ignore/handle `SIGPIPE` (the default disposition for an
+unhandled `SIGPIPE` is to terminate the process outright, not just fail
+the call), that single interaction is enough to kill it. The reference
+client (`web/server.py`'s own `ctrl_request()`) always calls `recv()`
+before closing, which avoids this exact race -- this project's client
+just never had, until now.
+
+**Fixed**: `send_maze_set()` now does a bounded `recv()` (same 50ms
+timeout already used for the send) before `close()`, draining the reply
+so this side's close can never race ahead of `maze_host`'s own write.
+Compiled clean, dependency profile unchanged (still plain
+`socket()`/`recv()`, no new library). **Not yet re-tested live** -- next
+step is repeating this exact test (drag a knob while a note plays,
+listen for the real sound changing) with the fix in place.
+
+Device fully reverted afterward (`maze_host` was already down by the
+time of the `acvs` restart, so no sequencing conflict with the hard rule
+above this time either). All physical checks passed.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
