@@ -1429,6 +1429,28 @@ Device fully reverted afterward (`maze_host` was already down by the
 time of the `acvs` restart, so no sequencing conflict with the hard rule
 above this time either). All physical checks passed.
 
+## Live load test #14 (2026-09-18): the loop closed — a dragged knob audibly changes the real sound
+
+Re-ran live load test #13's exact scenario with the `SIGPIPE` fix in
+place, same sequencing discipline (`maze_host` stopped before the
+`acvs` restart to load the new build, started again only once MPC was
+back up, `setsid` this time too).
+
+**Confirmed working, twice, on two different params**: dragging VCO
+TUNE audibly changed pitch; dragging FOLD DRIVE (the green knob)
+audibly changed too. `maze_host` stayed alive and responsive through
+both — checked directly via `ps` immediately after each drag, still
+running. This is the project's third central milestone, after buffer
+substitution (test #4) and interactive dragging (test #11): a knob on
+the shadow screen now drives the actual, running DSP in real time, not
+just its own on-screen pointer. Every piece built today -- rendering,
+touch calibration, dragging, decoupled redraw, and now real parameter
+control -- is proven together, end-to-end, on real hardware.
+
+Device reverted cleanly (`maze_host` stopped before the final `acvs`
+restart, same sequencing discipline as the load). All physical checks
+passed.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1473,6 +1495,21 @@ above this time either). All physical checks passed.
   attempted. A fuller design-language pass (labels/text, closer match to
   MPC's own visual conventions) is the natural next visual-polish step
   now that the interactive mechanism itself is proven end-to-end.
+- ~~Wire knobs to the real DSP~~ — **done, live load tests #13/#14**: a
+  dragged knob sends `SET` commands over `maze_host`'s own Unix control
+  socket and audibly changes the sound, confirmed live on two params
+  (VCO TUNE, FOLD DRIVE) after fixing a `SIGPIPE` bug (test #13) that was
+  killing `maze_host` on the first attempt. Only wired for the current
+  6-knob mockup subset — extending to the rest of `docs/CC-MAP.md`'s
+  params (or other addons' own params) is straightforward repetition of
+  the same pattern (`shadow_knob_param[]` + the layout table), not new
+  design work, whenever more knobs/pages are added.
+- Sequencing rule to carry into all future live tests involving a voice
+  addon (from `force-maze/maze-voice/DESIGN.md`'s own hard rule,
+  respected in tests #13/#14): **stop `maze_host` (or any attached
+  voice) before restarting `acvs`**, only start it again once MPC is
+  back up — restarting `acvs` with a voice attached reliably kills
+  pads/buttons.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
