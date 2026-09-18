@@ -1268,6 +1268,49 @@ them via a real `FB_ID`-only atomic commit instead of overwriting the
 live one in place) would fix it, but is new, more invasive work, not
 attempted today.
 
+## Live load test #12 (2026-09-18): decoupled painting confirmed live, with an honest caveat
+
+Tested the fix for live load test #11's remaining open problem
+(dragging only worked because a track was playing): `maybe_redraw_shadow()`
+now also gets called directly from the touch thread, on every touch
+event, not just from `maybe_substitute_fb()`'s commit-gated path.
+
+Staged as before: pass-through confirmed clean, then toggled on with
+**nothing playing**. The toggle poll itself needed a real MPC-driven
+commit to even notice the toggle file (consistent with every prior
+test) — a blank-space tap didn't produce one, but switching to the
+mixer page did. Once shadow mode engaged, the same drag test as live
+load tests #10/#11: **user confirmed the pointer moved, same tearing as
+before, same as the playback-driven test.**
+
+**Honest caveat, not a clean isolated result**: checking the log
+afterward, `SUBSTITUTING` commits were still flowing steadily throughout
+the drag (#1381→#1981, roughly one every ~2 seconds) — this session's
+mixer page apparently has its own idle redraw cadence (consistent with
+DESIGN.md's much earlier note that idle commit cadence "doesn't hold for
+every screen/state" — apparently some states, like this one, still
+produce a background trickle even with nothing playing). So this test
+does not cleanly prove the fix works with **zero** commits, the way live
+load test #10's failure was clean (that test had exactly zero commits
+logged during its drag). What it does show: even with commits arriving
+only every ~2 seconds, the knob felt responsive rather than laggy —
+consistent with the touch-thread's immediate paint being the thing
+actually driving visible updates moment-to-moment, not the occasional
+commit. **Practically fixed for at least this screen state; a
+truly-static screen (matching live load test #10's original zero-commit
+condition exactly) has not been re-tested against this fix specifically.**
+If that edge case ever matters in practice (a real addon page, shadow
+mode on, completely idle, no periodic redraw from anything), it's worth
+a dedicated re-check before relying on it — but it's no longer the
+blocking unknown it was after live load test #10.
+
+Device reverted cleanly (including a mid-session pad-unresponsive
+incident during this test's own `acvs` restart cycle, recovered by a
+second restart — matches `force-maze/maze-voice/DESIGN.md`'s own
+documented "an `acvs` restart... reliably kills pads/buttons" platform
+quirk, not something caused by this project's own code, which was inert
+pass-through at the time). All physical checks passed afterward.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1296,20 +1339,22 @@ attempted today.
   implemented, **and live-confirmed** (see "Touch coordinate calibration"
   above — a live tap landed 13px from a knob's true center) — trusted for
   hit-testing now. ~~Interactive dragging~~ is built and **live-confirmed
-  end-to-end** (live load test #11, after live load test #10 first found
-  the drag/hit-test math correct but the redraw silent with nothing
-  playing): with a track playing to keep commits flowing, dragging a
-  knob visibly moves its pointer live, audio unaffected. Two things
-  remain, both scoped precisely rather than open-ended: **(1)** the
-  general case (adjusting a knob with nothing playing) still has no
-  guaranteed commit to hang a redraw off of -- idle commit cadence has
-  proven unreliable before (gaps up to 99s, live load test #4) -- needs
-  its own fix, not yet designed; **(2)** minor cosmetic tearing (a few
-  faint, shifting-angle lines, most visible on the knobs' own color
-  contrast) from the lack of double-buffering -- fixable, lower priority,
-  not attempted. A fuller design-language pass (labels/text, closer match
-  to MPC's own visual conventions) is the natural next visual-polish step
-  now that the interactive mechanism itself is proven.
+  end-to-end** (live load test #11 with a track playing, then live load
+  test #12 decoupled the redraw from commits entirely by also painting
+  directly from the touch thread on every value change). Practically
+  working now in every screen state tried, including one with nothing
+  playing -- though live load test #12's own writeup notes a caveat
+  worth remembering: that test still had a background trickle of
+  MPC-driven commits from the mixer page's own idle cadence, so a
+  literally-frozen screen (matching live load test #10's original
+  zero-commit condition exactly) hasn't been re-tested against this
+  specific fix. Low-priority re-check if it ever matters in practice, not
+  a blocker. One remaining item: minor cosmetic tearing (a few faint,
+  shifting-angle lines, most visible on the knobs' own color contrast)
+  from the lack of double-buffering -- fixable, lower priority, not
+  attempted. A fuller design-language pass (labels/text, closer match to
+  MPC's own visual conventions) is the natural next visual-polish step
+  now that the interactive mechanism itself is proven end-to-end.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
