@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -53,11 +54,33 @@ int main(int argc, char **argv) {
     int fd = open("/dev/snd/seq", O_RDWR);
     if (fd < 0) { perror("open /dev/snd/seq"); return 1; }
 
+    /* Mystery ioctl seen via strace on arecordmidi (a known-working
+     * client on this device), called immediately after PVERSION and
+     * before anything else -- not even named in this device's own
+     * strace's ioctl table, so likely newer than any header we have
+     * access to (probably a MIDI2/UMP protocol-negotiation call added
+     * post-6.5). Replicating it verbatim, with a 0 ("legacy"?) argument,
+     * to see whether it's a precondition for CREATE_PORT succeeding. */
+    int pversion = 0;
+    if (ioctl(fd, SNDRV_SEQ_IOCTL_PVERSION, &pversion) < 0) {
+        perror("PVERSION (continuing anyway)");
+    }
+    int mystery_arg = 0;
+    long unk = ioctl(fd, _IOW('S', 0x04, int), &mystery_arg);
+    fprintf(stderr, "mystery ioctl 0x04 result: %ld (errno %d: %s)\n",
+             unk, errno, strerror(errno));
+
     int my_client = 0;
     if (ioctl(fd, SNDRV_SEQ_IOCTL_CLIENT_ID, &my_client) < 0) {
         perror("CLIENT_ID"); return 1;
     }
     fprintf(stderr, "our client id: %d\n", my_client);
+
+    struct snd_seq_running_info rinfo;
+    memset(&rinfo, 0, sizeof(rinfo));
+    if (ioctl(fd, SNDRV_SEQ_IOCTL_RUNNING_MODE, &rinfo) < 0) {
+        perror("RUNNING_MODE (continuing anyway)");
+    }
 
     fprintf(stderr, "--- enumerating clients/ports ---\n");
     struct snd_seq_client_info cinfo;
@@ -74,7 +97,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  port %d:%d '%s' cap=0x%x type=0x%x\n",
                      pinfo.addr.client, pinfo.addr.port, pinfo.name,
                      pinfo.capability, pinfo.type);
-            if (found_client < 0 && strstr(cinfo.name, target_name)) {
+            if (found_client < 0 &&
+                (strstr(cinfo.name, target_name) || strstr(pinfo.name, target_name))) {
                 found_client = pinfo.addr.client;
                 found_port = pinfo.addr.port;
             }
@@ -88,11 +112,62 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "target: client %d port %d\n", found_client, found_port);
 
+    struct snd_seq_client_info myclient;
+    memset(&myclient, 0, sizeof(myclient));
+    myclient.client = my_client;
+    if (ioctl(fd, SNDRV_SEQ_IOCTL_GET_CLIENT_INFO, &myclient) < 0) {
+        perror("GET_CLIENT_INFO");
+    }
+    fprintf(stderr, "our client type=%d midi_version=%u (pre-set)\n",
+             myclient.type, myclient.midi_version);
+    strncpy(myclient.name, "seq_probe", sizeof(myclient.name) - 1);
+    if (ioctl(fd, SNDRV_SEQ_IOCTL_SET_CLIENT_INFO, &myclient) < 0) {
+        perror("SET_CLIENT_INFO (continuing anyway)");
+    }
+
+    /* arecordmidi (a known-working client on this device, confirmed via
+     * strace) creates a queue before creating its port. Architecturally
+     * unrelated concepts on stock ALSA, but replicating verbatim since
+     * reasoning about this custom kernel hasn't converged -- empirical
+     * beats theoretical here. */
+    struct snd_seq_queue_info qinfo;
+    memset(&qinfo, 0, sizeof(qinfo));
+    qinfo.queue = -1; /* request auto-assigned queue id */
+    qinfo.owner = my_client;
+    qinfo.locked = 1;
+    strncpy(qinfo.name, "seq_probe", sizeof(qinfo.name) - 1);
+    if (ioctl(fd, SNDRV_SEQ_IOCTL_CREATE_QUEUE, &qinfo) < 0) {
+        perror("CREATE_QUEUE (continuing anyway)");
+    } else {
+        fprintf(stderr, "created queue %d\n", qinfo.queue);
+        struct snd_seq_queue_tempo qtempo;
+        memset(&qtempo, 0, sizeof(qtempo));
+        qtempo.queue = qinfo.queue;
+        qtempo.tempo = 500000;
+        qtempo.ppq = 480;
+        if (ioctl(fd, SNDRV_SEQ_IOCTL_SET_QUEUE_TEMPO, &qtempo) < 0) {
+            perror("SET_QUEUE_TEMPO (continuing anyway)");
+        }
+    }
+
+    /* Matched byte-for-byte against a known-working client (arecordmidi)
+     * via a dedicated LD_PRELOAD dump (tools/seq_dump_ioctl.c) after
+     * plain APPLICATION-type/zeroed-channels/no-queue-link got EPERM
+     * here but not there. Three real differences found: `type` needs
+     * MIDI_GENERIC alongside APPLICATION, `midi_channels` needs to be
+     * nonzero (16, matching a real MIDI port), and `flags`/`time_queue`
+     * need to reference the queue just created above -- a zeroed/
+     * unlinked port apparently isn't accepted as a valid MIDI port by
+     * this kernel's CREATE_PORT validation, where stock ALSA is more
+     * permissive. */
     struct snd_seq_port_info myport;
     memset(&myport, 0, sizeof(myport));
     strncpy(myport.name, "seq_probe", sizeof(myport.name) - 1);
     myport.capability = SNDRV_SEQ_PORT_CAP_WRITE | SNDRV_SEQ_PORT_CAP_SUBS_WRITE;
-    myport.type = SNDRV_SEQ_PORT_TYPE_APPLICATION;
+    myport.type = SNDRV_SEQ_PORT_TYPE_APPLICATION | SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC;
+    myport.midi_channels = 16;
+    myport.flags = SNDRV_SEQ_PORT_FLG_GIVEN_PORT | SNDRV_SEQ_PORT_FLG_TIMESTAMP;
+    myport.time_queue = (unsigned char)qinfo.queue;
     if (ioctl(fd, SNDRV_SEQ_IOCTL_CREATE_PORT, &myport) < 0) {
         perror("CREATE_PORT"); return 1;
     }

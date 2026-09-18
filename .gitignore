@@ -6,3 +6,4 @@ tools/atomic_probe
 tools/getfb
 tools/grab_test
 tools/seq_probe
+tools/seq_dump_ioctl.so

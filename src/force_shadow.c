@@ -193,6 +193,20 @@ static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 #define SHADOW_H 1280
 #define SHADOW_BPP 32
 #define SHADOW_TOGGLE_FILE "/tmp/force_shadow_on"
+
+/* Real toggle mechanism (2026-09-18): MidiLoop's KNOBS+SCENE-N combos
+ * (N=1-7, mirroring the same addon indexing this device's own
+ * SHIFT+SCENE-N combos already use to start/stop each addon's engine --
+ * see USER-SCRIPTS.sh's SCRIPT-19..25) write the page number they want
+ * shown into this file; pressing the same one again removes it
+ * (toggle off), a different one switches pages directly. Only page 3
+ * (Maze Voice) has a real rendered page today -- any other page number
+ * is a safe, silent no-op (shadow_on stays false) until that addon's own
+ * page is built. SHADOW_TOGGLE_FILE above is kept working alongside this
+ * (not replaced) purely as a manual SSH-driven override for testing --
+ * either one being "on" is enough. */
+#define SHADOW_PAGE_FILE "/tmp/force_shadow_page"
+#define SHADOW_PAGE_MAZE_VOICE 3
 #define SHADOW_TOGGLE_CHECK_EVERY 30  /* ~2/sec at observed active commit rates */
 
 /* Virtual landscape canvas all rendering targets -- matches MPC's own
@@ -820,7 +834,19 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
 
 static void poll_toggle(void) {
     struct stat st;
-    shadow_on = (stat(SHADOW_TOGGLE_FILE, &st) == 0);
+    int on = (stat(SHADOW_TOGGLE_FILE, &st) == 0);
+
+    if (!on) {
+        FILE *f = fopen(SHADOW_PAGE_FILE, "r");
+        if (f) {
+            int page = -1;
+            if (fscanf(f, "%d", &page) == 1 && page == SHADOW_PAGE_MAZE_VOICE) {
+                on = 1;
+            }
+            fclose(f);
+        }
+    }
+    shadow_on = on;
 }
 
 /* ---- Touch takeover (step 3) ----

@@ -1451,6 +1451,161 @@ Device reverted cleanly (`maze_host` stopped before the final `acvs`
 restart, same sequencing discipline as the load). All physical checks
 passed.
 
+## Live load test #15 (2026-09-18): the real hardware toggle replaces the SSH test file
+
+Replaced the test-only `/tmp/force_shadow_on` SSH toggle with a real
+MidiLoop button-combo, closing out one of the longest-standing "Not yet
+done" items in this project.
+
+**Combo layout decided with the user, after two rounds of correcting a
+wrong assumption.** Originally assumed `SHIFT+LAUNCH-1`-style combos
+(per this project's own earlier, imprecise paraphrase of MidiLoop's
+docs) and `EDIT+SCENE-N` would both be available. Checked against the
+**live** device config (not the stale template copy in the local
+`MockbaMod` clone, which was misleading) and the `midiloop` binary's
+own recognized-trigger strings directly: `EDIT+` only ever pairs with a
+small fixed set of named functions, never per-pad; the doc's own
+`SHIFT+LAUNCH-1` example doesn't match the binary's actual recognized
+string (`SHIFT+SCENE-1`..`8`); and all 8 `SHIFT+SCENE-N` slots turned
+out to already be bound to real, actively-used functions (nodeServer/
+VNC/Harpie4T/Riffmaker4T/rtpMidi/screen-dim/AltMPC toggles, later
+repurposed by the user to per-addon engine on/off toggles via
+`SCRIPT-14`..`18`, reusing `SCRIPT-16`'s already-existing `maze_host`
+start/stop logic). Landed on **`KNOBS+SCENE-1`..`7`** (confirmed free,
+`KNOBS` a real, separate physical modifier button) mirroring the same
+addon indexing as `SHIFT+SCENE-N`: `SHIFT+SCENE-N` turns an addon's
+engine on/off, `KNOBS+SCENE-N` shows its shadow-mode visual page.
+
+**Mechanism**: `SHADOW_PAGE_FILE` (`/tmp/force_shadow_page`) replaces
+the old boolean toggle with a page number. `poll_toggle()` now checks
+both this file and the old `SHADOW_TOGGLE_FILE` (kept working
+side-by-side, purely as a manual SSH override for future testing) --
+shadow mode is on if either says so. Only page `3` (Maze Voice) has a
+real rendered page today; any other page number is a safe, silent
+no-op. Seven new `USER-SCRIPTS.sh` blocks (`SCRIPT-19`..`25`, next free
+numbers after the user's own `14`..`18`) each write their own page
+number to the file, or delete it if that page is already showing
+(same-combo-again toggles off; a different `KNOBS+SCENE-M` switches
+directly). Edited the live `midiloop.config` and `USER-SCRIPTS.sh`
+directly via targeted `sed`/append (not a full rewrite), with backups
+taken first and a `diff` against the backup confirming only the 7
+intended lines changed -- appropriate caution for a shared config file
+that also controls MidiLoop's own safety shortcuts (reboot/restart/
+shutdown) and every other addon's bindings.
+
+**Validated MidiLoop's own config with its built-in checker**
+(`/media/662522/AddOns/MidiLoop/midiloop test`, found via its own docs --
+not at the `/media/662522/Tools/` path the docs literally give, which
+doesn't exist on this device; the real binary supports the same `test`
+subcommand directly) -- `Config File Seems Ok!!` confirmed before ever
+touching hardware. Reloaded `midiloop` itself (`killall midiloop` +
+`run_midiloop.sh`) to pick up the new config, since there's no
+non-physical trigger for its own `RELOAD-CONFIG` action.
+
+**Live-confirmed working, both directions**, after one real-world
+troubleshooting round: the first physical attempt didn't fire at all --
+not a config bug (MidiLoop's own `test` subcommand had already confirmed
+the binding was syntactically valid, and directly invoking the bound
+script by hand worked perfectly, proving the shell logic was correct) --
+turned out to be a press-technique issue (per MidiLoop's own docs,
+modifiers must be pressed-and-held, target tapped while still held, then
+released -- not pressed simultaneously). Once done correctly:
+`KNOBS+SCENE-3` reliably toggles shadow mode on and off, confirmed via
+log (`shadow mode toggled off`, touch grab released cleanly) and direct
+user observation. Also incidentally hit and recovered from another
+occurrence of the `force-maze`-documented "`acvs` restart kills pads"
+platform quirk during this test's own reload cycle (a second restart
+fixed it, as before) -- unrelated to this project's own code, which was
+inert pass-through at the time.
+
+## ALSA sequencer investigation (2026-09-18): "any other button reverts" hit a real wall, not abandoned lightly
+
+Attempted the deferred piece from live load test #15's own combo work:
+pressing any *other* physical Force button (not just the same
+`KNOBS+SCENE-N` combo again) should also revert shadow mode to normal
+MPC UI. Investigated three approaches in order of increasing
+invasiveness, ruling each out with direct evidence rather than
+assumption:
+
+1. **Passive `evdev` watch** (like the touch grab already does, but
+   without `EVIOCGRAB` so MPC still sees the press normally) --
+   `evemu-describe` on `gpio-keys` (`event1`) showed it only reports
+   `KEY_POWER`. The Force's actual control surface (pads, transport,
+   SCENE/EDIT/SHIFT/Q-Link) doesn't reach userspace via `evdev` at all --
+   it's delivered over an internal ALSA MIDI port
+   (`Akai Pro Force:Akai Pro Force Private`, per `midiloop`'s own
+   startup banner). Ruled out immediately, no live risk.
+2. **Extend MidiLoop's own config** (chain our revert script onto many
+   existing bindings, since MidiLoop already sees every button and
+   supports chaining multiple actions per trigger) -- surveying the live
+   config found **150+ active bindings**, including raw CC/Note
+   automation triggers (not just physical presses) and complex
+   multi-step `MACRO_*` touch sequences with their own precise
+   `WAITx...` timing. Narrowed to the user's actual intent (8 named mode
+   buttons: LOAD/SAVE/MATRIX/CLIP/MIXER/NAVIGATE/LAUNCH/MENU) and checked
+   the `midiloop` binary's own recognized-trigger strings for bare,
+   unmodified presses of each -- **only `NAVIGATE` and `CLIP-STOP` exist
+   as interceptable bare triggers**; the rest go straight to MPC's own
+   firmware with no MidiLoop-config hook at all. Ruled out as
+   structurally impossible for most of the target buttons, not just
+   risky.
+3. **Hand-roll a minimal ALSA sequencer client** (matching this
+   project's own established DRM-hand-rolling precedent) -- built
+   `tools/seq_probe.c`, a read-only discovery tool in the same family as
+   `atomic_probe.c`/`getfb.c`. Used the real kernel UAPI header
+   (`<sound/asequencer.h>`, vendored into `tools/include/` from a current
+   Debian bookworm's `linux-libc-dev`, not hand-typed from memory --
+   compile-time only, no runtime dependency change) rather than guessing
+   struct layouts. Enumeration (`QUERY_NEXT_CLIENT`/`QUERY_NEXT_PORT`,
+   read-only) worked immediately and confirmed the target
+   (`client 20 port 1`, "Akai Pro Force Private") exists and is
+   reachable. **`CREATE_PORT` consistently failed with `EPERM`**, even
+   after:
+   - Matching a known-working reference client's (`arecordmidi`, from
+     `alsa-utils`, confirmed via `arecordmidi -l`/direct test to work
+     against the same target) **entire observed ioctl sequence**
+     (`PVERSION`, an unnamed/very-recent ioctl not in even the bookworm
+     header, `CLIENT_ID`, `RUNNING_MODE`, `GET`/`SET_CLIENT_INFO`,
+     `CREATE_QUEUE`, `SET_QUEUE_TEMPO`) in the same order, confirmed via
+     `strace -e trace=ioctl`.
+   - Matching its `CREATE_PORT` struct **byte-for-byte**, obtained via a
+     small purpose-built `LD_PRELOAD` shim
+     (`tools/seq_dump_ioctl.c`, reusing this project's own core
+     interposition technique against a disposable `arecordmidi` test
+     process -- zero risk to the real device) that dumped the exact
+     struct fields and raw bytes a real working client passes. Found and
+     fixed three genuine discrepancies (`type` needing `MIDI_GENERIC`
+     alongside `APPLICATION`, `midi_channels` needing to be nonzero,
+     `flags`/`time_queue` needing to reference the queue just created) --
+     still `EPERM` after fixing all three.
+   - Matching the calling process's name (copied the binary to
+     `/tmp/arecordmidi` and ran it under that name) -- still `EPERM`.
+
+   No dmesg denial message appears at any point (checked with a freshly
+   cleared buffer), and no active IMA policy is loaded
+   (`/sys/kernel/security/ima/policy` doesn't exist on this device) --
+   ruling out the two most likely standard Linux audit/integrity
+   mechanisms as the visible cause. The evidence now points at something
+   checked about the calling *binary itself* -- most likely its literal
+   path (`/usr/bin/arecordmidi` specifically) -- on this custom "az01"
+   kernel build, consistent with a deliberate, undocumented allowlist
+   rather than a bug in this project's own ioctl usage. **Not conclusively
+   proven**: confirming it would require temporarily overwriting the real
+   `/usr/bin/arecordmidi` binary to test, which the user declined --
+   correctly, given how much has already been ruled out through safer
+   means and how little would be gained by confirming a mechanism this
+   project has no intention of trying to bypass either way.
+
+**Where this leaves the feature**: not fixable from userspace on this
+device without linking `libasound` directly (the one approach not yet
+tried -- trading away the project's clean `libc`/`libpthread`/`libdl`-
+only dependency profile for a proven-working code path, since
+`arecordmidi`/`midiloop` both succeed via a properly-linked `libasound`
+rather than raw ioctls). Whether that tradeoff is worth it for this one
+feature is an open product decision, not a technical one -- deferred,
+not abandoned. The same-combo-toggle (`KNOBS+SCENE-N` again) already
+provides a full, working exit path in the meantime.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1510,9 +1665,23 @@ passed.
   voice) before restarting `acvs`**, only start it again once MPC is
   back up — restarting `acvs` with a voice attached reliably kills
   pads/buttons.
-- Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
-  MidiLoop button-combo mechanism, flipping a shared flag the interposer
-  checks on every commit.
+- ~~Replacing the test-only `/tmp/force_shadow_on` toggle file with the
+  real MidiLoop button-combo mechanism~~ -- **done, live load test #15**:
+  `KNOBS+SCENE-1`..`7` (mirroring `SHIFT+SCENE-N`'s addon indexing)
+  confirmed live, both directions. `SHADOW_TOGGLE_FILE` kept working
+  alongside the new `SHADOW_PAGE_FILE` mechanism as a manual override,
+  not removed.
+- **"Any other button also reverts"** -- deferred, not solved. See the
+  "ALSA sequencer investigation" section above: config-based interception
+  is structurally impossible for most of the target buttons (only
+  `NAVIGATE`/`CLIP-STOP` are interceptable bare presses), and a
+  hand-rolled ALSA seq client hit an unexplained `EPERM` on `CREATE_PORT`
+  that survived exhaustive byte-for-byte struct/sequence matching against
+  a known-working reference client. Only remaining untested theory
+  (literal binary path) needs touching a real system binary, declined.
+  Next real option, if this is revisited, is linking `libasound` directly
+  (trading away this project's dependency-profile purity for a
+  proven-working code path) -- a product decision, not yet made.
 - Packaging this as a real `AddOns/ForceShadow` addon (`run_*.sh`,
   `NSMODULE.json`, proper `/dev/shm/.LD_PRELOAD.lock`-respecting install/
   kill scripts) instead of the current one-off manual `scp`+edit test
