@@ -1691,13 +1691,89 @@ Freq will feel non-linear relative to its real frequency perception --
 a real UX rough edge, flagged for the design-language pass, not
 forgotten.
 
-**Not yet loaded live.** Compiles clean (`-Wall -Wextra`, zero warnings
-despite being the largest single change to this file), dependency
-profile confirmed unchanged post-build. Next: the staged load sequence
-as always (pass-through, then static toggle-on with nothing playing,
-then interactive testing with `maze_host` running) -- this is by far
-the largest untested surface this project has shipped in one pass, so
-staging matters more here than ever.
+Compiled clean (`-Wall -Wextra`, zero warnings despite being the largest
+single change to this file), dependency profile confirmed unchanged
+post-build. **Now loaded live** — see live load test #16 below for the
+tab bar bug found and fixed during that first live pass.
+
+## Live load test #16 (2026-09-19): the control pages went live, tab bar found broken, third WiFi drop, and the real fix (not the first attempted one)
+
+Loaded the 3-page control build live for the first time. Staged as always
+(pass-through confirmed normal, then toggle-on). **Font rendering
+confirmed legible on real hardware** ("yes, rendering is ok, could be
+improved later"). **Knobs confirmed working.** But: **the bottom tab bar
+did not respond to touch at all** ("the knobs work, but the tab nav
+buttons dont work").
+
+**First (wrong) theory and fix, reverted later this same entry**:
+suspected the touch digitizer's native sensing height was genuinely only
+720px against `LAND_H`'s 800, based on `evemu-describe`'s kernel-reported
+axis max and the "Touch coordinate calibration" section's own
+long-standing open question. Shipped a fix (`TOUCHABLE_H=720`) that
+pulled the tab bar and all content up to fit inside that assumed-smaller
+budget. This part did make the tab bar clickable — but at a real cost:
+content visually compressed into the top 90% of the screen, tab bar
+floating 80px above the true bottom edge.
+
+**A crash loop then a third WiFi/ethernet drop interrupted retesting**
+(both incidental to the real bug, resolved by their own established
+patterns — a power cycle for the crash loop, matching live load test #8's
+same-boot-restart-fatigue precedent; the device came back reachable on
+its own for the WiFi drop, no action needed). Neither blocked continuing
+once the device was back.
+
+**Redeployed the `TOUCHABLE_H` fix for a fresh live retest — user caught
+the real bug immediately**: reported the layout looked "squashed," then
+specifically clarified (unprompted, correcting my own initial
+interpretation) that tapping *directly on* the visible tab label didn't
+register, but tapping *below* it, in what looked like blank space closer
+to the true bottom edge, did — and separately stated plainly that the
+device's normal MPC UI **is** touchable all the way to the real bottom of
+the screen, contradicting the "physical dead zone" theory outright.
+
+**Root cause, found from that correction**: pulled 20 real raw-touch
+samples from the device's own log (temporarily set the touch-event log
+throttle from 1-in-20 to every event for this diagnosis, then reverted
+it). `touch_to_landscape()`'s `py` (landscape-height) formula was `raw_x
+* 9/16` — a scale factor borrowed wholesale from MidiLoop's own `TOUCH~`
+macro conversion formula, which targets a *1280x720* coordinate
+convention for MidiLoop's own purposes. That scale tops out at `py=720`
+even though `raw_x`'s own real native max is 1280 and `LAND_H` is 800 —
+so every touch was being computed with `py` compressed into only 90% of
+its true range, regardless of how far down the real touch actually
+landed. The old "untouchable at `LAND_H`'s bottom edge" bug (this
+project's first attempt, load test #15/#16 start) and the "must tap below
+the visible label" symptom are the **same bug**, not two different ones:
+a `py` ceiling that's 80px too low. (For contrast: the horizontal `px`
+formula was never wrong — `raw_y`'s own real native max genuinely is 720,
+and `720 * 16/9 = 1280 = LAND_W` exactly, no error there.)
+
+**Real fix**: `py = raw_x * 5/8` (1280:800 reduces to 8:5) — reaches
+`py=800` exactly at `raw_x`'s own true max. Still exact integer math, no
+`libm`. This made the `TOUCHABLE_H` workaround unnecessary entirely:
+reverted it back to using `LAND_H` directly for `CONTENT_H` and
+`tabbar_y`, so content uses the *full* screen height again and the tab
+bar sits flush against the real bottom edge, matching the reference
+screenshots' own bottom-bar convention. (Briefly also tried a
+cosmetic-only fix — extending the tab bar's painted background down to
+`LAND_H` without touching the real hit zone — before realizing that would
+create a *worse* trap: a visually-continuous button whose bottom half
+silently doesn't respond. Reverted that one too, in favor of the real
+fix.)
+
+**Confirmed live, redeployed a third time same session**: user reported
+"yes better" — full-height layout, tab bar at the true bottom edge,
+touch registering correctly on the visible labels. Live raw-touch samples
+after the fix show `py` reaching into the high 700s/near 800 (e.g.
+`py=783`, `785`) for real bottom-of-screen taps, versus capping at ~720
+before.
+
+**Lesson for next time**: a formula borrowed from another working system
+(MidiLoop's own touch macros) can still be wrong for *this* use, if that
+system's own coordinate convention doesn't actually span the same target
+space ours does — cross-validate the specific dimension being reused
+(here, the landscape-height target), not just "does the overall mechanism
+work for its own original purpose."
 
 ## Not yet done
 
@@ -1706,13 +1782,20 @@ staging matters more here than ever.
   same-boot restarts, not a real reproducible defect. Buffer cache
   coherency is no longer suspected as a result; no separate investigation
   needed there.
-- **Investigate the WiFi/ethernet drop pattern** — now two occurrences
-  during active live testing on two different sessions (live load test
-  #5, and live load test #8), zero during idle periods, still no
-  confirmed causal mechanism. Worth treating as a real open risk: if it
-  recurs a third time, look for a common trigger across all three
-  occurrences (what command/action immediately preceded each drop) rather
-  than continuing to treat each one as an isolated incident.
+- **Investigate the WiFi/ethernet drop pattern** — now three occurrences
+  during active live testing across three different sessions (live load
+  test #5, live load test #8, and live load test #16's own retest), zero
+  during idle periods, still no confirmed causal mechanism found despite
+  this being the "look for a common trigger on the third occurrence"
+  checkpoint this doc itself set. All three happened during active
+  touch/redraw testing, all three self-resolved (device came back
+  reachable without intervention, in #16's case within the same short
+  session), none left the device in a bad state once reconnected. Given
+  three independent occurrences with no identified trigger and no lasting
+  harm, treat as a known, recoverable flakiness of this test setup rather
+  than a blocker — but if a fourth occurrence ever correlates with a
+  specific action (not just "testing was happening"), that's worth
+  chasing properly.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   needs a fresh angle, not more iteration on the two approaches already
   tried and abandoned. Revisit once forward substitution is confirmed

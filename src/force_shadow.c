@@ -569,20 +569,17 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
 
 #define TOPBAR_H 72
 #define TABBAR_H 72
-/* Confirmed live (2026-09-18): the touch digitizer's native height is
- * only 720px (touch_to_landscape()'s py can never exceed
- * TOUCH_RAW_X_MAX*9/16 = 720), but LAND_H is 800 to match the display's
- * own composition size -- DESIGN.md's "Touch coordinate calibration"
- * flagged this exact gap as an open question back when it was only
- * theoretical. It wasn't theoretical: the tab bar, originally placed
- * flush with LAND_H's bottom edge (728-800), was completely untouchable
- * -- real touches there don't just land near the target, py physically
- * cannot reach past 720 at all. Every touchable element now fits within
- * [0,720); LAND_H's remaining 80px stays visually part of the canvas
- * but is deliberately never given a touch target. */
-#define TOUCHABLE_H 720
+/* The tab bar was briefly (2026-09-18/19) pulled up to a "TOUCHABLE_H"
+ * of 720 in the mistaken belief that the touch digitizer physically
+ * can't sense the bottom 80px of the real 800px-tall screen. Live
+ * testing (2026-09-19) disproved that: the real bug was
+ * touch_to_landscape()'s py scale topping out at 720 instead of 800 (see
+ * its own comment) -- once that's fixed, touch reaches the true bottom
+ * edge and the tab bar belongs flush against LAND_H like every other
+ * bottom-bar convention in the reference screenshots this design is
+ * based on. */
 #define CONTENT_Y (TOPBAR_H + 16)
-#define CONTENT_H (TOUCHABLE_H - TOPBAR_H - TABBAR_H - 32)
+#define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 32)
 #define NUM_PAGES 3
 
 typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V } widget_kind_t;
@@ -873,7 +870,13 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     for (int i = 0; i < n_frames; i++) render_frame_box(map, stride_px, &frames[i]);
     for (int i = 0; i < n_widgets; i++) render_widget(map, stride_px, &widgets[i]);
 
-    int32_t tabbar_y = TOUCHABLE_H - TABBAR_H;
+    /* Tried extending this fill down to LAND_H once (cosmetic, to close
+     * the blank gap below the bar) and reverted it: it would have made a
+     * visually-continuous button whose bottom ~half silently doesn't
+     * respond to touch (720-800 is outside touch's reachable range) --
+     * a worse trap than an honest gap. What you see here is exactly
+     * what's touchable. */
+    int32_t tabbar_y = LAND_H - TABBAR_H;
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, PLATE_LINE);
     int32_t tw = LAND_W / NUM_PAGES;
@@ -1194,13 +1197,29 @@ static void poll_toggle(void) {
 #define TOUCH_RAW_X_MAX 1280
 #define TOUCH_RAW_Y_MAX 720
 
-/* raw (ABS_X, ABS_Y) -> landscape (px, py), per DESIGN.md's derivation.
- * 1280:720 reduces exactly to 16:9, so this is plain integer math, no
- * libm needed (same dependency-profile discipline as the knob renderer's
- * sin_deg()/cos_deg()). Clamped defensively since real digitizers
- * occasionally report slightly-out-of-nominal-range noise. */
+/* raw (ABS_X, ABS_Y) -> landscape (px, py).
+ *
+ * px (landscape width, spanning LAND_W) is derived from raw_y, whose own
+ * native max (TOUCH_RAW_Y_MAX=720) genuinely matches what's needed: 720 *
+ * 16/9 = 1280 = LAND_W exactly. No error there.
+ *
+ * py (landscape height, spanning LAND_H=800) is derived from raw_x, whose
+ * native max is TOUCH_RAW_X_MAX=1280 -- but the *scale* originally used
+ * here (9/16, borrowed wholesale from MidiLoop's own TOUCH~ macro
+ * formula, which targets a 1280x720 coordinate space for its own
+ * purposes) tops out at py=720, not 800. Live testing (2026-09-19)
+ * disproved the "touch physically can't reach past 720" theory this scale
+ * implied: the device's normal UI is touchable to the real bottom edge,
+ * and tapping visually-blank space below a shadow-mode tab label (well
+ * past landscape y=720 in this build's own rendering) still registered a
+ * page switch -- meaning raw_x really does span the full screen, our
+ * scale was just wrong about *where* its max lands. Fixed to scale raw_x
+ * against LAND_H directly: 1280:800 reduces to 8:5, so raw_x*5/8 hits
+ * py=800 exactly at raw_x's own true max. Still plain integer math, no
+ * libm needed. Clamped defensively since real digitizers occasionally
+ * report slightly-out-of-nominal-range noise. */
 static void touch_to_landscape(int raw_x, int raw_y, int32_t *out_px, int32_t *out_py) {
-    int32_t py = raw_x * 9 / 16;
+    int32_t py = raw_x * 5 / 8;
     int32_t px = (TOUCH_RAW_Y_MAX - raw_y) * 16 / 9;
     if (px < 0) px = 0; else if (px >= LAND_W) px = LAND_W - 1;
     if (py < 0) py = 0; else if (py >= LAND_H) py = LAND_H - 1;
@@ -1395,7 +1414,7 @@ static void update_touch_state(const struct input_event *ev) {
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
         active_widget = -1;
 
-        int32_t tabbar_y = TOUCHABLE_H - TABBAR_H;
+        int32_t tabbar_y = LAND_H - TABBAR_H;
         if (lpy >= tabbar_y) {
             int32_t tw = LAND_W / NUM_PAGES;
             int new_page = lpx / tw;

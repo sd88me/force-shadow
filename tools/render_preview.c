@@ -157,12 +157,13 @@ static void frame_box(int x, int y, int w, int h, const char *title) {
 /* ---- chrome: top bar + tab bar ---- */
 #define TOPBAR_H 72
 #define TABBAR_H 72
-/* Confirmed live (2026-09-18): the touch digitizer's native height is
- * only 720px, not LAND_H's 800 -- a tab bar flush with LAND_H's bottom
- * edge is completely untouchable, not just imprecise. Kept in sync with
- * force_shadow.c's own TOUCHABLE_H so this preview stays a faithful
- * reference for future pages. */
-#define TOUCHABLE_H 720
+/* Was briefly pulled up to a 720px "TOUCHABLE_H" (2026-09-18/19) on the
+ * mistaken belief the touch digitizer can't sense the bottom 80px of the
+ * real 800px screen. Live testing (2026-09-19) found the real bug was
+ * force_shadow.c's touch_to_landscape() py scale topping out at 720
+ * instead of 800 -- fixed there, so the tab bar belongs flush against
+ * LAND_H again. Kept in sync with force_shadow.c so this preview stays a
+ * faithful reference for future pages. */
 static const char *TABS[] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" };
 static void draw_chrome(int active_tab) {
     fill_rect(0, 0, LAND_W, LAND_H, PLATE);
@@ -172,7 +173,7 @@ static void draw_chrome(int active_tab) {
     fill_circle(LAND_W - 150, 36, 5, ACCENT_HI);
     draw_text(LAND_W - 130, 28, "LIVE", 2, INK_DIM);
 
-    int tabbar_y = TOUCHABLE_H - TABBAR_H;
+    int tabbar_y = LAND_H - TABBAR_H;
     fill_rect(0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
     draw_hline(0, tabbar_y, LAND_W, PLATE_LINE);
     int n = 3, tw = LAND_W / n;
@@ -187,7 +188,7 @@ static void draw_chrome(int active_tab) {
 }
 
 #define CONTENT_Y (TOPBAR_H + 16)
-#define CONTENT_H (TOUCHABLE_H - TOPBAR_H - TABBAR_H - 32)
+#define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 32)
 
 /* ---- Page 1: Voice ---- */
 static void page_voice(void) {
