@@ -1311,6 +1311,63 @@ documented "an `acvs` restart... reliably kills pads/buttons" platform
 quirk, not something caused by this project's own code, which was inert
 pass-through at the time). All physical checks passed afterward.
 
+## Closing the loop: knobs control the real DSP (2026-09-18, compiled offline, not yet loaded live)
+
+First step toward the actual product goal (a real addon control page,
+not just a mockup that looks interactive) -- dragging a knob now also
+changes Force Maze Voice's real, running DSP parameter, not just its own
+on-screen pointer.
+
+**Chose maze_host's existing Unix control socket over MIDI CC.**
+`force-maze/maze-voice/src/maze_host.cpp` already exposes exactly this
+for its own web panel (`web/server.py`) to use: a plain `AF_UNIX`/
+`SOCK_STREAM` socket at `/tmp/maze_ctrl.sock`, newline-terminated text
+protocol (`SET <key> <value>\n` → `OK\n`/`ERR\n`). That file's own header
+comment explains why it exists at all instead of routing through MIDI
+CC: "simpler than round-tripping through ALSA CC for something that
+never needs to be a hardware knob" -- exactly this project's situation
+too. Using it instead of real MIDI CC (`docs/CC-MAP.md`'s own mapping,
+which this design initially assumed) means **zero new library
+dependencies** -- plain `socket()`/`connect()`/`send()`, already in
+`libc` -- instead of hand-rolling the ALSA sequencer kernel UAPI the way
+this file already hand-rolls the DRM one (a considerably bigger, riskier
+undertaking for the same functional outcome). Confirmed post-build:
+dependency profile still exactly `libc`/`libpthread`/`libdl`.
+
+**Param mapping** (`shadow_knob_param[]`, confirmed against
+`module.json`'s own `chain_params` entries directly, not just
+`docs/CC-MAP.md`'s summary table): `VCO TUNE`→`vco_tune` (-24..24 st,
+the one non-0-100 range), `CUTOFF`→`cutoff`, `RESO`→`reso`,
+`FOLD DRIVE`→`fold_drive`, `ENV DECAY`→`env1_decay`, `LEVEL`→`level`
+(all plain linear 0-100).
+
+**Safety/performance choices**:
+- Socket calls happen **after** releasing `touch_mu`, never while held --
+  a blocking-ish call (bounded by a 50ms `SO_SNDTIMEO`) has no business
+  running inside a lock the commit thread also needs for its own redraw
+  snapshot.
+- **Throttled to at most once per 15ms** during an active drag (the web
+  panel's own `server.py` notes a drag can fire 50-100 events/sec;
+  no reason to hit the socket that often here) -- except the final value
+  on release, which always sends unconditionally, bypassing the
+  throttle, so a release landing inside the throttle window can't leave
+  the real param stale relative to what the screen (and the user) last
+  saw.
+- **Fails silent if `maze_host` isn't running** -- same fail-closed
+  principle as everywhere else in this file. Shadow mode's own
+  rendering/dragging has no dependency on this working; it's purely an
+  added effect, and its failure mode (the control socket doesn't exist
+  or refuses the connection) is silent and cheap by construction, not a
+  visible error or a crash.
+- Reply intentionally never read (there's nowhere in this project's own
+  UI to show it yet) -- fine per `server.py`'s own header comment, whose
+  documented leak was skipping the close entirely, not skipping the read.
+
+**Not yet loaded live.** Next: stage as always (pass-through, then
+static toggle-on), then the actual test -- with `maze_host` running and
+a MIDI track routed so the real audio is audible, drag a knob and
+listen for the sound actually changing, not just watch the pointer move.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:

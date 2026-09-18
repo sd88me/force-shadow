@@ -74,6 +74,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <linux/input.h>
@@ -495,6 +497,27 @@ static const shadow_knob_layout_t shadow_knob_layout[] = {
 };
 #define NUM_SHADOW_KNOBS (sizeof(shadow_knob_layout) / sizeof(shadow_knob_layout[0]))
 
+/* Maps each knob (same order/index as shadow_knob_layout) to the real
+ * Force Maze Voice chain_param it controls -- key names and min/max
+ * confirmed against /home/sam/force-maze/maze-voice/module.json's own
+ * chain_params entries directly (not just docs/CC-MAP.md's summary
+ * table, which agrees but doesn't give exact JSON key spelling). Every
+ * one of these is plain linear 0-100 except vco_tune, which is
+ * -24..24 semitones. */
+typedef struct {
+    const char *key;
+    float min, max;
+} shadow_knob_param_t;
+
+static const shadow_knob_param_t shadow_knob_param[] = {
+    { "vco_tune",   -24.0f, 24.0f },
+    { "cutoff",       0.0f, 100.0f },
+    { "reso",         0.0f, 100.0f },
+    { "fold_drive",   0.0f, 100.0f },
+    { "env1_decay",   0.0f, 100.0f },
+    { "level",        0.0f, 100.0f },
+};
+
 /* 0-100 per knob, same indexing as shadow_knob_layout. Initial spread
  * (0/20/40/60/80/100) is load test #9's proven static layout, now just
  * the starting values instead of fixed ones -- touch-driven changes are
@@ -838,6 +861,76 @@ static void touch_to_landscape(int raw_x, int raw_y, int32_t *out_px, int32_t *o
 
 static int touch_x = -1, touch_y = -1, touch_down = 0;
 
+/* ---- Real DSP control (closes the loop: a dragged knob actually
+ * changes the sound, not just its own on-screen pointer) ----
+ *
+ * maze_host (force-maze/maze-voice/src/maze_host.cpp) already exposes a
+ * plain Unix-domain control socket for exactly this purpose -- the same
+ * one its own web panel (web/server.py) uses, deliberately in place of
+ * routing through MIDI CC for something that never needs to be a
+ * hardware knob (see that file's own header comment). Newline-terminated
+ * text protocol: "SET <key> <value>\n" -> "OK\n"/"ERR\n". Reusing it
+ * here means zero new library dependencies (plain AF_UNIX/SOCK_STREAM,
+ * already in libc -- no ALSA sequencer client, no libasound, keeping
+ * this project's confirmed libc/libpthread/libdl-only profile) instead
+ * of hand-rolling the considerably more complex ALSA sequencer kernel
+ * UAPI the way this file hand-rolls the DRM one. Fails silent by design
+ * (same fail-closed principle as everywhere else in this file) if
+ * maze_host isn't running -- shadow mode's own rendering/dragging still
+ * works regardless, this is purely an added effect, never a dependency
+ * of anything else here. */
+#define MAZE_CTRL_SOCK "/tmp/maze_ctrl.sock"
+#define MAZE_SEND_TIMEOUT_MS 50
+
+static void send_maze_set(const char *key, float value) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+
+    struct timeval tv = { 0, MAZE_SEND_TIMEOUT_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, MAZE_CTRL_SOCK, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        char line[96];
+        int n = snprintf(line, sizeof(line), "SET %s %.2f\n", key, value);
+        if (n > 0) send(fd, line, (size_t)n, MSG_NOSIGNAL);
+    }
+    /* Reply intentionally not read -- shadow mode's own UI has nowhere
+     * to show it, and this keeps every call a bounded, fast fire-and-
+     * forget from the touch thread. Closing without reading is fine:
+     * the only leak load test web/server.py's own header comment warned
+     * about was skipping the close entirely, not skipping the read. */
+    close(fd);
+}
+
+/* Only ever called from the touch thread (never concurrently), so this
+ * throttle state needs no locking of its own. Bounds worst-case socket
+ * churn during a fast drag (the web panel's own server.py notes a drag
+ * can fire 50-100 events/sec) without needing per-knob bookkeeping. */
+static struct timespec maze_send_last_ts;
+#define MAZE_SEND_MIN_INTERVAL_MS 15
+
+static int maze_send_throttle_ok(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms_since = (now.tv_sec - maze_send_last_ts.tv_sec) * 1000 +
+                    (now.tv_nsec - maze_send_last_ts.tv_nsec) / 1000000;
+    if (ms_since < MAZE_SEND_MIN_INTERVAL_MS) return 0;
+    maze_send_last_ts = now;
+    return 1;
+}
+
+static void send_knob_param(int knob_idx, int value_pct, int force) {
+    if (!force && !maze_send_throttle_ok()) return;
+    const shadow_knob_param_t *p = &shadow_knob_param[knob_idx];
+    float scaled = p->min + (p->max - p->min) * ((float)value_pct / 100.0f);
+    send_maze_set(p->key, scaled);
+}
+
 /* Landscape px of vertical drag needed to sweep a knob's full 0-100
  * range. A relative vertical drag (move up = increase), not absolute
  * angle-from-center tracking, deliberately: this project's touch
@@ -854,6 +947,12 @@ static int drag_start_value = 0;
 static int touch_down_prev = 0;
 
 static void update_touch_state(const struct input_event *ev) {
+    /* Set below while touch_mu is held, acted on (send_maze_set, a
+     * blocking-ish socket call) only after it's released -- never do
+     * potentially-slow I/O while holding a lock the commit thread also
+     * needs for its own (should stay fast) redraw snapshot. */
+    int send_knob = -1, send_value = 0, send_force = 0;
+
     pthread_mutex_lock(&touch_mu);
     if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
         touch_x = ev->value;
@@ -895,13 +994,28 @@ static void update_touch_state(const struct input_event *ev) {
         if (new_val != shadow_knob_value[active_knob]) {
             shadow_knob_value[active_knob] = new_val;
             shadow_redraw_needed = 1;
+            send_knob = active_knob;
+            send_value = new_val;
         }
+    } else if (!touch_down && touch_down_prev && active_knob >= 0) {
+        /* Just released, mid-drag: send the final value unconditionally,
+         * bypassing the throttle -- otherwise a release landing inside
+         * the throttle window would leave the real DSP param on a value
+         * older than what the screen (and the user) last saw. */
+        send_knob = active_knob;
+        send_value = shadow_knob_value[active_knob];
+        send_force = 1;
+        active_knob = -1;
     } else if (!touch_down) {
         active_knob = -1;
     }
     touch_down_prev = touch_down;
 
     pthread_mutex_unlock(&touch_mu);
+
+    if (send_knob >= 0) {
+        send_knob_param(send_knob, send_value, send_force);
+    }
 }
 
 /* Runs for the whole process lifetime: sleeps while shadow mode is off,
