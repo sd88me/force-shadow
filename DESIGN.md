@@ -1088,6 +1088,70 @@ confirmation as any transform in this project has gotten on a first live
 try. The transform is now trusted for hit-testing, not just derived —
 next increment can build on it directly.
 
+## Interactive knob dragging (2026-09-18, compiled offline, not yet loaded live): the riskiest increment yet
+
+Wires the three independently-proven pieces above together: the render
+primitives (live load test #9), the touch/landscape transform (confirmed
+live immediately after), and a new drag state machine, into an actually
+interactive mockup. `src/force_shadow.c` changes:
+
+- **Buffer is now persistent.** `create_shadow_buffer()` no longer draws
+  or `munmap`s -- it just sets up `shadow_map`/`shadow_stride_px` and
+  leaves the mapping open for the buffer's whole lifetime, so the commit
+  thread can redraw it on demand.
+- **`shadow_knob_value[]`** replaces the old fixed `value_pct` field --
+  same 6 starting values (0/20/40/60/80/100) as live load test #9, now
+  mutable, guarded by `touch_mu` (already existed for `touch_x`/
+  `touch_y`/`touch_down`; reused rather than adding a second lock).
+- **Drag convention: relative vertical drag, not absolute angle.** On
+  touch-down, hit-tests the landscape point against all 6 knobs'
+  `90px` hit circles (via `touch_to_landscape()`) and activates the
+  first match; while held, `drag_start_py - current_py` (scaled over
+  `KNOB_DRAG_RANGE_PX = 300`) adjusts that knob's value, clamped 0-100.
+  Chosen deliberately over absolute angle-from-knob-center tracking:
+  this project's touch transform is confirmed accurate to about ±13px
+  (see "Touch coordinate calibration" above), fine for hit-testing a
+  90px-radius circle but not for angle tracking near a knob's own
+  center, where small position errors swing the derived angle wildly.
+- **Redraw is gated, not unconditional.** `maybe_redraw_shadow()` (called
+  from `maybe_substitute_fb()`, before the `FB_ID` swap) only repaints
+  when `shadow_redraw_needed` is set -- i.e. only after an actual value
+  change, not on every commit. During idle viewing (no touch) this should
+  cost one atomic flag check per commit and nothing else; a full-canvas
+  redraw only happens on commits coinciding with an active drag.
+
+**Why this is flagged as the riskiest piece built so far, more than a
+reason to avoid it**: every previous increment in this project was
+either read-only, additive-only (a new plane property, a new buffer), or
+a one-time operation at setup. This is the first code to write into a
+buffer that is *actively the scanned-out `FB_ID`* on a *live, running
+CRTC*, synchronously, on MPC's own DRM commit thread, repeatedly, for as
+long as a drag continues. Two specific unknowns, not yet assessed by
+anything short of a live test:
+- **Tearing**: no double-buffering exists yet (one dumb buffer, redrawn
+  in place) -- during an active drag, the display could briefly show a
+  buffer mid-repaint. Likely visible as a minor cosmetic glitch on the
+  knob being dragged, not a correctness or stability risk, but unverified.
+- **Commit-thread latency**: a full-canvas redraw (`fill_rect_land` over
+  1280x800 landscape pixels, `1,024,000` `put_px_land()` calls, plus 6
+  knobs' circles/rings/pointers) runs synchronously inside the same
+  `ioctl()` call MPC itself is blocked on. Not yet measured on real
+  hardware -- if it's slow enough to matter, the visible symptom would be
+  touch/audio stutter during a drag specifically (this project's `atomic_probe`
+  tool already documented a similar, unrelated stutter from single-step
+  tracing overhead, so this class of symptom has real precedent here).
+
+**Staged live test plan, not yet run**: (1) load with the toggle off,
+confirm pass-through unaffected as always; (2) toggle on with **no
+touch input at all**, let it sit -- should redraw exactly once
+(`shadow_redraw_needed` starts true) and then stay static, behaving
+identically to live load test #9's fully-static build, no periodic
+redraws, no stutter; (3) only once that's confirmed stable, a single
+slow, deliberate drag on one knob, watching for any visible tearing and
+listening for audio stutter, before ever trying a fast drag or multiple
+rapid drags. Toggle-off reliability is still unsolved regardless of this
+test's outcome -- revert via `acvs` restart as always.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:

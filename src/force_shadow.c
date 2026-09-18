@@ -210,6 +210,15 @@ static uint32_t shadow_fb_id = 0;
 static volatile int shadow_ready = 0;    /* only true once setup fully succeeded */
 static volatile int shadow_on = 0;       /* live toggle state, updated by polling */
 
+/* Kept mapped for the buffer's entire lifetime (process lifetime, same as
+ * every other static resource here -- never explicitly torn down) so the
+ * DRM commit thread can redraw on demand instead of the buffer being
+ * write-once. Only ever written from that one thread (maybe_substitute_fb,
+ * gated by shadow_redraw_needed) -- the touch thread only ever updates
+ * shadow_knob_value, never touches this memory directly. */
+static uint32_t *shadow_map = NULL;
+static uint32_t shadow_stride_px = 0;
+
 static void logline(const char *fmt, ...) {
     if (!logf) return;
     va_list ap;
@@ -466,44 +475,69 @@ static void draw_ring_land(uint32_t *map, uint32_t stride_px,
 
 /* A handful of Force Maze Voice's own params (docs/CC-MAP.md in the
  * force-maze repo) -- the initial mockup subset, not the full 16-knob
- * Q-Link bank. value_pct is fixed per knob for this static-layout test
- * (0/20/40/60/80/100, spread deliberately like load test #6's asymmetric
- * markers, so both knob position AND pointer-angle mapping can be read
- * back unambiguously in one live check) -- touch-driven live values are
- * the next increment, gated behind this one rendering correctly. */
+ * Q-Link bank. Layout/color are fixed; value is not -- split into a
+ * const layout table and a separate mutable value array (touch-driven,
+ * see the drag state machine in update_touch_state() below) so the
+ * layout table can stay `static const` while values change live. */
 typedef struct {
     const char *name;
     int32_t cx, cy, radius;
     uint32_t color;
-    int value_pct; /* 0-100, maps to a -135..+135 degree sweep */
-} shadow_knob_t;
+} shadow_knob_layout_t;
 
-static const shadow_knob_t shadow_knobs[] = {
-    { "VCO TUNE",   LAND_W * 1 / 6, LAND_H * 1 / 4, 90, 0xFFFF3B30u,   0 },
-    { "CUTOFF",     LAND_W * 3 / 6, LAND_H * 1 / 4, 90, 0xFFFF9500u,  20 },
-    { "RESO",       LAND_W * 5 / 6, LAND_H * 1 / 4, 90, 0xFFFFCC00u,  40 },
-    { "FOLD DRIVE", LAND_W * 1 / 6, LAND_H * 3 / 4, 90, 0xFF34C759u,  60 },
-    { "ENV DECAY",  LAND_W * 3 / 6, LAND_H * 3 / 4, 90, 0xFF00C7D4u,  80 },
-    { "LEVEL",      LAND_W * 5 / 6, LAND_H * 3 / 4, 90, 0xFF5E5CE6u, 100 },
+static const shadow_knob_layout_t shadow_knob_layout[] = {
+    { "VCO TUNE",   LAND_W * 1 / 6, LAND_H * 1 / 4, 90, 0xFFFF3B30u },
+    { "CUTOFF",     LAND_W * 3 / 6, LAND_H * 1 / 4, 90, 0xFFFF9500u },
+    { "RESO",       LAND_W * 5 / 6, LAND_H * 1 / 4, 90, 0xFFFFCC00u },
+    { "FOLD DRIVE", LAND_W * 1 / 6, LAND_H * 3 / 4, 90, 0xFF34C759u },
+    { "ENV DECAY",  LAND_W * 3 / 6, LAND_H * 3 / 4, 90, 0xFF00C7D4u },
+    { "LEVEL",      LAND_W * 5 / 6, LAND_H * 3 / 4, 90, 0xFF5E5CE6u },
 };
-#define NUM_SHADOW_KNOBS (sizeof(shadow_knobs) / sizeof(shadow_knobs[0]))
+#define NUM_SHADOW_KNOBS (sizeof(shadow_knob_layout) / sizeof(shadow_knob_layout[0]))
+
+/* 0-100 per knob, same indexing as shadow_knob_layout. Initial spread
+ * (0/20/40/60/80/100) is load test #9's proven static layout, now just
+ * the starting values instead of fixed ones -- touch-driven changes are
+ * applied under touch_mu (see update_touch_state()) since this array is
+ * read from the DRM commit thread (rendering) and written from the touch
+ * thread (dragging). */
+static int shadow_knob_value[NUM_SHADOW_KNOBS] = { 0, 20, 40, 60, 80, 100 };
+
+/* Set whenever a knob value actually changes; cleared once the commit
+ * thread has redrawn to reflect it. Sole purpose: skip the (comparatively
+ * expensive, full-canvas) redraw entirely on the vast majority of commits
+ * where nothing changed, rather than repainting every single frame
+ * regardless of whether the screen's contents are still correct. */
+static volatile int shadow_redraw_needed = 1; /* starts true: first draw */
+
+/* Guards shadow_knob_value (written by the touch thread while dragging,
+ * read by the DRM commit thread while redrawing) -- declared here rather
+ * than down in the touch-handling section below because
+ * maybe_substitute_fb() needs it too, and C requires the declaration to
+ * come first. */
+static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void render_knob(uint32_t *map, uint32_t stride_px,
-                         const shadow_knob_t *k) {
+                         const shadow_knob_layout_t *k, int value_pct) {
     fill_circle_land(map, stride_px, k->cx, k->cy, k->radius, 0xFF3A3A3Cu);
     draw_ring_land(map, stride_px, k->cx, k->cy, k->radius, 5, 0xFF606062u);
 
-    int angle_deg = -135 + (270 * k->value_pct) / 100;
+    int angle_deg = -135 + (270 * value_pct) / 100;
     int32_t dot_dist = (k->radius * 72) / 100;
     int32_t dx = (int32_t)(dot_dist * sin_deg(angle_deg));
     int32_t dy = -(int32_t)(dot_dist * cos_deg(angle_deg));
     fill_circle_land(map, stride_px, k->cx + dx, k->cy + dy, 14, k->color);
 }
 
-static void render_shadow_frame(uint32_t *map, uint32_t stride_px) {
+/* values must have NUM_SHADOW_KNOBS entries, same order as
+ * shadow_knob_layout -- callers snapshot shadow_knob_value under
+ * touch_mu first (see maybe_substitute_fb()) so this function itself
+ * never has to take a lock, keeping the actual pixel-pushing work off
+ * any lock's critical section. */
+static void render_shadow_frame(uint32_t *map, uint32_t stride_px, const int *values) {
     fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, 0xFF202020u);
     for (size_t i = 0; i < NUM_SHADOW_KNOBS; i++)
-        render_knob(map, stride_px, &shadow_knobs[i]);
+        render_knob(map, stride_px, &shadow_knob_layout[i], values[i]);
 }
 
 /* Allocates one reusable dumb buffer + framebuffer, filled with a solid
@@ -549,16 +583,12 @@ static void create_shadow_buffer(int fd) {
         logline("mmap of dumb buffer failed: %s", strerror(errno));
         return;
     }
-    /* Live load test #6's asymmetric orientation-marker pattern proved the
-     * put_px_land() transform above (already exercised live, four
-     * distinct corner/edge markers read back correctly off the physical
-     * panel) -- no longer needed as the actual buffer content now that
-     * the transform is implemented once, centrally, and used by every
-     * draw call. Renders the initial Maze Voice knob mockup instead. */
-    uint32_t stride_px = creq.pitch / 4;
-    render_shadow_frame((uint32_t *)map, stride_px);
-
-    munmap(map, creq.size);
+    /* Kept mapped (not munmap'd) so maybe_substitute_fb() can redraw on
+     * demand as knob values change -- see shadow_map/shadow_redraw_needed
+     * above. The first redraw (shadow_redraw_needed starts true) happens
+     * there, not here, so all rendering goes through one code path. */
+    shadow_map = (uint32_t *)map;
+    shadow_stride_px = creq.pitch / 4;
 
     shadow_fb_id = fbcmd.fb_id;
     logline("shadow buffer ready: handle=%u fb_id=%u pitch=%u size=%llu",
@@ -697,8 +727,30 @@ int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioc
  * behavior if the property isn't found in a given commit or wasn't
  * resolved/created at setup (damage_clips_prop_id/damage_clips_blob_id
  * both 0 in that case, so this is simply skipped). */
+/* Redraws the shadow buffer if (and only if) a knob value has changed
+ * since the last redraw -- skips the full-canvas repaint on the large
+ * majority of commits where the screen's contents are already correct.
+ * Called from the DRM commit thread, before the FB_ID substitution below,
+ * so a redraw and the commit that first shows it happen together. Not
+ * yet live-tested: writing into a buffer that's actively the scanned-out
+ * FB_ID, synchronously on MPC's own commit thread, is new territory for
+ * this project (see DESIGN.md's "Not yet done" -- this was deliberately
+ * held back from live load test #9 for exactly this reason). */
+static void maybe_redraw_shadow(void) {
+    if (!shadow_map) return;
+    if (!__atomic_exchange_n(&shadow_redraw_needed, 0, __ATOMIC_RELAXED)) return;
+
+    int values_snapshot[NUM_SHADOW_KNOBS];
+    pthread_mutex_lock(&touch_mu);
+    memcpy(values_snapshot, shadow_knob_value, sizeof(values_snapshot));
+    pthread_mutex_unlock(&touch_mu);
+
+    render_shadow_frame(shadow_map, shadow_stride_px, values_snapshot);
+}
+
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
     if (!shadow_ready || !shadow_on) return;
+    maybe_redraw_shadow();
     if (req->count_objs == 0) return;
 
     uint32_t *objs = (uint32_t *)(uintptr_t)req->objs_ptr;
@@ -784,8 +836,22 @@ static void touch_to_landscape(int raw_x, int raw_y, int32_t *out_px, int32_t *o
     *out_py = py;
 }
 
-static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
 static int touch_x = -1, touch_y = -1, touch_down = 0;
+
+/* Landscape px of vertical drag needed to sweep a knob's full 0-100
+ * range. A relative vertical drag (move up = increase), not absolute
+ * angle-from-center tracking, deliberately: this project's touch
+ * transform is confirmed accurate to within ~13px (see DESIGN.md's
+ * "Touch coordinate calibration"), which is fine for hit-testing against
+ * a 90px-radius knob but would make angle-from-center tracking near a
+ * knob's own center (where small position errors swing the angle wildly)
+ * unreliable. */
+#define KNOB_DRAG_RANGE_PX 300
+
+static int active_knob = -1;
+static int32_t drag_start_py = 0;
+static int drag_start_value = 0;
+static int touch_down_prev = 0;
 
 static void update_touch_state(const struct input_event *ev) {
     pthread_mutex_lock(&touch_mu);
@@ -796,6 +862,45 @@ static void update_touch_state(const struct input_event *ev) {
     } else if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
         touch_down = ev->value;
     }
+
+    if (touch_down && !touch_down_prev) {
+        /* Fresh touch-down: hit-test against every knob, activate the
+         * first (only) match. touch_x/touch_y may still reflect the last
+         * *position* event rather than one synchronized with this exact
+         * BTN_TOUCH transition (the ILI2116 driver doesn't guarantee they
+         * arrive in the same report) -- acceptable given the 90px hit
+         * radius and the confirmed ~13px calibration accuracy. */
+        int32_t lpx, lpy;
+        touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
+        active_knob = -1;
+        for (size_t i = 0; i < NUM_SHADOW_KNOBS; i++) {
+            int32_t dx = lpx - shadow_knob_layout[i].cx;
+            int32_t dy = lpy - shadow_knob_layout[i].cy;
+            int32_t r = shadow_knob_layout[i].radius;
+            if (dx * dx + dy * dy <= r * r) {
+                active_knob = (int)i;
+                drag_start_py = lpy;
+                drag_start_value = shadow_knob_value[i];
+                break;
+            }
+        }
+    } else if (touch_down && active_knob >= 0) {
+        int32_t lpx, lpy;
+        touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
+        (void)lpx;
+        int32_t dy_dragged = drag_start_py - lpy; /* positive = moved up */
+        int new_val = drag_start_value + (int)((dy_dragged * 100) / KNOB_DRAG_RANGE_PX);
+        if (new_val < 0) new_val = 0;
+        else if (new_val > 100) new_val = 100;
+        if (new_val != shadow_knob_value[active_knob]) {
+            shadow_knob_value[active_knob] = new_val;
+            shadow_redraw_needed = 1;
+        }
+    } else if (!touch_down) {
+        active_knob = -1;
+    }
+    touch_down_prev = touch_down;
+
     pthread_mutex_unlock(&touch_mu);
 }
 
