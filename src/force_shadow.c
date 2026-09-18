@@ -950,6 +950,22 @@ static void *touch_thread_fn(void *arg) {
                 ssize_t r = read(fd, &ev, sizeof(ev));
                 if (r == (ssize_t)sizeof(ev)) {
                     update_touch_state(&ev);
+                    /* Live load test #10 found the redraw gated inside
+                     * maybe_substitute_fb() never actually painted the
+                     * buffer's new content when MPC generated zero
+                     * commits during a drag (touch grabbed, MPC's own UI
+                     * static) -- so that test never actually distinguished
+                     * "needs a fresh commit to become visible" from "was
+                     * never even painted in the first place". This call
+                     * decouples painting from commits entirely: paint
+                     * immediately, from this thread, the instant a value
+                     * changes, regardless of MPC's own commit cadence.
+                     * Cheap when nothing changed (single atomic check via
+                     * maybe_redraw_shadow()'s own gate). Not yet
+                     * live-tested with nothing playing -- if this alone
+                     * makes idle-case dragging visible, no self-driven
+                     * commit mechanism is needed at all. */
+                    maybe_redraw_shadow();
                     nevents++;
                     if (nevents % 20 == 1) {
                         int32_t land_px, land_py;
