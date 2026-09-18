@@ -841,24 +841,62 @@ first (log all 13 property names during setup, not just the three
 currently checked) before writing the blob-handling code, to avoid
 guessing at a property that might not even exist on this driver.
 
+## Live load test #7, part 3 (2026-09-18): both plane-property theories ruled out live
+
+Logged the full property list for plane 0x21 (all 13, not just the three
+checked by name): `type, FB_ID, IN_FENCE_FD, CRTC_ID, CRTC_X, CRTC_Y,
+CRTC_W, CRTC_H, SRC_X, SRC_Y, SRC_W, SRC_H, IN_FORMATS`. **No
+`FB_DAMAGE_CLIPS` at all** — ruled out the damage-clips hypothesis
+immediately, no blob-handling code needed after all; this driver simply
+doesn't expose partial-refresh at the plane level.
+
+`IN_FENCE_FD` *was* present (`prop=18`), so implemented and tested the
+next hypothesis: clear it to `-1` ("no fence") whenever present in a
+substituted commit, in case the kernel was gating the actual flip on a
+fence tied to MPC's own buffer's render completion rather than ours.
+Tested live — **also ruled out**: a diagnostic log line was added to
+print the fence's value whenever the clear-path actually ran, and it
+never fired once across an entire toggle-on session with hundreds of
+substituted commits. `IN_FENCE_FD` is resolved as a valid property ID at
+setup (it genuinely exists on this plane) but MPC's actual live commits
+apparently never include it in their property list — same delta-commit
+behavior as everything else, just happens to mean this property was never
+actually in play to begin with.
+
+**Where this leaves things**: both plane-property-level theories are now
+disproven by direct live evidence, not speculation. Kernel debugfs
+already independently proved (live load test #7, part 1) that
+`FB_ID`-substitution is genuinely correct and active at the DRM/kernel
+level — correct plane, correct buffer, correct format/size/position, on
+the active CRTC. The remaining gap is somewhere even lower than DRM
+properties: possibly a cache-coherency issue in how the dumb buffer's
+mmap'd memory relates to what the display hardware actually scans from
+(the DRM dumb-buffer API is supposed to guarantee proper cache attributes
+automatically, but a driver quirk isn't impossible), possibly something
+tied to this session's unusually high count of same-boot `acvs` restarts
+without a single full power cycle, or possibly something not yet
+considered. No further cheap, well-reasoned hypotheses remain to test
+without either a power cycle (ruling state drift in or out cleanly) or
+deeper hardware-level tooling than what's available tonight.
+
 ## Not yet done
 
-- **Confirm `FB_DAMAGE_CLIPS` (or find the actual property) is really
-  what's blocking visibility** — log all property names found on plane
-  0x21 during setup (cheap, no new mechanism, just more logging) before
-  writing any blob-handling code.
-- **Implement and test the `FB_DAMAGE_CLIPS` override** if confirmed —
-  the next real code change once the property name is verified.
+- **Power cycle the device, then retest** — the most promising next
+  diagnostic step, now that both plane-property theories are ruled out.
+  A full power cycle would cleanly separate "state drift after ~100+
+  same-boot restarts tonight" from "a real, reproducible bug," which nothing
+  else tried tonight has been able to distinguish.
+- If a power cycle doesn't resolve it: investigate buffer cache
+  coherency — confirm the dumb buffer's mmap'd CPU writes are actually
+  reaching the memory the display hardware reads from (e.g. a small
+  independent read-back tool using the buffer's GEM handle, or checking
+  whether an explicit cache-flush/msync is needed around the fill on this
+  driver, which shouldn't normally be necessary for DRM dumb buffers but
+  hasn't been directly verified).
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   needs a fresh angle, not more iteration on the two approaches already
-  tried and abandoned. Worth revisiting once forward substitution is
-  actually visible again, since it may turn out to be related (e.g. if
-  reversion also needs damage-clips handling to be visible promptly).
-- Consider a full power cycle before the next live test regardless, given
-  this session's unusually high number of same-boot `acvs` restarts —
-  ruling out state drift as a contributing factor, even though the
-  debugfs evidence above points at damage-clips as the more likely single
-  explanation on its own.
+  tried and abandoned. Revisit once forward substitution is confirmed
+  visible again.
 - **Real rendering into the shadow buffer** (software rasterization of an
   addon's actual UI, using the tracked touch x/y/down state for hit-
   testing) in place of the solid magenta test color. This is the current
