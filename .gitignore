@@ -5,3 +5,4 @@
 tools/atomic_probe
 tools/getfb
 tools/grab_test
+tools/seq_probe
