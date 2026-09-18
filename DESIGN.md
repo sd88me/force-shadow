@@ -879,20 +879,77 @@ considered. No further cheap, well-reasoned hypotheses remain to test
 without either a power cycle (ruling state drift in or out cleanly) or
 deeper hardware-level tooling than what's available tonight.
 
+## Live load test #8 (2026-09-18): power cycle resolves the no-visible-effect bug — state drift confirmed as root cause
+
+Followed the most-promising-next-step from live load test #7's writeup:
+power-cycled the device (a real hard reboot, not another `acvs` restart —
+the first true cold boot of this device across this entire multi-session
+debugging arc), then re-ran the exact same test that had failed
+repeatedly through all of test #7 (orientation-marker pattern,
+`FB_ID`-substitution via the proven in-place write, byte-identical code
+to test #7's build). **The pattern appeared on screen.** Same plane
+(`0x21`), same `FB_ID` property (`17`), same `shadow_fb_id` (`65`) as
+every prior attempt — nothing about the substitution logic or resolved
+IDs changed between the failing and working runs. The only variable that
+changed was the power cycle itself.
+
+**This closes out the no-visible-effect bug.** Root cause is now
+confirmed, not just suspected: this session had accumulated 100+
+same-boot `acvs` restarts (the crash loop alone was 61) with zero full
+power cycles before test #7, and that accumulated session state — not a
+flaw in the substitution mechanism, not a missing plane property, not a
+buffer cache-coherency issue — is what made a provably-correct
+kernel-level commit (confirmed via debugfs in test #7 part 1) fail to
+ever reach the physical panel. Buffer cache coherency, the other
+candidate theory from test #7's writeup, is no longer suspected — no
+work needed there.
+
+**Practical implication for future sessions**: if a live test ever shows
+"kernel state is correct but nothing visible happens" again, power-cycle
+before spending time on new hypotheses — this class of bug is now known
+to be resolvable that way, and cheaper than any further diagnostic code.
+
+**Second WiFi/ethernet drop incident, same session.** Immediately after
+confirming the pattern, a read of
+`/sys/kernel/debug/dri/display-subsystem/state` (a plain read-only
+debugfs read, no different in kind from test #7's earlier successful
+read of the same file) caused the SSH connection to close
+(`Connection closed by <ip> port 22`), and the device dropped off the
+network entirely within the next command (`ssh`: "No route to host",
+`ping`: 100% loss) — before the planned toggle-off + `LD_PRELOAD` cleanup
+could run. User confirmed the physical screen had already returned to
+normal on its own (consistent with the established "toggle-off doesn't
+reliably work but a restart does" pattern — except no restart had been
+issued yet at that point) and rebooted the device manually. The reboot
+brought it back cleanly on a new DHCP-assigned IP
+(`192.168.1.44` → `192.168.1.187`), and the fresh process/file state
+confirmed **no manual cleanup was needed** — no stale
+`/dev/shm/.LD_PRELOAD.lock`, no leftover `force_shadow.so` entry, `MPC`
+running normally, `LD_PRELOAD` back to the standard three addons. This is
+now the **second** occurrence of an unexplained WiFi/ethernet drop during
+active live testing of this project (the first was live load test #5's
+incident), on two different sessions. Still no confirmed causal
+mechanism — this second occurrence happened during a plain debugfs read,
+not a write or a `drmModeAtomicCommit`-adjacent path, which argues
+somewhat against this project's own interposed code being the trigger —
+but two occurrences during active testing, zero during idle periods, is
+enough of a pattern to treat as a real open risk rather than a one-off,
+not just note and move on from.
+
 ## Not yet done
 
-- **Power cycle the device, then retest** — the most promising next
-  diagnostic step, now that both plane-property theories are ruled out.
-  A full power cycle would cleanly separate "state drift after ~100+
-  same-boot restarts tonight" from "a real, reproducible bug," which nothing
-  else tried tonight has been able to distinguish.
-- If a power cycle doesn't resolve it: investigate buffer cache
-  coherency — confirm the dumb buffer's mmap'd CPU writes are actually
-  reaching the memory the display hardware reads from (e.g. a small
-  independent read-back tool using the buffer's GEM handle, or checking
-  whether an explicit cache-flush/msync is needed around the fill on this
-  driver, which shouldn't normally be necessary for DRM dumb buffers but
-  hasn't been directly verified).
+- ~~Power cycle the device, then retest~~ — **done, live load test #8**:
+  confirmed the no-visible-effect bug was session state drift from ~100+
+  same-boot restarts, not a real reproducible defect. Buffer cache
+  coherency is no longer suspected as a result; no separate investigation
+  needed there.
+- **Investigate the WiFi/ethernet drop pattern** — now two occurrences
+  during active live testing on two different sessions (live load test
+  #5, and live load test #8), zero during idle periods, still no
+  confirmed causal mechanism. Worth treating as a real open risk: if it
+  recurs a third time, look for a common trigger across all three
+  occurrences (what command/action immediately preceded each drop) rather
+  than continuing to treat each one as an isolated incident.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   needs a fresh angle, not more iteration on the two approaches already
   tried and abandoned. Revisit once forward substitution is confirmed
