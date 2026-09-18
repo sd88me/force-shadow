@@ -1002,6 +1002,87 @@ test #8's own writeup for the second WiFi/ethernet drop incident and
 reboot that caused the reassignment, immediately before this test's
 rendering work began.
 
+## Touch coordinate calibration (2026-09-18): derived from MidiLoop's own touch-injection code, cross-validated against real captured data
+
+Needed before any touch-driven redraw work: how do the raw `ABS_X`/
+`ABS_Y` (and `ABS_MT_POSITION_X`/`_Y`) values this project's own
+`update_touch_state()` reads relate to the `(px, py)` landscape space
+knobs are rendered in? Unlike the buffer orientation transform (which
+needed a dedicated live test to pin down — see load test #6), this one
+turned out to already be answered by existing platform code: MidiLoop
+(`/home/sam/MockbaMod/SD/AddOns/MidiLoop`, a separate addon already
+installed on this device) ships a `TOUCH~<page>~<id>~XxY` macro command
+that synthesizes real touch events via `evemu-play` against
+`/dev/input/by-path/platform-ff160000.i2c-event` — confirmed to be the
+exact same device node as `event0`/`TOUCH_DEVICE` this project's own
+`touch_thread_fn` grabs (`ls -la /dev/input/by-path/` on-device). Its
+own docs (`midiloop-functions-reference.txt`) state coordinates are
+"between 1280x720", and `evemu-describe /dev/input/event0` independently
+confirms this is the device's **exact** kernel-reported native range for
+all four relevant axes (`ABS_X`/`ABS_Y`/`ABS_MT_POSITION_X`/
+`ABS_MT_POSITION_Y`, all `Min 0`), not a rounded approximation.
+
+`midiloop_script.sh`'s `TOUCH` case (reading `$2`/`$3` as the
+documented on-screen `X`/`Y`) computes:
+
+```
+X = 720 - ($2 * 720/1280)
+Y = ($3 * 1280/720)
+```
+
+then writes `Y` into `ABS_MT_POSITION_X`/`ABS_X` and `X` into
+`ABS_MT_POSITION_Y`/`ABS_Y` — i.e. the two axes are swapped relative to
+the documented on-screen coordinate names. Since this is a working,
+production mechanism (every Force/MidiLoop user's `TOUCH~` macros depend
+on it landing on the right on-screen button), inverting it gives this
+project's own raw→landscape transform for free, with real hardware
+already backing its correctness:
+
+```
+landscape_y = raw_x * 9 / 16     /* raw_x * 720/1280, reduces to 9/16 */
+landscape_x = (720 - raw_y) * 16 / 9
+```
+
+Exact integer ratios (1280:720 reduces cleanly to 16:9) — no rounding
+error worth worrying about, and no `libm` needed, consistent with this
+project's dependency-profile discipline (see live load test #9).
+
+**Cross-validated against real data, not just derived on paper**: fed
+six consecutive real touch samples from live load test #9's own log
+(captured during that test's touch-grab session, while the knob mockup
+was on screen) through this formula. They decode to a smooth, continuous
+trajectory — `px` staying in a tight 665–690 band while `py` falls
+steadily 613→403 across consecutive events — landing squarely inside the
+bottom-row `ENV DECAY` knob's hit circle (center `(640,600)`, radius
+`90`) at the first sample and sweeping straight up toward the top-row
+`CUTOFF` knob `(640,200)` above it. That is exactly the shape a real
+finger drag between those two knobs should produce under a correct
+transform; a wrong transform would not coincidentally produce a smooth,
+knob-to-knob-aligned path from essentially random raw input.
+
+**One open question, not yet resolved**: the touch device's native
+height is `720`, but the landscape render canvas (`LAND_H`) is `800`,
+matching the display's own composition size — so roughly the bottom
+`80px` of the render canvas (`py` 720–800) may be unreachable by touch
+entirely. Unknown yet whether that's a real physical dead zone (bezel,
+non-active digitizer area) or just a digitizer-vs-panel calibration
+mismatch that a real implementation should scale around. Deferred rather
+than guessed at: the current 6-knob layout's lowest elements (bottom row,
+`py` 600 ± 90 = `[510,690]`) comfortably clear `720` either way, so
+nothing today depends on the answer — but any future layout element
+placed below `py≈720` should get a live check first.
+
+**Implemented in `src/force_shadow.c`**: `touch_to_landscape()` (pure
+integer math, matches the formula above, with a defensive clamp to
+`[0,LAND_W)`/`[0,LAND_H)` since real digitizers occasionally report
+slightly-out-of-nominal-range noise). Wired into the existing touch log
+heartbeat only, for now — logs both raw and derived landscape
+coordinates side by side so the next live test can visually confirm a
+real tap on a specific knob decodes to a point inside that knob's own
+hit circle, the same "read it back off the physical screen" rigor every
+other transform in this project has gone through, before this feeds any
+actual hit-testing/dragging logic. **Not yet live-tested.**
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1025,12 +1106,21 @@ rendering work began.
   params) renders correctly, confirmed live by direct visual description
   (layout, per-knob color, and pointer-angle sweep all matched what the
   code intended). Next increment: touch-driven live values (drag a knob,
-  see it redraw) instead of the current fixed per-knob test percentages —
-  see live load test #9's writeup for what's still unresolved before that
-  can be built (buffer persistence for redraw, touch/landscape coordinate
-  correlation, and a redraw-cadence strategy). A fuller design-language
-  pass (labels/text, closer match to MPC's own visual conventions) comes
-  once interactivity is in place.
+  see it redraw) instead of the current fixed per-knob test percentages.
+  The touch/landscape coordinate transform is now derived and implemented
+  (see "Touch coordinate calibration" above) but **not yet live-tested**
+  — confirm that first (tap a specific knob, check the logged derived
+  coordinates land inside its hit circle) before building hit-testing on
+  top of it. Buffer persistence for redraw and a redraw-cadence strategy
+  (piggybacking on MPC's own commit cadence, most likely, but writing
+  into a live-scanned-out buffer synchronously on MPC's own commit thread
+  carries real tearing/latency risk not yet assessed) are both still
+  unbuilt — deliberately held back from this same pass, consistent with
+  this project's staged-testing discipline: the render primitives and the
+  touch transform were each risky/new enough on their own to earn their
+  own live check before being combined. A fuller design-language pass
+  (labels/text, closer match to MPC's own visual conventions) comes once
+  interactivity is in place.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.

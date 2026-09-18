@@ -760,6 +760,30 @@ static void poll_toggle(void) {
 #define TOUCH_DEVICE "/dev/input/event0"
 #define EVIOCGRAB_REQ _IOW('E', 0x90, int)
 
+/* Native ABS_X/ABS_Y/ABS_MT_POSITION_X/_Y range on this exact device
+ * (ILI2116 Touchscreen on event0), confirmed via `evemu-describe` --
+ * Min 0 on all four, Max as below. Matches MidiLoop's own documented
+ * "1280x720" touch coordinate space exactly, not a rounded figure -- see
+ * DESIGN.md's "Touch coordinate calibration" section for the full
+ * derivation (from MidiLoop's own touch-injection code, targeting this
+ * same device) and its cross-validation against real captured data. */
+#define TOUCH_RAW_X_MAX 1280
+#define TOUCH_RAW_Y_MAX 720
+
+/* raw (ABS_X, ABS_Y) -> landscape (px, py), per DESIGN.md's derivation.
+ * 1280:720 reduces exactly to 16:9, so this is plain integer math, no
+ * libm needed (same dependency-profile discipline as the knob renderer's
+ * sin_deg()/cos_deg()). Clamped defensively since real digitizers
+ * occasionally report slightly-out-of-nominal-range noise. */
+static void touch_to_landscape(int raw_x, int raw_y, int32_t *out_px, int32_t *out_py) {
+    int32_t py = raw_x * 9 / 16;
+    int32_t px = (TOUCH_RAW_Y_MAX - raw_y) * 16 / 9;
+    if (px < 0) px = 0; else if (px >= LAND_W) px = LAND_W - 1;
+    if (py < 0) py = 0; else if (py >= LAND_H) py = LAND_H - 1;
+    *out_px = px;
+    *out_py = py;
+}
+
 static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
 static int touch_x = -1, touch_y = -1, touch_down = 0;
 
@@ -823,9 +847,13 @@ static void *touch_thread_fn(void *arg) {
                     update_touch_state(&ev);
                     nevents++;
                     if (nevents % 20 == 1) {
-                        logline("touch: grab #%llu event #%llu type=%u code=%u value=%d (x=%d y=%d down=%d)",
+                        int32_t land_px, land_py;
+                        touch_to_landscape(touch_x, touch_y, &land_px, &land_py);
+                        logline("touch: grab #%llu event #%llu type=%u code=%u value=%d "
+                                 "(raw x=%d y=%d down=%d -> landscape px=%d py=%d)",
                                  (unsigned long long)session, (unsigned long long)nevents,
-                                 ev.type, ev.code, ev.value, touch_x, touch_y, touch_down);
+                                 ev.type, ev.code, ev.value, touch_x, touch_y, touch_down,
+                                 land_px, land_py);
                     }
                 }
             }
