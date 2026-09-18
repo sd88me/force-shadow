@@ -569,8 +569,20 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
 
 #define TOPBAR_H 72
 #define TABBAR_H 72
-#define CONTENT_Y (TOPBAR_H + 22)
-#define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 44)
+/* Confirmed live (2026-09-18): the touch digitizer's native height is
+ * only 720px (touch_to_landscape()'s py can never exceed
+ * TOUCH_RAW_X_MAX*9/16 = 720), but LAND_H is 800 to match the display's
+ * own composition size -- DESIGN.md's "Touch coordinate calibration"
+ * flagged this exact gap as an open question back when it was only
+ * theoretical. It wasn't theoretical: the tab bar, originally placed
+ * flush with LAND_H's bottom edge (728-800), was completely untouchable
+ * -- real touches there don't just land near the target, py physically
+ * cannot reach past 720 at all. Every touchable element now fits within
+ * [0,720); LAND_H's remaining 80px stays visually part of the canvas
+ * but is deliberately never given a touch target. */
+#define TOUCHABLE_H 720
+#define CONTENT_Y (TOPBAR_H + 16)
+#define CONTENT_H (TOUCHABLE_H - TOPBAR_H - TABBAR_H - 32)
 #define NUM_PAGES 3
 
 typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V } widget_kind_t;
@@ -861,7 +873,7 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     for (int i = 0; i < n_frames; i++) render_frame_box(map, stride_px, &frames[i]);
     for (int i = 0; i < n_widgets; i++) render_widget(map, stride_px, &widgets[i]);
 
-    int32_t tabbar_y = LAND_H - TABBAR_H;
+    int32_t tabbar_y = TOUCHABLE_H - TABBAR_H;
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, PLATE_LINE);
     int32_t tw = LAND_W / NUM_PAGES;
@@ -1383,7 +1395,7 @@ static void update_touch_state(const struct input_event *ev) {
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
         active_widget = -1;
 
-        int32_t tabbar_y = LAND_H - TABBAR_H;
+        int32_t tabbar_y = TOUCHABLE_H - TABBAR_H;
         if (lpy >= tabbar_y) {
             int32_t tw = LAND_W / NUM_PAGES;
             int new_page = lpx / tw;
