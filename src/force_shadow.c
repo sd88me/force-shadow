@@ -197,6 +197,7 @@ static uint32_t plane_obj_id = 0;
 static uint32_t fb_id_prop_id = 0;
 static uint32_t damage_clips_prop_id = 0;  /* 0 if not found on this plane */
 static uint32_t damage_clips_blob_id = 0;  /* 0 if not yet created */
+static uint32_t in_fence_fd_prop_id = 0;   /* 0 if not found on this plane */
 static uint32_t shadow_fb_id = 0;
 static volatile int shadow_ready = 0;    /* only true once setup fully succeeded */
 static volatile int shadow_on = 0;       /* live toggle state, updated by polling */
@@ -281,6 +282,7 @@ static void resolve_plane_and_props(int fd) {
     }
 
     uint32_t fallback_plane = 0, fallback_fb_prop = 0, fallback_damage_prop = 0;
+    uint32_t fallback_fence_prop = 0;
     int fallback_nprops = -1;
     uint32_t primary_plane = 0, primary_fb_prop = 0;
     int found_primary = 0;
@@ -303,7 +305,7 @@ static void resolve_plane_and_props(int fd) {
             free(props); free(vals); continue;
         }
 
-        uint32_t fb_prop = 0, crtc_prop = 0, damage_prop = 0;
+        uint32_t fb_prop = 0, crtc_prop = 0, damage_prop = 0, fence_prop = 0;
         int this_is_primary = 0;
         char names_buf[512] = "";
         size_t names_len = 0;
@@ -314,6 +316,7 @@ static void resolve_plane_and_props(int fd) {
             if (strcmp(name, "FB_ID") == 0) fb_prop = props[i];
             else if (strcmp(name, "CRTC_ID") == 0) crtc_prop = props[i];
             else if (strcmp(name, "FB_DAMAGE_CLIPS") == 0) damage_prop = props[i];
+            else if (strcmp(name, "IN_FENCE_FD") == 0) fence_prop = props[i];
             else if (strcmp(name, "type") == 0 &&
                      primary_val != UINT64_MAX && primary_val == vals[i]) {
                 this_is_primary = 1;
@@ -324,13 +327,14 @@ static void resolve_plane_and_props(int fd) {
         }
 
         if (fb_prop && crtc_prop) {
-            logline("plane 0x%x: %u props [%s], FB_ID=%u CRTC_ID=%u DAMAGE=%u%s",
-                     pid, cnt, names_buf, fb_prop, crtc_prop, damage_prop,
+            logline("plane 0x%x: %u props [%s], FB_ID=%u CRTC_ID=%u DAMAGE=%u FENCE=%u%s",
+                     pid, cnt, names_buf, fb_prop, crtc_prop, damage_prop, fence_prop,
                      this_is_primary ? " (type=Primary)" : "");
             if (this_is_primary && !found_primary) {
                 primary_plane = pid;
                 primary_fb_prop = fb_prop;
                 damage_clips_prop_id = damage_prop;
+                in_fence_fd_prop_id = fence_prop;
                 found_primary = 1;
             }
             if ((int)cnt > fallback_nprops) {
@@ -338,6 +342,7 @@ static void resolve_plane_and_props(int fd) {
                 fallback_plane = pid;
                 fallback_fb_prop = fb_prop;
                 fallback_damage_prop = damage_prop;
+                fallback_fence_prop = fence_prop;
             }
         }
         free(props);
@@ -348,15 +353,18 @@ static void resolve_plane_and_props(int fd) {
     if (found_primary) {
         plane_obj_id = primary_plane;
         fb_id_prop_id = primary_fb_prop;
-        logline("resolved primary plane via type=Primary: obj=0x%x FB_ID=%u DAMAGE_CLIPS=%u",
-                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id);
+        logline("resolved primary plane via type=Primary: obj=0x%x FB_ID=%u "
+                 "DAMAGE_CLIPS=%u IN_FENCE_FD=%u",
+                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id, in_fence_fd_prop_id);
     } else if (fallback_plane) {
         plane_obj_id = fallback_plane;
         fb_id_prop_id = fallback_fb_prop;
         damage_clips_prop_id = fallback_damage_prop;
+        in_fence_fd_prop_id = fallback_fence_prop;
         logline("no plane had type=Primary; falling back to most-properties "
-                 "heuristic: obj=0x%x FB_ID=%u DAMAGE_CLIPS=%u (%d props)",
-                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id, fallback_nprops);
+                 "heuristic: obj=0x%x FB_ID=%u DAMAGE_CLIPS=%u IN_FENCE_FD=%u (%d props)",
+                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id, in_fence_fd_prop_id,
+                 fallback_nprops);
     } else {
         logline("no plane with both FB_ID and CRTC_ID found -- shadow mode unavailable");
     }
@@ -537,10 +545,11 @@ static void do_lazy_setup(void) {
     if (plane_obj_id && fb_id_prop_id && shadow_fb_id) {
         shadow_ready = 1;
         logline("setup complete: plane=0x%x FB_ID_prop=%u shadow_fb_id=%u "
-                 "damage_clips_prop=%u damage_blob=%u -- shadow mode ARMED "
-                 "(still off; toggle via %s)",
+                 "damage_clips_prop=%u damage_blob=%u in_fence_fd_prop=%u "
+                 "-- shadow mode ARMED (still off; toggle via %s)",
                  plane_obj_id, fb_id_prop_id, shadow_fb_id,
-                 damage_clips_prop_id, damage_clips_blob_id, SHADOW_TOGGLE_FILE);
+                 damage_clips_prop_id, damage_clips_blob_id, in_fence_fd_prop_id,
+                 SHADOW_TOGGLE_FILE);
     } else {
         logline("setup incomplete -- shadow mode unavailable, pass-through only");
     }
@@ -610,6 +619,24 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
                 } else if (damage_clips_prop_id && damage_clips_blob_id &&
                            props[offset + j] == damage_clips_prop_id) {
                     values[offset + j] = damage_clips_blob_id;
+                } else if (in_fence_fd_prop_id &&
+                           props[offset + j] == in_fence_fd_prop_id) {
+                    /* Live load test #7: FB_DAMAGE_CLIPS doesn't exist on
+                     * this plane (ruled out live). New hypothesis:
+                     * IN_FENCE_FD ties this commit's flip to a fence tied
+                     * to MPC's OWN buffer's render completion -- if we
+                     * swap FB_ID but leave that fence value alone, the
+                     * kernel may gate the actual flip on a fence that has
+                     * nothing to do with our substituted buffer. -1 means
+                     * "no fence, ready immediately" -- clear it whenever
+                     * present so our substituted buffer is never blocked
+                     * on a fence meant for a different one. */
+                    static uint64_t fence_seen = 0;
+                    if (__atomic_add_fetch(&fence_seen, 1, __ATOMIC_RELAXED) % 20 == 1) {
+                        logline("IN_FENCE_FD was %lld -- clearing to -1",
+                                 (long long)(int64_t)values[offset + j]);
+                    }
+                    values[offset + j] = (uint64_t)(int64_t)-1;
                 }
             }
             return; /* done with this plane either way */
