@@ -40,11 +40,22 @@ already use for their own native builds):
 docker run --rm --platform linux/arm/v7 \
   -v "$PWD/tools":/build -w /build \
   arm32v7/debian:stretch bash -c '
-    apt-get update -qq && apt-get install -y --no-install-recommends gcc libc6-dev
+    cat > /etc/apt/sources.list <<EOF
+deb http://archive.debian.org/debian stretch main
+deb http://archive.debian.org/debian-security stretch/updates main
+EOF
+    apt-get -o Acquire::Check-Valid-Until=false update -qq && apt-get install -y --no-install-recommends gcc libc6-dev
     gcc -O2 -Wall -o atomic_probe atomic_probe.c && strip atomic_probe
     gcc -O2 -Wall -o getfb getfb.c && strip getfb
   '
 ```
+
+(Debian stretch's own package repos went EOL after this toolchain was
+first set up — `deb.debian.org`/`security.debian.org` now 404 on
+`stretch`. The `sources.list` rewrite above points at
+`archive.debian.org` instead, confirmed working 2026-09-18. Same fix
+applies to `src/force_shadow.c`'s own build, e.g.
+`gcc -O2 -Wall -Wextra -fPIC -shared -o force_shadow.so force_shadow.c -ldl -lpthread`.)
 
 `atomic_probe` briefly slows the traced thread down (Python/C single-step
 overhead, not `strace`'s own optimized internals) — expect a short
