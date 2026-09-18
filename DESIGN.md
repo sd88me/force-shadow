@@ -1218,6 +1218,56 @@ out the command-mode/needs-content-aware-refresh concern. If it never
 updates even then, that points the other way. Either result is useful
 and neither requires writing new code first.
 
+## Live load test #11 (2026-09-18): interactive dragging confirmed live — the project's second central milestone
+
+Ran the diagnostic queued at the end of live load test #10: reloaded
+with a track playing (playhead/meter activity generating continuous
+`pass-through` commits independent of touch — confirmed in the log,
+commit numbers climbing steadily even before shadow mode was toggled
+on), then toggled shadow mode on and repeated the same drag test.
+
+**It worked.** User confirmed: the pointer visually moved as the drag
+progressed, in real time. This is the first time this project has shown
+live-driven, touch-reactive rendering, not just a static or one-shot
+buffer swap — every piece built today (rasterizer, touch transform, drag
+math, gated redraw) is now proven working together, end-to-end, on real
+hardware.
+
+**Resolves live load test #10's open question, practically if not
+theoretically**: redraw *does* become visible once `maybe_substitute_fb`
+is actually being called regularly (i.e. once MPC is generating its own
+commits, here via a playing track) — confirming the existing gated-
+redraw design is fundamentally sound. The video-mode-vs-command-mode
+panel question is still not directly settled, but visible tearing during
+the drag — **user described a few faint lines across the screen width,
+changing angle slightly, most noticeable on the knobs themselves** (the
+brightest color contrast against the dark background, though the whole
+canvas redraws each time, not just the knobs) — is itself informative:
+a shifting-angle horizontal tear is the classic signature of a display
+continuously scanning from memory mid-write, which leans toward
+**video-mode** (continuous scan), not command-mode (pushed frames, which
+would tend to show a stale frame or a clean full-frame swap, not a
+partial mid-scan tear). Not proof, but the first real evidence either
+way. **Audio was unaffected** — no stutter or crackle reported during the
+drag, so the commit-thread latency concern from live load test #10's
+risk writeup did not manifest as an audible problem in this test.
+
+**What's still unsolved, now scoped precisely**: this test only worked
+*because* a track was playing, continuously feeding `maybe_substitute_fb`
+real commits to piggyback the redraw on. The general case -- a user in
+shadow mode adjusting a knob with nothing playing -- still has no
+guaranteed commit to hang a redraw off of (idle commit cadence has
+proven unreliable in this project before, live load test #4 documented
+gaps up to 99 seconds). That remains the real open problem, not
+solved by this test, just no longer entangled with "does the redraw
+mechanism even work at all" -- it now clearly does.
+
+**Also unaddressed, lower priority**: the tearing itself (cosmetic, not
+correctness) -- proper double-buffering (two dumb buffers, flip between
+them via a real `FB_ID`-only atomic commit instead of overwriting the
+live one in place) would fix it, but is new, more invasive work, not
+attempted today.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1245,20 +1295,21 @@ and neither requires writing new code first.
   ~~The touch/landscape coordinate transform~~ is now derived,
   implemented, **and live-confirmed** (see "Touch coordinate calibration"
   above — a live tap landed 13px from a knob's true center) — trusted for
-  hit-testing now. Interactive dragging was built and live-tested (live
-  load test #10): the drag/hit-test math is confirmed correct (a clean,
-  knob-centered trajectory in the log), but **the redraw never visually
-  fires while touch is grabbed**, because it's gated on MPC's own commit
-  cadence and MPC generates zero commits once it can't see the touch and
-  its own UI is otherwise static -- see live load test #10's writeup for
-  the full finding and the cheap, no-new-code diagnostic queued up next
-  (force an MPC-driven commit via a physical transport button during
-  playback, see whether a dragged-but-unshown value then snaps into
-  place) to determine whether this panel needs a fresh atomic commit to
-  notice pixel-only buffer changes at all, which decides what the actual
-  fix looks like. A fuller design-language pass (labels/text, closer
-  match to MPC's own visual conventions) still comes once interactivity
-  actually works end-to-end.
+  hit-testing now. ~~Interactive dragging~~ is built and **live-confirmed
+  end-to-end** (live load test #11, after live load test #10 first found
+  the drag/hit-test math correct but the redraw silent with nothing
+  playing): with a track playing to keep commits flowing, dragging a
+  knob visibly moves its pointer live, audio unaffected. Two things
+  remain, both scoped precisely rather than open-ended: **(1)** the
+  general case (adjusting a knob with nothing playing) still has no
+  guaranteed commit to hang a redraw off of -- idle commit cadence has
+  proven unreliable before (gaps up to 99s, live load test #4) -- needs
+  its own fix, not yet designed; **(2)** minor cosmetic tearing (a few
+  faint, shifting-angle lines, most visible on the knobs' own color
+  contrast) from the lack of double-buffering -- fixable, lower priority,
+  not attempted. A fuller design-language pass (labels/text, closer match
+  to MPC's own visual conventions) is the natural next visual-polish step
+  now that the interactive mechanism itself is proven.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
