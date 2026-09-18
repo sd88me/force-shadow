@@ -1775,6 +1775,54 @@ space ours does — cross-validate the specific dimension being reused
 (here, the landscape-height target), not just "does the overall mechanism
 work for its own original purpose."
 
+## Live load test #17 (2026-09-19): the full 3-page UI closes the loop — every widget kind, every page, confirmed live with real audio
+
+Same session as test #16's touch fix, continued immediately after. Added
+temporary logging to `send_maze_set()` (logs the exact `SET <key>
+<value>` line and `maze_host`'s own reply) to make this test's results
+checkable from the log, not just by ear — kept permanently afterward
+(cheap: fires once per discrete widget interaction, not per-frame, same
+throttled-logging style already used elsewhere in this file).
+
+**First pass, no voice attached**: toggled random toggles, the Route
+enum, and the Generate button. User confirmed visually ("I can see the
+random toggles change state, and the routing switch change state").
+Log showed every dispatch was `connect(/tmp/maze_ctrl.sock) failed: No
+such file or directory` -- expected, since nothing was listening yet --
+but confirmed the touch -> widget -> dispatch logic sends exactly the
+right protocol string per widget kind: `rnd_voice off`, `rnd_go go`,
+`route Parallel`/`VCF>VCW`/`VCW>VCF` (the enum's own literal option
+strings, not indices), all matching `module.json`'s `chain_params`
+convention.
+
+**Second pass, real DSP attached**: started `maze_host` manually via
+`setsid` (same procedure as live load test #13/#14, using
+`NSMODULE.json`'s own documented `ARGUMENTS`), confirmed it survived a
+fresh SSH connection. Hit an expected snag: the toggle-off reliability
+problem (long-standing "Not yet done" item) meant the user couldn't get
+back to the normal MPC UI on the device itself to route a MIDI track to
+`Maze:In (Mockba)` -- worked around it by clearing `/tmp/force_shadow_on`
+from this end over SSH (the same toggle this session had set), which the
+log confirmed cleanly ("shadow mode toggled off", touch grab released).
+User routed the track, got a sequence playing, shadow mode was
+re-enabled the same way.
+
+**Result: "it all works! tried al lpages and it responds, including the
+voice page, and random generation."** Log confirms clean `OK` replies
+from `maze_host` for every widget kind exercised: knobs (`cutoff`,
+`cutoff_eg1`, ...), toggles (`rnd_voice`/`rnd_wavefolder`/`rnd_filter`/
+`rnd_tone`), the button (`rnd_go`), and two different enums (`route`,
+`mix.channel` with its `L`/`R`/`L+R` options) -- `maze_host` itself
+never crashed, confirmed still running under the same PID throughout.
+This is this project's fourth central milestone: every widget kind, on
+every page of the real 3-page control surface, proven live against the
+actual running DSP engine, not just its own on-screen state.
+
+Cleaned up in the established order: toggled shadow mode off (confirmed
+via log), user confirmed screen/pads/audio all normal, then stopped
+`maze_host` (per `NSMODULE.json`'s own "always start it after boot, not
+autoloaded" convention -- it shouldn't persist across sessions).
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1797,9 +1845,14 @@ work for its own original purpose."
   specific action (not just "testing was happening"), that's worth
   chasing properly.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
-  needs a fresh angle, not more iteration on the two approaches already
-  tried and abandoned. Revisit once forward substitution is confirmed
-  visible again.
+  recurred in live load test #17: mid-test, the user couldn't get back to
+  the normal MPC UI on the device itself to route a MIDI track (the real
+  MidiLoop hardware combo apparently didn't take), worked around only by
+  clearing `/tmp/force_shadow_on` from this end over SSH. Still not
+  investigated *why* the hardware combo didn't revert that time — this
+  session's workaround treated the symptom, not the cause. Needs a fresh
+  angle, not more iteration on the two approaches already tried and
+  abandoned.
 - ~~Real rendering into the shadow buffer~~ — **step A done, live load
   test #9**: a static 6-knob mockup (Maze Voice's most commonly-tweaked
   params) renders correctly, confirmed live by direct visual description
@@ -1826,15 +1879,14 @@ work for its own original purpose."
   attempted. A fuller design-language pass (labels/text, closer match to
   MPC's own visual conventions) is the natural next visual-polish step
   now that the interactive mechanism itself is proven end-to-end.
-- ~~Wire knobs to the real DSP~~ — **done, live load tests #13/#14**: a
-  dragged knob sends `SET` commands over `maze_host`'s own Unix control
-  socket and audibly changes the sound, confirmed live on two params
-  (VCO TUNE, FOLD DRIVE) after fixing a `SIGPIPE` bug (test #13) that was
-  killing `maze_host` on the first attempt. Only wired for the current
-  6-knob mockup subset — extending to the rest of `docs/CC-MAP.md`'s
-  params (or other addons' own params) is straightforward repetition of
-  the same pattern (`shadow_knob_param[]` + the layout table), not new
-  design work, whenever more knobs/pages are added.
+- ~~Wire knobs to the real DSP~~ — **done, live load tests #13/#14**, then
+  **extended to every widget kind on the full 3-page UI, live load test
+  #17**: knobs, toggles, the Generate button, and two different enum
+  selectors (`route`, `mix.channel`) all confirmed sending correct `SET`
+  commands and getting clean `OK` replies from a live `maze_host`, with
+  the user confirming every page audibly/functionally responds. No longer
+  limited to a 6-knob subset — this is now the real, complete param
+  surface `module.json` defines.
 - Sequencing rule to carry into all future live tests involving a voice
   addon (from `force-maze/maze-voice/DESIGN.md`'s own hard rule,
   respected in tests #13/#14): **stop `maze_host` (or any attached

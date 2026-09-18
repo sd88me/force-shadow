@@ -1288,13 +1288,18 @@ static void send_maze_set(const char *key, const char *value_str) {
         char line[128];
         int n = snprintf(line, sizeof(line), "SET %s %s\n", key, value_str);
         if (n > 0 && send(fd, line, (size_t)n, MSG_NOSIGNAL) > 0) {
-            char reply[16];
-            recv(fd, reply, sizeof(reply), 0); /* result unused -- just
-                                                  * drains it so our close()
-                                                  * can never race ahead of
+            char reply[16] = {0};
+            ssize_t rn = recv(fd, reply, sizeof(reply) - 1, 0); /* drains
+                                                  * it so our close() can
+                                                  * never race ahead of
                                                   * maze_host's own reply
                                                   * write. */
+            logline("maze_ctrl: SET %s %s -> reply='%s' (rn=%zd)",
+                     key, value_str, rn > 0 ? reply : "", rn);
         }
+    } else {
+        logline("maze_ctrl: connect(%s) failed: %s -- SET %s %s dropped",
+                 MAZE_CTRL_SOCK, strerror(errno), key, value_str);
     }
     close(fd);
 }
