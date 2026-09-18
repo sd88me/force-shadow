@@ -1823,6 +1823,92 @@ via log), user confirmed screen/pads/audio all normal, then stopped
 `maze_host` (per `NSMODULE.json`'s own "always start it after boot, not
 autoloaded" convention -- it shouldn't persist across sessions).
 
+## Live load test #18 (2026-09-19): packaged as a real installable addon, ENABLE/DISABLE confirmed live
+
+Replaced the one-off manual `scp /tmp/force_shadow.so` + hand-edit
+`/dev/shm/.LD_PRELOAD` test workflow (used for every live test this
+project has ever run) with a real `AddOns/ForceShadow` addon, following
+`force-audioin`'s own proven `manage.sh`/`run_*.sh` pattern exactly
+(the closest precedent: also a pure `LD_PRELOAD` interposer, already
+shipped) rather than inventing a new convention — confirmed against that
+project's actual committed scripts, not just its README's prose summary,
+and cross-checked against the `mockbamod-module-creator` skill's own
+`architecture.md`/`gotchas.md` (the `manage.sh` contract, the
+`mkdir`-based `/dev/shm/.LD_PRELOAD.lock` convention, and the full
+boot-race incident history that convention exists to prevent).
+
+**`addon/manage.sh` + `addon/run_ForceShadow.sh`**: arms `force_shadow.so`
+into `/dev/shm/.LD_PRELOAD` at boot, always starting inactive
+(pass-through only — shadow mode still needs an explicit toggle),
+mirroring `force-audioin`'s own "zero voices at boot" safety principle.
+No `NSMODULE.json` — confirmed via `architecture.md` that one is only
+needed for a nodeServer Modules-page entry, which only makes sense for a
+managed background *process*; `force_shadow.so` has none (everything runs
+inside MPC's own process), matching `forceAudioIn.so`'s own precedent
+(no `NSMODULE.json` either — only `injectTone`, its separate test
+producer, has one).
+
+**`addon/bind_midiloop.sh`**: the one genuinely new design problem, not
+copied from precedent. The real hardware toggle (`KNOBS+SCENE-1`..`7`,
+live load test #15) depends on hand-edited lines in MidiLoop's own
+`midiloop.config`/`USER-SCRIPTS.sh` — a shared, safety-critical config
+file (also controls MidiLoop's reboot/restart/shutdown shortcuts and
+every other addon's bindings) that lived only on this one already-edited
+device, never captured in this repo. Deliberately kept **out** of
+`manage.sh ENABLE` (a materially higher risk tier than arming our own,
+never-touched-by-anyone-else `LD_PRELOAD` entry — see `gotchas.md`'s
+integration-technique ranking) and built as a separate, explicit,
+idempotent script instead:
+- Discovers free `SCRIPT-N` ids dynamically (scans for the highest
+  already-used id, starts after it) rather than hardcoding `19`-`25` —
+  those were only "next free" on *this* device on *that* day; a fresh
+  install needs to find its own.
+- Refuses and changes nothing if any target `KNOBS+SCENE-1`..`7` slot is
+  already bound to something else — never overwrites a real binding
+  blind.
+- Idempotent: if all 7 slots are already force-shadow-bound (own marker
+  comment), it's a clean no-op.
+- Backs up both files first, timestamped, every run.
+- Validates with `midiloop`'s own `test` subcommand before reloading.
+
+**Live-tested in stages, no live risk taken on unverified logic**:
+1. Ran the script as-is against the device's *current* (already-bound,
+   from live load test #15) config — exercised the idempotent no-op path
+   for real, on real BusyBox `grep -E`/`sed`, confirmed correct
+   (`"All 7 ... already force-shadow-bound. Nothing to do."`) with zero
+   files touched (no new backups created — verified directly).
+2. Sandboxed the *fresh-bind* write path: copied the pre-binding backup
+   files (saved from live load test #15) into `/tmp`, ran a
+   path-redirected copy of the script against those instead of the real
+   files, with the `midiloop test`/reload step stripped out entirely (so
+   it could never reach the real live `midiloop` process). **Output
+   byte-for-byte matched** live load test #15's own hand-verified,
+   already-working live edit — strong evidence the automated write logic
+   is correct, without ever touching the real config to find out.
+3. Deployed the real `addon/` directory to its real install path
+   (`$mmPath/AddOns/ForceShadow`, replacing the ad-hoc `/tmp` copy every
+   earlier test used) and ran `manage.sh ENABLE` for real: `LD_PRELOAD`
+   correctly updated (old `/tmp/force_shadow.so` entry removed, new
+   `.../AddOns/ForceShadow/force_shadow.so` path prepended, other 3
+   libraries preserved untouched), `force_shadow.so` loaded and armed
+   cleanly in the new MPC process, user confirmed screen/pads/touch
+   normal.
+4. Ran `manage.sh DISABLE`: `LD_PRELOAD` correctly reverted to exactly
+   the original 3 libraries, top-level launcher removed, user confirmed
+   normal again.
+
+`bind_midiloop.sh` itself was intentionally *not* run against the real
+live config this session (it's already correctly bound from live load
+test #15 — nothing to gain by re-running the write path for real, only
+risk). Its write path is validated by the sandboxed test above instead;
+next fresh install (a different device, or this one after a from-scratch
+`UNINSTALL`) is the first time it'll run for real against a live target.
+
+Device left in a clean, disabled-but-installed state (`addon/` present at
+its real path, no top-level launcher, `LD_PRELOAD` at baseline) — a safe
+resting point, re-enabled with one command (`manage.sh ENABLE`) whenever
+next needed.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -1910,11 +1996,8 @@ autoloaded" convention -- it shouldn't persist across sessions).
   Next real option, if this is revisited, is linking `libasound` directly
   (trading away this project's dependency-profile purity for a
   proven-working code path) -- a product decision, not yet made.
-- Packaging this as a real `AddOns/ForceShadow` addon (`run_*.sh`,
-  `NSMODULE.json`, proper `/dev/shm/.LD_PRELOAD.lock`-respecting install/
-  kill scripts) instead of the current one-off manual `scp`+edit test
-  workflow — worth doing once the remaining feature work above is closer
-  to done, to stop repeating the manual edit/lock dance on every test.
+- ~~Packaging this as a real `AddOns/ForceShadow` addon~~ — **done, live
+  load test #18**: see its own section below.
 - If any future test needs to edit `/dev/shm/.LD_PRELOAD` live again: use
   the `/dev/shm/.LD_PRELOAD.lock` `mkdir`-lock convention, per the incident
   documented under live load test #1.
