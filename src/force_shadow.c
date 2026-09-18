@@ -193,6 +193,14 @@ static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 #define SHADOW_TOGGLE_FILE "/tmp/force_shadow_on"
 #define SHADOW_TOGGLE_CHECK_EVERY 30  /* ~2/sec at observed active commit rates */
 
+/* Virtual landscape canvas all rendering targets -- matches MPC's own
+ * internal 1280x800 composition size (live load test #6), before its RGA
+ * rotation step which this project bypasses entirely by writing straight
+ * into the panel's raw post-rotation buffer. LAND_W/LAND_H are just
+ * SHADOW_H/SHADOW_W swapped; see put_px_land()'s transform below. */
+#define LAND_W SHADOW_H
+#define LAND_H SHADOW_W
+
 static uint32_t plane_obj_id = 0;
 static uint32_t fb_id_prop_id = 0;
 static uint32_t damage_clips_prop_id = 0;  /* 0 if not found on this plane */
@@ -370,6 +378,134 @@ static void resolve_plane_and_props(int fd) {
     }
 }
 
+/* ---- Rendering (Maze Voice mockup, step A: static knob layout) ----
+ *
+ * Live load test #6 established the buffer orientation transform by
+ * direct visual confirmation (four asymmetric corner/edge markers read
+ * back off the physical screen) -- see DESIGN.md. Every draw call below
+ * goes through put_px_land() so that transform only ever has to be
+ * correct in one place.
+ *
+ * No libm: this project has twice confirmed (readelf --dyn-syms, live
+ * load tests #4/#6) that force_shadow.so depends on exactly
+ * libc/libpthread/libdl and nothing else, and treats that as a
+ * deliberate property worth preserving, not an accident -- adding
+ * sinf()/cosf() would pull in a fourth dependency for no real benefit.
+ * sin_deg()/cos_deg() below use a small hand-generated 0-90 degree
+ * lookup table (1-degree resolution, plenty for a knob pointer) instead. */
+
+static const float sin_table_deg0_90[91] = {
+    0.0f, 0.017452f, 0.034899f, 0.052336f, 0.069756f, 0.087156f, 0.104528f,
+    0.121869f, 0.139173f, 0.156434f, 0.173648f, 0.190809f, 0.207912f,
+    0.224951f, 0.241922f, 0.258819f, 0.275637f, 0.292372f, 0.309017f,
+    0.325568f, 0.342020f, 0.358368f, 0.374607f, 0.390731f, 0.406737f,
+    0.422618f, 0.438371f, 0.453990f, 0.469472f, 0.484810f, 0.500000f,
+    0.515038f, 0.529919f, 0.544639f, 0.559193f, 0.573576f, 0.587785f,
+    0.601815f, 0.615661f, 0.629320f, 0.642788f, 0.656059f, 0.669131f,
+    0.681998f, 0.694658f, 0.707107f, 0.719340f, 0.731354f, 0.743145f,
+    0.754710f, 0.766044f, 0.777146f, 0.788011f, 0.798636f, 0.809017f,
+    0.819152f, 0.829038f, 0.838671f, 0.848048f, 0.857167f, 0.866025f,
+    0.874620f, 0.882948f, 0.891007f, 0.898794f, 0.906308f, 0.913545f,
+    0.920505f, 0.927184f, 0.933580f, 0.939693f, 0.945519f, 0.951057f,
+    0.956305f, 0.961262f, 0.965926f, 0.970296f, 0.974370f, 0.978148f,
+    0.981627f, 0.984808f, 0.987688f, 0.990268f, 0.992546f, 0.994522f,
+    0.996195f, 0.997564f, 0.998630f, 0.999391f, 0.999848f, 1.0f
+};
+
+/* deg may be any integer, including negative -- normalizes into [0,360)
+ * then reflects into the tabulated [0,90] quadrant. */
+static float sin_deg(int deg) {
+    int d = ((deg % 360) + 360) % 360;
+    if (d <= 90) return sin_table_deg0_90[d];
+    if (d <= 180) return sin_table_deg0_90[180 - d];
+    if (d <= 270) return -sin_table_deg0_90[d - 180];
+    return -sin_table_deg0_90[360 - d];
+}
+static float cos_deg(int deg) { return sin_deg(deg + 90); }
+
+/* Transform confirmed live in load test #6: our buffer is the panel's
+ * raw post-rotation scanout format (SHADOW_W x SHADOW_H, portrait), and
+ * we want to render into a natural LAND_W x LAND_H landscape canvas. */
+static inline void put_px_land(uint32_t *map, uint32_t stride_px,
+                                int32_t lx, int32_t ly, uint32_t color) {
+    if (lx < 0 || lx >= LAND_W || ly < 0 || ly >= LAND_H) return;
+    int32_t bx = ly;
+    int32_t by = (int32_t)SHADOW_H - 1 - lx;
+    if (bx < 0 || bx >= (int32_t)SHADOW_W || by < 0 || by >= (int32_t)SHADOW_H) return;
+    map[(size_t)by * stride_px + (size_t)bx] = color;
+}
+
+static void fill_rect_land(uint32_t *map, uint32_t stride_px,
+                            int32_t x0, int32_t y0, int32_t w, int32_t h,
+                            uint32_t color) {
+    for (int32_t y = y0; y < y0 + h; y++)
+        for (int32_t x = x0; x < x0 + w; x++)
+            put_px_land(map, stride_px, x, y, color);
+}
+
+static void fill_circle_land(uint32_t *map, uint32_t stride_px,
+                              int32_t cx, int32_t cy, int32_t r,
+                              uint32_t color) {
+    for (int32_t y = -r; y <= r; y++)
+        for (int32_t x = -r; x <= r; x++)
+            if (x * x + y * y <= r * r)
+                put_px_land(map, stride_px, cx + x, cy + y, color);
+}
+
+static void draw_ring_land(uint32_t *map, uint32_t stride_px,
+                            int32_t cx, int32_t cy, int32_t r, int32_t thick,
+                            uint32_t color) {
+    int32_t r_in = r - thick;
+    for (int32_t y = -r; y <= r; y++)
+        for (int32_t x = -r; x <= r; x++) {
+            int32_t d2 = x * x + y * y;
+            if (d2 <= r * r && d2 >= r_in * r_in)
+                put_px_land(map, stride_px, cx + x, cy + y, color);
+        }
+}
+
+/* A handful of Force Maze Voice's own params (docs/CC-MAP.md in the
+ * force-maze repo) -- the initial mockup subset, not the full 16-knob
+ * Q-Link bank. value_pct is fixed per knob for this static-layout test
+ * (0/20/40/60/80/100, spread deliberately like load test #6's asymmetric
+ * markers, so both knob position AND pointer-angle mapping can be read
+ * back unambiguously in one live check) -- touch-driven live values are
+ * the next increment, gated behind this one rendering correctly. */
+typedef struct {
+    const char *name;
+    int32_t cx, cy, radius;
+    uint32_t color;
+    int value_pct; /* 0-100, maps to a -135..+135 degree sweep */
+} shadow_knob_t;
+
+static const shadow_knob_t shadow_knobs[] = {
+    { "VCO TUNE",   LAND_W * 1 / 6, LAND_H * 1 / 4, 90, 0xFFFF3B30u,   0 },
+    { "CUTOFF",     LAND_W * 3 / 6, LAND_H * 1 / 4, 90, 0xFFFF9500u,  20 },
+    { "RESO",       LAND_W * 5 / 6, LAND_H * 1 / 4, 90, 0xFFFFCC00u,  40 },
+    { "FOLD DRIVE", LAND_W * 1 / 6, LAND_H * 3 / 4, 90, 0xFF34C759u,  60 },
+    { "ENV DECAY",  LAND_W * 3 / 6, LAND_H * 3 / 4, 90, 0xFF00C7D4u,  80 },
+    { "LEVEL",      LAND_W * 5 / 6, LAND_H * 3 / 4, 90, 0xFF5E5CE6u, 100 },
+};
+#define NUM_SHADOW_KNOBS (sizeof(shadow_knobs) / sizeof(shadow_knobs[0]))
+
+static void render_knob(uint32_t *map, uint32_t stride_px,
+                         const shadow_knob_t *k) {
+    fill_circle_land(map, stride_px, k->cx, k->cy, k->radius, 0xFF3A3A3Cu);
+    draw_ring_land(map, stride_px, k->cx, k->cy, k->radius, 5, 0xFF606062u);
+
+    int angle_deg = -135 + (270 * k->value_pct) / 100;
+    int32_t dot_dist = (k->radius * 72) / 100;
+    int32_t dx = (int32_t)(dot_dist * sin_deg(angle_deg));
+    int32_t dy = -(int32_t)(dot_dist * cos_deg(angle_deg));
+    fill_circle_land(map, stride_px, k->cx + dx, k->cy + dy, 14, k->color);
+}
+
+static void render_shadow_frame(uint32_t *map, uint32_t stride_px) {
+    fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, 0xFF202020u);
+    for (size_t i = 0; i < NUM_SHADOW_KNOBS; i++)
+        render_knob(map, stride_px, &shadow_knobs[i]);
+}
+
 /* Allocates one reusable dumb buffer + framebuffer, filled with a solid
  * test color. Leaves shadow_fb_id 0 (shadow_ready stays false) on any
  * failure -- fail closed, same principle as every other step here. */
@@ -413,52 +549,14 @@ static void create_shadow_buffer(int fd) {
         logline("mmap of dumb buffer failed: %s", strerror(errno));
         return;
     }
-    /* ORIENTATION TEST PATTERN (temporary -- see DESIGN.md's "buffer
-     * orientation test" section). Our buffer is 800x1280, matching the
-     * panel's raw post-rotation scanout format directly (confirmed via
-     * GETFB) -- but MPC's own pipeline composes in 1280x800 landscape and
-     * has RGA rotate it 90 degrees before scanout, and we deliberately
-     * skip that step entirely, writing straight into the final buffer.
-     * A solid fill (the step-2/3 magenta test) can't reveal whether our
-     * buffer's x/y axes end up rotated relative to what the viewer
-     * actually sees, since a solid color looks identical either way.
-     * This asymmetric pattern can: four distinct markers, each anchored
-     * to a specific buffer corner/edge, so the mapping can be read
-     * straight off the physical screen.
-     *   - GREEN 60x60 square at buffer (0,0)      -- the origin corner
-     *   - RED strip along buffer's y=0 edge (rows 0..59, all columns)
-     *   - BLUE strip along buffer's x=0 edge (cols 0..59, all rows)
-     *   - YELLOW 60x60 square at buffer (max,max)  -- the opposite corner
-     *   - dark gray background elsewhere
-     * Paint order: background, then blue, then red (so the top-left
-     * overlap defaults to red), then green explicitly on top of that
-     * same corner so it's unambiguous, then yellow in the far corner. */
-    uint32_t *px = (uint32_t *)map;
+    /* Live load test #6's asymmetric orientation-marker pattern proved the
+     * put_px_land() transform above (already exercised live, four
+     * distinct corner/edge markers read back correctly off the physical
+     * panel) -- no longer needed as the actual buffer content now that
+     * the transform is implemented once, centrally, and used by every
+     * draw call. Renders the initial Maze Voice knob mockup instead. */
     uint32_t stride_px = creq.pitch / 4;
-    uint32_t bg     = 0xFF202020u;
-    uint32_t red    = 0xFFFF0000u;
-    uint32_t blue   = 0xFF0000FFu;
-    uint32_t green  = 0xFF00FF00u;
-    uint32_t yellow = 0xFFFFFF00u;
-    const uint32_t MARK = 60;
-
-    for (uint32_t y = 0; y < SHADOW_H; y++) {
-        uint32_t *row = px + (size_t)y * stride_px;
-        for (uint32_t x = 0; x < SHADOW_W; x++) row[x] = bg;
-    }
-    /* blue: left edge -- x in [0,MARK), all rows */
-    for (uint32_t y = 0; y < SHADOW_H; y++)
-        for (uint32_t x = 0; x < MARK; x++) (px + (size_t)y * stride_px)[x] = blue;
-    /* red: top edge -- y in [0,MARK), all columns (painted after blue, so
-     * the top-left overlap defaults to red) */
-    for (uint32_t y = 0; y < MARK; y++)
-        for (uint32_t x = 0; x < SHADOW_W; x++) (px + (size_t)y * stride_px)[x] = red;
-    /* green: explicitly marks the (0,0) corner, on top of both */
-    for (uint32_t y = 0; y < MARK; y++)
-        for (uint32_t x = 0; x < MARK; x++) (px + (size_t)y * stride_px)[x] = green;
-    /* yellow: marks the opposite (max,max) corner */
-    for (uint32_t y = SHADOW_H - MARK; y < SHADOW_H; y++)
-        for (uint32_t x = SHADOW_W - MARK; x < SHADOW_W; x++) (px + (size_t)y * stride_px)[x] = yellow;
+    render_shadow_frame((uint32_t *)map, stride_px);
 
     munmap(map, creq.size);
 

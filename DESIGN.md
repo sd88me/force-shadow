@@ -936,6 +936,72 @@ but two occurrences during active testing, zero during idle periods, is
 enough of a pattern to treat as a real open risk rather than a one-off,
 not just note and move on from.
 
+## Live load test #9 (2026-09-18): first real rendered content confirmed live — the Maze Voice knob mockup
+
+First rendering work since the mechanism was proven: replaced the
+orientation-marker pattern (its job done, transform proven — see live
+load test #6) with an actual software rasterizer and a static 6-knob
+mockup drawing on Force Maze Voice's own params (`vco_tune`, `cutoff`,
+`reso`, `fold_drive`, `env1_decay`, `level` — the most commonly-tweaked
+of the ~30 `chain_params` per `force-maze/maze-voice/docs/CC-MAP.md`),
+laid out 3×2 in a landscape virtual canvas.
+
+**Implementation choices worth recording:**
+- All drawing goes through one `put_px_land()` function implementing the
+  landscape→buffer transform live load test #6 established, so that
+  transform only has to be correct in one place, not re-derived per
+  drawing primitive.
+- **No `libm` dependency added.** This project has twice confirmed
+  (`readelf --dyn-syms`, live load tests #4 and #6) that
+  `force_shadow.so` depends on exactly `libc`/`libpthread`/`libdl`, and
+  treats that as deliberate, not incidental. Knob pointer angles need
+  `sin`/`cos`; rather than link `-lm` for that, `sin_deg()`/`cos_deg()`
+  use a hand-generated 91-entry (0–90°, 1° resolution) lookup table
+  instead. Confirmed post-build: dependency profile unchanged.
+- Each knob's value is a fixed test percentage (0/20/40/60/80/100 across
+  the 6, in reading order) rather than one uniform value — deliberately
+  modeled on live load test #6's asymmetric-marker methodology, so a
+  single live check can confirm both knob *position* and pointer-*angle*
+  mapping at once, not just "something round appeared."
+- The dumb buffer is filled once at setup and `munmap`'d immediately
+  after, same lifecycle as the old test pattern — this mockup is still
+  static content, not yet touch-reactive. Kept deliberately minimal
+  rather than building buffer persistence + a redraw path in the same
+  pass as the first-ever rendering code, consistent with this project's
+  established one-new-thing-at-a-time testing discipline.
+
+**Toolchain note**: the Docker+QEMU armhf build environment (`arm32v7/
+debian:stretch`, per README.md) failed on this session's first attempt —
+Debian stretch's own package repos have gone fully EOL since this
+toolchain was last exercised (`deb.debian.org`/`security.debian.org` both
+404 on `stretch`/`stretch/updates` now). Fixed by pointing
+`/etc/apt/sources.list` at `archive.debian.org` instead (and dropping the
+`stretch-updates` line, which isn't mirrored there) with
+`-o Acquire::Check-Valid-Until=false` to tolerate the archived release's
+expired `Release` file. Worth remembering for any future build in this
+repo — the README's documented docker command will hit this same wall
+until it's updated to match.
+
+**Live test**: pushed to the device (`192.168.1.187` this session — see
+the incident below for why), staged toggle-off-first as always, then
+toggled on. **User confirmed, by direct description (not just log
+inference): all 6 knobs visible, arranged 3-across in two rows, correct
+per-knob accent colors (red/orange/yellow top row, green/cyan/purple
+bottom row), and each knob's pointer dot swept from lower-left round
+through the top to lower-right reading left-to-right/top-to-bottom across
+the 6 — exactly the intended 0%→100% value-to-angle mapping.** This is
+the first live-confirmed evidence that software rasterization into the
+shadow buffer works correctly end-to-end: circle fill, ring outline, the
+libm-free trig table, and the landscape transform all validated in one
+check. Toggled off + `acvs` restart per the established (still-unsolved
+toggle-off-reliability) recovery procedure; user confirmed screen/pads/
+audio all normal afterward.
+
+Device IP was `192.168.1.187` for this test, not `.44` — see live load
+test #8's own writeup for the second WiFi/ethernet drop incident and
+reboot that caused the reassignment, immediately before this test's
+rendering work began.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
@@ -954,13 +1020,17 @@ not just note and move on from.
   needs a fresh angle, not more iteration on the two approaches already
   tried and abandoned. Revisit once forward substitution is confirmed
   visible again.
-- **Real rendering into the shadow buffer** (software rasterization of an
-  addon's actual UI, using the tracked touch x/y/down state for hit-
-  testing) in place of the solid magenta test color. This is the current
-  focus: an initial mockup page with a few controls for Maze voice,
-  borrowing MPC's own design language (page layout, knob sizing
-  conventions) rather than inventing a new visual style from scratch — a
-  fuller design-language pass comes once this initial mockup is in place.
+- ~~Real rendering into the shadow buffer~~ — **step A done, live load
+  test #9**: a static 6-knob mockup (Maze Voice's most commonly-tweaked
+  params) renders correctly, confirmed live by direct visual description
+  (layout, per-knob color, and pointer-angle sweep all matched what the
+  code intended). Next increment: touch-driven live values (drag a knob,
+  see it redraw) instead of the current fixed per-knob test percentages —
+  see live load test #9's writeup for what's still unresolved before that
+  can be built (buffer persistence for redraw, touch/landscape coordinate
+  correlation, and a redraw-cadence strategy). A fuller design-language
+  pass (labels/text, closer match to MPC's own visual conventions) comes
+  once interactivity is in place.
 - Replacing the test-only `/tmp/force_shadow_on` toggle file with the real
   MidiLoop button-combo mechanism, flipping a shared flag the interposer
   checks on every commit.
