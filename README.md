@@ -19,12 +19,17 @@ through `maze_host`'s own control socket, confirmed live: every widget on
 every page audibly/functionally responds. See [DESIGN.md](DESIGN.md) for
 the full research writeup, live-test history, and incident log; the
 `addon/` directory is a real installable MockbaMod addon, not just a test
-harness.
+harness. Building a page for another addon (DX7, JV-880, ...)? Start
+with [docs/adding-a-page.md](docs/adding-a-page.md).
 
 ## Layout
 
 ```
 DESIGN.md          full research writeup — read this first
+docs/
+  adding-a-page.md  practical guide: how to build another addon's shadow
+                     page (widget API, DSP wiring, layout constants,
+                     offline-first testing workflow)
 src/
   force_shadow.c    the LD_PRELOAD interposer: DRM/KMS buffer substitution,
                      touch takeover, the 3-page widget renderer, DSP wiring
