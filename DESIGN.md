@@ -1077,11 +1077,16 @@ integer math, matches the formula above, with a defensive clamp to
 `[0,LAND_W)`/`[0,LAND_H)` since real digitizers occasionally report
 slightly-out-of-nominal-range noise). Wired into the existing touch log
 heartbeat only, for now — logs both raw and derived landscape
-coordinates side by side so the next live test can visually confirm a
-real tap on a specific knob decodes to a point inside that knob's own
-hit circle, the same "read it back off the physical screen" rigor every
-other transform in this project has gone through, before this feeds any
-actual hit-testing/dragging logic. **Not yet live-tested.**
+coordinates side by side.
+
+**Live-tested same session, immediately after live load test #9**: with
+the 6-knob mockup on screen, asked the user to tap and hold the top-left
+(VCO TUNE, red) knob — true center `(213,200)`, radius `90`. The logged
+derived coordinates: `raw x=334 y=598 down=0 -> landscape px=216 py=187`
+— **13px off dead center**, comfortably inside the hit circle. As clean a
+confirmation as any transform in this project has gotten on a first live
+try. The transform is now trusted for hit-testing, not just derived —
+next increment can build on it directly.
 
 ## Not yet done
 
@@ -1107,11 +1112,10 @@ actual hit-testing/dragging logic. **Not yet live-tested.**
   (layout, per-knob color, and pointer-angle sweep all matched what the
   code intended). Next increment: touch-driven live values (drag a knob,
   see it redraw) instead of the current fixed per-knob test percentages.
-  The touch/landscape coordinate transform is now derived and implemented
-  (see "Touch coordinate calibration" above) but **not yet live-tested**
-  — confirm that first (tap a specific knob, check the logged derived
-  coordinates land inside its hit circle) before building hit-testing on
-  top of it. Buffer persistence for redraw and a redraw-cadence strategy
+  ~~The touch/landscape coordinate transform~~ is now derived,
+  implemented, **and live-confirmed** (see "Touch coordinate calibration"
+  above — a live tap landed 13px from a knob's true center) — trusted for
+  hit-testing now. Buffer persistence for redraw and a redraw-cadence strategy
   (piggybacking on MPC's own commit cadence, most likely, but writing
   into a live-scanned-out buffer synchronously on MPC's own commit thread
   carries real tearing/latency risk not yet assessed) are both still
