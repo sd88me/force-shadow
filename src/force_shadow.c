@@ -79,6 +79,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <linux/input.h>
+#include "font8x8.h"
 
 /* ---- Raw DRM UAPI structs (no libdrm/kernel headers available offline;
  * see file header comment). ---- */
@@ -231,7 +232,7 @@ static volatile int shadow_on = 0;       /* live toggle state, updated by pollin
  * DRM commit thread can redraw on demand instead of the buffer being
  * write-once. Only ever written from that one thread (maybe_substitute_fb,
  * gated by shadow_redraw_needed) -- the touch thread only ever updates
- * shadow_knob_value, never touches this memory directly. */
+ * page_widgets[]' state, never touches this memory directly. */
 static uint32_t *shadow_map = NULL;
 static uint32_t shadow_stride_px = 0;
 
@@ -489,92 +490,389 @@ static void draw_ring_land(uint32_t *map, uint32_t stride_px,
         }
 }
 
-/* A handful of Force Maze Voice's own params (docs/CC-MAP.md in the
- * force-maze repo) -- the initial mockup subset, not the full 16-knob
- * Q-Link bank. Layout/color are fixed; value is not -- split into a
- * const layout table and a separate mutable value array (touch-driven,
- * see the drag state machine in update_touch_state() below) so the
- * layout table can stay `static const` while values change live. */
-typedef struct {
-    const char *name;
-    int32_t cx, cy, radius;
-    uint32_t color;
-} shadow_knob_layout_t;
-
-static const shadow_knob_layout_t shadow_knob_layout[] = {
-    { "VCO TUNE",   LAND_W * 1 / 6, LAND_H * 1 / 4, 90, 0xFFFF3B30u },
-    { "CUTOFF",     LAND_W * 3 / 6, LAND_H * 1 / 4, 90, 0xFFFF9500u },
-    { "RESO",       LAND_W * 5 / 6, LAND_H * 1 / 4, 90, 0xFFFFCC00u },
-    { "FOLD DRIVE", LAND_W * 1 / 6, LAND_H * 3 / 4, 90, 0xFF34C759u },
-    { "ENV DECAY",  LAND_W * 3 / 6, LAND_H * 3 / 4, 90, 0xFF00C7D4u },
-    { "LEVEL",      LAND_W * 5 / 6, LAND_H * 3 / 4, 90, 0xFF5E5CE6u },
-};
-#define NUM_SHADOW_KNOBS (sizeof(shadow_knob_layout) / sizeof(shadow_knob_layout[0]))
-
-/* Maps each knob (same order/index as shadow_knob_layout) to the real
- * Force Maze Voice chain_param it controls -- key names and min/max
- * confirmed against /home/sam/force-maze/maze-voice/module.json's own
- * chain_params entries directly (not just docs/CC-MAP.md's summary
- * table, which agrees but doesn't give exact JSON key spelling). Every
- * one of these is plain linear 0-100 except vco_tune, which is
- * -24..24 semitones. */
-typedef struct {
-    const char *key;
-    float min, max;
-} shadow_knob_param_t;
-
-static const shadow_knob_param_t shadow_knob_param[] = {
-    { "vco_tune",   -24.0f, 24.0f },
-    { "cutoff",       0.0f, 100.0f },
-    { "reso",         0.0f, 100.0f },
-    { "fold_drive",   0.0f, 100.0f },
-    { "env1_decay",   0.0f, 100.0f },
-    { "level",        0.0f, 100.0f },
-};
-
-/* 0-100 per knob, same indexing as shadow_knob_layout. Initial spread
- * (0/20/40/60/80/100) is load test #9's proven static layout, now just
- * the starting values instead of fixed ones -- touch-driven changes are
- * applied under touch_mu (see update_touch_state()) since this array is
- * read from the DRM commit thread (rendering) and written from the touch
- * thread (dragging). */
-static int shadow_knob_value[NUM_SHADOW_KNOBS] = { 0, 20, 40, 60, 80, 100 };
-
-/* Set whenever a knob value actually changes; cleared once the commit
- * thread has redrawn to reflect it. Sole purpose: skip the (comparatively
- * expensive, full-canvas) redraw entirely on the vast majority of commits
- * where nothing changed, rather than repainting every single frame
- * regardless of whether the screen's contents are still correct. */
-static volatile int shadow_redraw_needed = 1; /* starts true: first draw */
-
-/* Guards shadow_knob_value (written by the touch thread while dragging,
- * read by the DRM commit thread while redrawing) -- declared here rather
- * than down in the touch-handling section below because
- * maybe_substitute_fb() needs it too, and C requires the declaration to
- * come first. */
-static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static void render_knob(uint32_t *map, uint32_t stride_px,
-                         const shadow_knob_layout_t *k, int value_pct) {
-    fill_circle_land(map, stride_px, k->cx, k->cy, k->radius, 0xFF3A3A3Cu);
-    draw_ring_land(map, stride_px, k->cx, k->cy, k->radius, 5, 0xFF606062u);
-
-    int angle_deg = -135 + (270 * value_pct) / 100;
-    int32_t dot_dist = (k->radius * 72) / 100;
-    int32_t dx = (int32_t)(dot_dist * sin_deg(angle_deg));
-    int32_t dy = -(int32_t)(dot_dist * cos_deg(angle_deg));
-    fill_circle_land(map, stride_px, k->cx + dx, k->cy + dy, 14, k->color);
+/* ---- Text (font8x8.h) ----
+ * Verified offline via tools/render_preview.c -- a host-side tool that
+ * shares these exact drawing semantics (put_px vs put_px_land is the
+ * only difference) and renders to a plain PPM image, so the whole
+ * multi-page layout below was checked visually before ever touching the
+ * device. See DESIGN.md for the preview screenshots and font generation
+ * notes. */
+static int font_glyph_index(char ch) {
+    for (size_t i = 0; font_chars[i]; i++)
+        if (font_chars[i] == ch) return (int)i;
+    return 0; /* space */
+}
+static void draw_char_land(uint32_t *map, uint32_t stride_px,
+                            int32_t x, int32_t y, char ch, int32_t scale,
+                            uint32_t color) {
+    const uint8_t *g = font8x8[font_glyph_index(ch)];
+    for (int32_t row = 0; row < 8; row++)
+        for (int32_t col = 0; col < 8; col++)
+            if (g[row] & (1 << (7 - col)))
+                fill_rect_land(map, stride_px, x + col*scale, y + row*scale,
+                                scale, scale, color);
+}
+static int32_t text_width_land(const char *s, int32_t scale) {
+    return (int32_t)strlen(s) * 9 * scale - scale;
+}
+static void draw_text_land(uint32_t *map, uint32_t stride_px,
+                            int32_t x, int32_t y, const char *s, int32_t scale,
+                            uint32_t color) {
+    int32_t cx = x;
+    for (const char *p = s; *p; p++) {
+        draw_char_land(map, stride_px, cx, y, *p, scale, color);
+        cx += 9 * scale;
+    }
+}
+static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
+                              int32_t cx, int32_t y, const char *s, int32_t scale,
+                              uint32_t color) {
+    draw_text_land(map, stride_px, cx - text_width_land(s, scale)/2, y, s, scale, color);
 }
 
-/* values must have NUM_SHADOW_KNOBS entries, same order as
- * shadow_knob_layout -- callers snapshot shadow_knob_value under
- * touch_mu first (see maybe_substitute_fb()) so this function itself
- * never has to take a lock, keeping the actual pixel-pushing work off
- * any lock's critical section. */
-static void render_shadow_frame(uint32_t *map, uint32_t stride_px, const int *values) {
-    fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, 0xFF202020u);
-    for (size_t i = 0; i < NUM_SHADOW_KNOBS; i++)
-        render_knob(map, stride_px, &shadow_knob_layout[i], values[i]);
+/* ---- Multi-page Maze Voice control UI ----
+ *
+ * Replaces the original fixed 6-knob mockup with the full layout worked
+ * out live with the user and verified offline in tools/render_preview.c
+ * (same drawing primitives, PPM output instead of a DRM buffer -- see
+ * that file and DESIGN.md for the preview screenshots this was checked
+ * against before ever touching the device). Three pages -- Voice,
+ * WaveFolder/Filter, Mod/Random/Mix -- covering essentially all of
+ * module.json's own chain_params plus maze_host's host-level mix.*
+ * controls, navigated via an on-screen tab bar rather than more hardware
+ * combos.
+ *
+ * Every widget (knob, toggle, button, enum selector) is one entry in a
+ * single table that both rendering and touch hit-testing read from --
+ * built once per page (build_page(), on entry or tab switch), not
+ * recomputed per redraw, so layout math only exists in one place and
+ * visuals/hit-testing can never drift apart. Palette matches the Maze
+ * Voice web GUI (force-maze/maze-voice/web/index.html's own CSS custom
+ * properties) rather than this project's earlier arbitrary rainbow test
+ * colors. */
+
+#define PLATE_BG      0xFF131211u
+#define PLATE_HI      0xFF1C1A17u
+#define PLATE_LINE    0xFF2A2823u
+#define UI_INK        0xFFEFE9D8u
+#define UI_INK_DIM    0xFF8F8878u
+#define UI_INK_FAINT  0xFF5C584Cu
+#define UI_ACCENT     0xFFC1552Fu
+#define UI_ACCENT_HI  0xFFE2793Fu
+#define KNOB_FACE     0xFFEFE9D8u
+#define KNOB_RING     0xFF2A2823u
+#define BAR_BG        0xFF0D0C0Au
+#define SEG_ACTIVE    0xFFF2F1EEu
+#define SEG_INACTIVE  0xFF050403u
+#define SEG_ACTIVE_TX 0xFF1C1A17u
+#define BTN_TEXT      0xFFFDF3EAu
+
+#define TOPBAR_H 72
+#define TABBAR_H 72
+#define CONTENT_Y (TOPBAR_H + 22)
+#define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 44)
+#define NUM_PAGES 3
+
+typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V } widget_kind_t;
+#define MAX_OPTIONS 3
+
+typedef struct {
+    widget_kind_t kind;
+    int32_t cx, cy;           /* center, landscape px */
+    int32_t hit_hw, hit_hh;   /* half-width/half-height hit box */
+    int32_t radius;           /* knob draw radius */
+    char label[24];
+    char param_key[20];       /* maze_host SET key; "" = no DSP binding */
+    float pmin, pmax;         /* knob: real-world value range */
+    int state;                /* knob: 0-100 pct; toggle: 0/1; enum: active idx */
+    const char *options[MAX_OPTIONS];
+    int n_options;
+    int32_t seg_x[MAX_OPTIONS], seg_y[MAX_OPTIONS], seg_w, seg_h; /* enum only */
+} ui_widget_t;
+
+typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
+
+#define MAX_WIDGETS 40
+#define MAX_FRAMES 3
+static ui_widget_t page_widgets[MAX_WIDGETS];
+static int n_page_widgets = 0;
+static ui_frame_t page_frames[MAX_FRAMES];
+static int n_page_frames = 0;
+static int current_page = 0;
+static const char *PAGE_NAMES[NUM_PAGES] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" };
+
+/* Set whenever anything on the current page changes (a knob drag, a
+ * toggle, a page switch); cleared once the commit thread has redrawn to
+ * reflect it. Sole purpose: skip the (comparatively expensive,
+ * full-canvas) redraw entirely on the vast majority of commits where
+ * nothing changed, rather than repainting every single frame regardless
+ * of whether the screen's contents are still correct. */
+static volatile int shadow_redraw_needed = 1; /* starts true: first draw */
+
+/* Guards page_widgets[]/current_page (written by the touch thread while
+ * dragging/tapping, read by the DRM commit thread while redrawing) --
+ * declared here rather than down in the touch-handling section below
+ * because maybe_substitute_fb() needs it too, and C requires the
+ * declaration to come first. */
+static pthread_mutex_t touch_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int add_knob(int32_t cx, int32_t cy, int32_t r, const char *label,
+                     const char *key, float pmin, float pmax, int initial_pct) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_KNOB; w->cx = cx; w->cy = cy; w->radius = r;
+    w->hit_hw = w->hit_hh = r + 8;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    w->pmin = pmin; w->pmax = pmax; w->state = initial_pct;
+    return n_page_widgets++;
+}
+static int add_toggle(int32_t cx, int32_t cy, const char *label,
+                       const char *key, int initial_on) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_TOGGLE; w->cx = cx; w->cy = cy;
+    w->hit_hw = 20; w->hit_hh = 12;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    w->state = initial_on ? 1 : 0;
+    return n_page_widgets++;
+}
+static int add_button(int32_t cx, int32_t cy, const char *label, const char *key) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_BUTTON; w->cx = cx; w->cy = cy;
+    w->hit_hw = text_width_land(label, 1)/2 + 20; w->hit_hh = 18;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    return n_page_widgets++;
+}
+static int add_enum(int32_t cx, int32_t cy, widget_kind_t kind, const char *label,
+                     const char *key, const char **opts, int n, int active) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = kind; w->cx = cx; w->cy = cy;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    w->n_options = n; w->state = active;
+    for (int i = 0; i < n; i++) w->options[i] = opts[i];
+    if (kind == W_ENUM_H) {
+        w->seg_w = 78; w->seg_h = 22;
+        int32_t total = n*w->seg_w + (n-1)*2;
+        int32_t x0 = cx - total/2;
+        for (int i = 0; i < n; i++) { w->seg_x[i] = x0 + i*(w->seg_w+2); w->seg_y[i] = cy - w->seg_h/2; }
+        w->hit_hw = total/2; w->hit_hh = w->seg_h/2;
+    } else {
+        w->seg_w = 90; w->seg_h = 20;
+        int32_t y0 = cy - (n*(w->seg_h+2))/2;
+        for (int i = 0; i < n; i++) { w->seg_x[i] = cx - w->seg_w/2; w->seg_y[i] = y0 + i*(w->seg_h+2); }
+        w->hit_hw = w->seg_w/2; w->hit_hh = (n*(w->seg_h+2))/2;
+    }
+    return n_page_widgets++;
+}
+static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title) {
+    ui_frame_t *f = &page_frames[n_page_frames++];
+    f->x = x; f->y = y; f->w = w; f->h = h;
+    strncpy(f->title, title, sizeof(f->title)-1);
+}
+
+/* Ported directly from tools/render_preview.c's page_voice()/
+ * page_wavefolder_filter()/page_mod_random_mix() -- same layout math,
+ * verified visually there first. pmin/pmax/initial values come from
+ * module.json's chain_params (force-maze/maze-voice) directly; mix.*
+ * entries are maze_host's own host-level controls (see
+ * handle_mix_set()/handle_mix_get() in that project's maze_host.cpp),
+ * not chain_params, hence the separate "mix." key namespace. */
+static void build_page(int page) {
+    n_page_widgets = 0;
+    n_page_frames = 0;
+    int32_t margin = 36, gap = 20;
+    int32_t y = CONTENT_Y, h = CONTENT_H;
+
+    if (page == 0) {
+        int32_t fw = (LAND_W - 2*margin - 2*gap) / 3;
+        int32_t x0 = margin, x1 = x0 + fw + gap, x2 = x1 + fw + gap;
+        add_frame(x0, y, fw, h, "OSCILLATOR");
+        add_frame(x1, y, fw, h, "ENVELOPES");
+        add_frame(x2, y, fw, h, "MIXER / TONE");
+
+        struct { const char *l1,*k1; const char *l2,*k2; int p1,p2; } rows[3] = {
+            {"VCO TUNE","vco_tune", "VCO EG1","vco_eg1", 50,50},
+            {"MOD FREQ","mod_freq", "MOD EG1","mod_eg1", 42,50},
+            {"FM DEPTH","fm_depth", "FM EG1","fm_eg1",   0,50},
+        };
+        float pmin1[3] = { -24.0f, 0.2f, 0.0f }, pmax1[3] = { 24.0f, 1300.0f, 100.0f };
+        int32_t ry0 = y + 50, rh = (h - 60) / 3;
+        for (int i = 0; i < 3; i++) {
+            int32_t ry = ry0 + i*rh + rh/2;
+            int32_t kx0 = x0 + 85, kx1 = x0 + fw - 70;
+            add_knob(kx0, ry, 26, rows[i].l1, rows[i].k1, pmin1[i], pmax1[i], rows[i].p1);
+            add_knob(kx1, ry, 26, rows[i].l2, rows[i].k2, -100.0f, 100.0f, rows[i].p2);
+        }
+
+        int32_t ery = y + h/2 + 10;
+        add_knob(x1 + fw/3, ery, 30, "ENV1 DEC", "env1_decay", 0.0f, 100.0f, 60);
+        add_knob(x1 + 2*fw/3, ery, 30, "VCA DECAY", "env2_decay", 0.0f, 100.0f, 70);
+
+        struct { const char *l,*k; float mn,mx; int p; } mix[7] = {
+            {"VCO LVL","vco_lvl", 0,200, 50}, {"MOD LVL","mod_lvl", 0,200, 25},
+            {"NOISE LVL","noise_lvl", 0,200, 0}, {"NOISE TONE","noise_tone", -100,100, 50},
+            {"RING LVL","ring_lvl", 0,100, 0}, {"TONE/SAT","sat", 0,100, 0},
+            {"OUT LEVEL","level", 0,100, 80},
+        };
+        int32_t cols = 3, rowsN = 3;
+        int32_t cw = (fw - 36) / cols, mrh = (h - 50) / rowsN;
+        for (int i = 0; i < 7; i++) {
+            int32_t col = i % cols, row = i / cols;
+            int32_t cx = x2 + 18 + cw*col + cw/2, cyk = y + 50 + mrh*row + mrh/2;
+            add_knob(cx, cyk, 24, mix[i].l, mix[i].k, mix[i].mn, mix[i].mx, mix[i].p);
+        }
+    } else if (page == 1) {
+        int32_t divw = 140;
+        int32_t fw = (LAND_W - 2*margin - 2*gap - divw) / 2;
+        int32_t x0 = margin, xdiv = x0 + fw + gap, x1 = xdiv + divw + gap;
+        add_frame(x0, y, fw, h, "WAVEFOLDER");
+        add_frame(x1, y, fw, h, "FILTER");
+
+        struct { const char *l,*k; float mn,mx; int p; } wf[4] = {
+            {"FOLD DRIVE","fold_drive", 0,100, 0}, {"FOLD BIAS","fold_bias", -100,100, 50},
+            {"FOLD EG1","fold_eg1", -100,100, 50}, {"FOLD KEY","fold_key", 0,100, 0},
+        };
+        int32_t cw = fw/2, wrh = (h-50)/2;
+        for (int i = 0; i < 4; i++) {
+            int32_t col = i%2, row = i/2;
+            add_knob(x0 + cw*col + cw/2, y+50+wrh*row+wrh/2, 28, wf[i].l, wf[i].k, wf[i].mn, wf[i].mx, wf[i].p);
+        }
+
+        int32_t dcx = xdiv + divw/2, dcy = y + h/2;
+        static const char *ropts[3] = {"VCW>VCF","Parallel","VCF>VCW"};
+        add_enum(dcx, dcy - 90, W_ENUM_V, "ROUTE", "route", ropts, 3, 1);
+        add_knob(dcx, dcy + 70, 28, "BLEND", "blend", -100.0f, 100.0f, 50);
+
+        struct { const char *l,*k; float mn,mx; int p; } fl[6] = {
+            {"CUTOFF","cutoff", 0,100, 100}, {"RESONANCE","reso", 0,100, 0},
+            {"LP-BP","filter_mode", 0,100, 0}, {"CUT EG1","cutoff_eg1", -100,100, 65},
+            {"CUT KEY","cutoff_key", 0,100, 0}, {"FILT DRIVE","filt_drive", 0,100, 0},
+        };
+        cw = fw/2; int32_t frh = (h-50)/3;
+        for (int i = 0; i < 6; i++) {
+            int32_t col = i%2, row = i/2;
+            add_knob(x1 + cw*col + cw/2, y+50+frh*row+frh/2, 26, fl[i].l, fl[i].k, fl[i].mn, fl[i].mx, fl[i].p);
+        }
+    } else {
+        int32_t fw = (LAND_W - 2*margin - 2*gap) / 3;
+        int32_t x0 = margin, x1 = x0 + fw + gap, x2 = x1 + fw + gap;
+        add_frame(x0, y, fw, h, "KEY TRACK");
+        add_frame(x1, y, fw, h, "RANDOMISE");
+        add_frame(x2, y, fw, h, "OUTPUT MIX");
+
+        add_knob(x0 + fw/2, y + h/3, 30, "VCO KEY", "vco_key", 0.0f, 100.0f, 100);
+        add_knob(x0 + fw/2, y + 2*h/3, 30, "MOD KEY", "mod_key", 0.0f, 100.0f, 100);
+
+        static const char *rlabels[4] = {"RND VOICE","RND FOLD","RND FILT","RND TONE"};
+        static const char *rkeys[4] = {"rnd_voice","rnd_wavefolder","rnd_filter","rnd_tone"};
+        int32_t rry0 = y + 55, rrh = (h - 110) / 4;
+        for (int i = 0; i < 4; i++)
+            add_toggle(x1 + fw/2, rry0 + rrh*i + rrh/2, rlabels[i], rkeys[i], 1);
+        add_button(x1 + fw/2, y + h - 30, "GENERATE", "rnd_go");
+
+        int32_t mry0 = y + 55, mrh2 = (h - 55) / 3;
+        add_toggle(x2 + fw/2, mry0 + mrh2*0 + mrh2/2, "VOICE ON/OFF", "mix.enabled", 1);
+        add_knob(x2 + fw/2, mry0 + mrh2*1 + mrh2/2, 28, "GAIN", "mix.gain", 0.0f, 150.0f, 66);
+        static const char *chopts[3] = {"L","R","L+R"};
+        add_enum(x2 + fw/2, mry0 + mrh2*2 + mrh2/2, W_ENUM_H, "CHANNEL", "mix.channel", chopts, 3, 2);
+    }
+}
+
+static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t *f) {
+    fill_rect_land(map, stride_px, f->x, f->y, f->w, 1, PLATE_LINE);
+    fill_rect_land(map, stride_px, f->x, f->y, 1, f->h, PLATE_LINE);
+    fill_rect_land(map, stride_px, f->x + f->w - 1, f->y, 1, f->h, PLATE_LINE);
+    fill_rect_land(map, stride_px, f->x, f->y + f->h - 1, f->w, 1, PLATE_LINE);
+    draw_text_land(map, stride_px, f->x + 18, f->y + 16, f->title, 1, UI_ACCENT_HI);
+    fill_rect_land(map, stride_px, f->x + 18, f->y + 30, f->w - 36, 1, PLATE_LINE);
+}
+
+static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *w) {
+    char valbuf[24];
+    switch (w->kind) {
+    case W_KNOB: {
+        draw_ring_land(map, stride_px, w->cx, w->cy, w->radius + 3, 3, KNOB_RING);
+        fill_circle_land(map, stride_px, w->cx, w->cy, w->radius, KNOB_FACE);
+        int angle_deg = -135 + (270 * w->state) / 100;
+        int32_t dot_dist = (w->radius * 72) / 100;
+        int32_t dx = w->cx + (int32_t)(dot_dist * sin_deg(angle_deg));
+        int32_t dy = w->cy - (int32_t)(dot_dist * cos_deg(angle_deg));
+        fill_circle_land(map, stride_px, dx, dy, w->radius/7 + 2, UI_ACCENT);
+        float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
+        snprintf(valbuf, sizeof(valbuf), "%.0f", real);
+        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 10, w->label, 1, UI_INK);
+        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 22, valbuf, 1, UI_INK_FAINT);
+        break;
+    }
+    case W_TOGGLE: {
+        int32_t pw = 34, ph = 18;
+        fill_rect_land(map, stride_px, w->cx - pw/2, w->cy - ph/2, pw, ph, 0xFF050403u);
+        int32_t lx = w->state ? (w->cx + pw/2 - ph/2) : (w->cx - pw/2 + ph/2);
+        fill_circle_land(map, stride_px, lx, w->cy, ph/2 - 3, w->state ? UI_ACCENT_HI : 0xFF4C473Du);
+        draw_text_land_c(map, stride_px, w->cx, w->cy + ph/2 + 8, w->label, 1, UI_INK);
+        break;
+    }
+    case W_BUTTON: {
+        int32_t bw = text_width_land(w->label, 1) + 24, bh = 26;
+        fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, UI_ACCENT);
+        draw_text_land_c(map, stride_px, w->cx, w->cy - 3, w->label, 1, BTN_TEXT);
+        break;
+    }
+    case W_ENUM_H:
+    case W_ENUM_V: {
+        int32_t label_y = (w->kind == W_ENUM_H) ? (w->cy - 30) : (w->cy - w->hit_hh - 20);
+        draw_text_land_c(map, stride_px, w->cx, label_y, w->label, 1,
+                          w->kind == W_ENUM_V ? UI_ACCENT_HI : UI_INK);
+        for (int i = 0; i < w->n_options; i++) {
+            int active = (i == w->state);
+            fill_rect_land(map, stride_px, w->seg_x[i], w->seg_y[i], w->seg_w, w->seg_h,
+                            active ? SEG_ACTIVE : SEG_INACTIVE);
+            draw_text_land_c(map, stride_px, w->seg_x[i] + w->seg_w/2, w->seg_y[i] + w->seg_h/2 - 4,
+                              w->options[i], 1, active ? SEG_ACTIVE_TX : UI_INK_DIM);
+        }
+        break;
+    }
+    }
+}
+
+/* Takes an explicit snapshot rather than reading page_widgets/
+ * page_frames/current_page directly, so the caller can copy those out
+ * under touch_mu and then call this lock-free -- keeps the actual
+ * pixel-pushing work off any lock's critical section, same principle
+ * the original single-page design already established. */
+static void render_shadow_page(uint32_t *map, uint32_t stride_px,
+                                const ui_widget_t *widgets, int n_widgets,
+                                const ui_frame_t *frames, int n_frames,
+                                int page) {
+    fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, PLATE_BG);
+
+    fill_rect_land(map, stride_px, 0, 0, LAND_W, TOPBAR_H, PLATE_HI);
+    fill_rect_land(map, stride_px, 0, TOPBAR_H, LAND_W, 1, PLATE_LINE);
+    draw_text_land(map, stride_px, 40, 28, "FORCE SHADOW - MAZE VOICE", 2, UI_INK);
+    fill_circle_land(map, stride_px, LAND_W - 150, 36, 5, UI_ACCENT_HI);
+    draw_text_land(map, stride_px, LAND_W - 130, 28, "LIVE", 2, UI_INK_DIM);
+
+    for (int i = 0; i < n_frames; i++) render_frame_box(map, stride_px, &frames[i]);
+    for (int i = 0; i < n_widgets; i++) render_widget(map, stride_px, &widgets[i]);
+
+    int32_t tabbar_y = LAND_H - TABBAR_H;
+    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
+    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, PLATE_LINE);
+    int32_t tw = LAND_W / NUM_PAGES;
+    for (int i = 0; i < NUM_PAGES; i++) {
+        if (i == page) {
+            fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, 3, UI_ACCENT);
+            fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, TABBAR_H, 0xFF1A120Du);
+        }
+        draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 6,
+                          PAGE_NAMES[i], 2, i == page ? UI_INK : UI_INK_FAINT);
+    }
 }
 
 /* Allocates one reusable dumb buffer + framebuffer, filled with a solid
@@ -623,9 +921,14 @@ static void create_shadow_buffer(int fd) {
     /* Kept mapped (not munmap'd) so maybe_substitute_fb() can redraw on
      * demand as knob values change -- see shadow_map/shadow_redraw_needed
      * above. The first redraw (shadow_redraw_needed starts true) happens
-     * there, not here, so all rendering goes through one code path. */
+     * there, not here, so all rendering goes through one code path.
+     * build_page(0) has to happen here, synchronously, rather than let
+     * that first redraw find an empty page_widgets[] -- this runs once,
+     * before shadow_ready is ever set true, so it's guaranteed to finish
+     * before maybe_substitute_fb() could possibly call maybe_redraw_shadow(). */
     shadow_map = (uint32_t *)map;
     shadow_stride_px = creq.pitch / 4;
+    build_page(0);
 
     shadow_fb_id = fbcmd.fb_id;
     logline("shadow buffer ready: handle=%u fb_id=%u pitch=%u size=%llu",
@@ -777,12 +1080,20 @@ static void maybe_redraw_shadow(void) {
     if (!shadow_map) return;
     if (!__atomic_exchange_n(&shadow_redraw_needed, 0, __ATOMIC_RELAXED)) return;
 
-    int values_snapshot[NUM_SHADOW_KNOBS];
+    static ui_widget_t widgets_snap[MAX_WIDGETS];
+    static ui_frame_t frames_snap[MAX_FRAMES];
+    int n_widgets_snap, n_frames_snap, page_snap;
+
     pthread_mutex_lock(&touch_mu);
-    memcpy(values_snapshot, shadow_knob_value, sizeof(values_snapshot));
+    n_widgets_snap = n_page_widgets;
+    n_frames_snap = n_page_frames;
+    page_snap = current_page;
+    memcpy(widgets_snap, page_widgets, sizeof(ui_widget_t) * (size_t)n_widgets_snap);
+    memcpy(frames_snap, page_frames, sizeof(ui_frame_t) * (size_t)n_frames_snap);
     pthread_mutex_unlock(&touch_mu);
 
-    render_shadow_frame(shadow_map, shadow_stride_px, values_snapshot);
+    render_shadow_page(shadow_map, shadow_stride_px, widgets_snap, n_widgets_snap,
+                        frames_snap, n_frames_snap, page_snap);
 }
 
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
@@ -922,7 +1233,14 @@ static int touch_x = -1, touch_y = -1, touch_down = 0;
  * ctrl_request()) always calls recv() before closing -- this now does
  * the same, bounded by the same short timeout so a slow/hung reply still
  * can't stall the touch thread for long. */
-static void send_maze_set(const char *key, float value) {
+/* Takes the value pre-formatted as a string rather than always a float:
+ * chain_params are numeric ("SET cutoff 42.00"), but the enum-typed ones
+ * (route, rnd_*, mix.channel) take one of their own literal option
+ * strings ("SET route Parallel", "SET rnd_voice on") per module.json's
+ * own "options" arrays and maze_host's handle_mix_set() -- one send
+ * path for both, the caller decides the formatting. */
+static void send_maze_set(const char *key, const char *value_str) {
+    if (!key[0]) return; /* widgets with no param_key are display-only */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return;
 
@@ -936,8 +1254,8 @@ static void send_maze_set(const char *key, float value) {
     strncpy(addr.sun_path, MAZE_CTRL_SOCK, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        char line[96];
-        int n = snprintf(line, sizeof(line), "SET %s %.2f\n", key, value);
+        char line[128];
+        int n = snprintf(line, sizeof(line), "SET %s %s\n", key, value_str);
         if (n > 0 && send(fd, line, (size_t)n, MSG_NOSIGNAL) > 0) {
             char reply[16];
             recv(fd, reply, sizeof(reply), 0); /* result unused -- just
@@ -953,7 +1271,7 @@ static void send_maze_set(const char *key, float value) {
 /* Only ever called from the touch thread (never concurrently), so this
  * throttle state needs no locking of its own. Bounds worst-case socket
  * churn during a fast drag (the web panel's own server.py notes a drag
- * can fire 50-100 events/sec) without needing per-knob bookkeeping. */
+ * can fire 50-100 events/sec) without needing per-widget bookkeeping. */
 static struct timespec maze_send_last_ts;
 #define MAZE_SEND_MIN_INTERVAL_MS 15
 
@@ -967,11 +1285,41 @@ static int maze_send_throttle_ok(void) {
     return 1;
 }
 
-static void send_knob_param(int knob_idx, int value_pct, int force) {
-    if (!force && !maze_send_throttle_ok()) return;
-    const shadow_knob_param_t *p = &shadow_knob_param[knob_idx];
-    float scaled = p->min + (p->max - p->min) * ((float)value_pct / 100.0f);
-    send_maze_set(p->key, scaled);
+/* Dispatches by widget kind: knob sends its scaled real-world numeric
+ * value (throttled during a drag, forced on release -- same reasoning
+ * as the original single-page build); toggle sends "on"/"off"; enum
+ * sends the option's own literal string; button always fires (it's
+ * momentary, there's nothing to throttle). */
+static void send_widget_param(const ui_widget_t *w, int force) {
+    if (!w->param_key[0]) return;
+    switch (w->kind) {
+    case W_KNOB: {
+        if (!force && !maze_send_throttle_ok()) return;
+        float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%.2f", real);
+        send_maze_set(w->param_key, buf);
+        break;
+    }
+    case W_TOGGLE:
+        /* mix.enabled is maze_host's own host-level toggle
+         * (handle_mix_set()), which checks for "1"/"true" -- a
+         * different convention from the real chain_params' own
+         * ["off","on"] enum options (rnd_voice etc). Not a case worth
+         * generalizing for one exception. */
+        if (strcmp(w->param_key, "mix.enabled") == 0)
+            send_maze_set(w->param_key, w->state ? "1" : "0");
+        else
+            send_maze_set(w->param_key, w->state ? "on" : "off");
+        break;
+    case W_BUTTON:
+        send_maze_set(w->param_key, "go");
+        break;
+    case W_ENUM_H:
+    case W_ENUM_V:
+        send_maze_set(w->param_key, w->options[w->state]);
+        break;
+    }
 }
 
 /* Landscape px of vertical drag needed to sweep a knob's full 0-100
@@ -984,17 +1332,36 @@ static void send_knob_param(int knob_idx, int value_pct, int force) {
  * unreliable. */
 #define KNOB_DRAG_RANGE_PX 300
 
-static int active_knob = -1;
+/* Only knobs use active_widget (touch-down starts a drag, continues
+ * across move events, finalizes on release) -- toggles/buttons/enums
+ * fire immediately on touch-down instead, no drag state needed. */
+static int active_widget = -1;
 static int32_t drag_start_py = 0;
 static int drag_start_value = 0;
 static int touch_down_prev = 0;
+
+/* Point-in-box hit-test against every widget on the current page;
+ * returns the first (only) match, or -1. Widgets never overlap in this
+ * project's own layouts, so "first match" is unambiguous. */
+static int hit_test_widget(int32_t lpx, int32_t lpy) {
+    for (int i = 0; i < n_page_widgets; i++) {
+        ui_widget_t *w = &page_widgets[i];
+        if (lpx >= w->cx - w->hit_hw && lpx <= w->cx + w->hit_hw &&
+            lpy >= w->cy - w->hit_hh && lpy <= w->cy + w->hit_hh)
+            return i;
+    }
+    return -1;
+}
 
 static void update_touch_state(const struct input_event *ev) {
     /* Set below while touch_mu is held, acted on (send_maze_set, a
      * blocking-ish socket call) only after it's released -- never do
      * potentially-slow I/O while holding a lock the commit thread also
-     * needs for its own (should stay fast) redraw snapshot. */
-    int send_knob = -1, send_value = 0, send_force = 0;
+     * needs for its own (should stay fast) redraw snapshot. Only ever
+     * one widget fires per touch event (a fresh tap, a drag step, or a
+     * release), so one slot is enough. */
+    int send_idx = -1, send_force = 0;
+    ui_widget_t send_snapshot = {0};
 
     pthread_mutex_lock(&touch_mu);
     if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
@@ -1006,58 +1373,90 @@ static void update_touch_state(const struct input_event *ev) {
     }
 
     if (touch_down && !touch_down_prev) {
-        /* Fresh touch-down: hit-test against every knob, activate the
-         * first (only) match. touch_x/touch_y may still reflect the last
+        /* Fresh touch-down. touch_x/touch_y may still reflect the last
          * *position* event rather than one synchronized with this exact
          * BTN_TOUCH transition (the ILI2116 driver doesn't guarantee they
-         * arrive in the same report) -- acceptable given the 90px hit
-         * radius and the confirmed ~13px calibration accuracy. */
+         * arrive in the same report) -- acceptable given every hit box
+         * here being at least ~35px and the confirmed ~13px calibration
+         * accuracy. */
         int32_t lpx, lpy;
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
-        active_knob = -1;
-        for (size_t i = 0; i < NUM_SHADOW_KNOBS; i++) {
-            int32_t dx = lpx - shadow_knob_layout[i].cx;
-            int32_t dy = lpy - shadow_knob_layout[i].cy;
-            int32_t r = shadow_knob_layout[i].radius;
-            if (dx * dx + dy * dy <= r * r) {
-                active_knob = (int)i;
-                drag_start_py = lpy;
-                drag_start_value = shadow_knob_value[i];
-                break;
+        active_widget = -1;
+
+        int32_t tabbar_y = LAND_H - TABBAR_H;
+        if (lpy >= tabbar_y) {
+            int32_t tw = LAND_W / NUM_PAGES;
+            int new_page = lpx / tw;
+            if (new_page < 0) new_page = 0;
+            if (new_page >= NUM_PAGES) new_page = NUM_PAGES - 1;
+            if (new_page != current_page) {
+                current_page = new_page;
+                build_page(current_page);
+                shadow_redraw_needed = 1;
+            }
+        } else {
+            int i = hit_test_widget(lpx, lpy);
+            if (i >= 0) {
+                ui_widget_t *w = &page_widgets[i];
+                switch (w->kind) {
+                case W_KNOB:
+                    active_widget = i;
+                    drag_start_py = lpy;
+                    drag_start_value = w->state;
+                    break;
+                case W_TOGGLE:
+                    w->state = !w->state;
+                    shadow_redraw_needed = 1;
+                    send_idx = i; send_force = 1; send_snapshot = *w;
+                    break;
+                case W_BUTTON:
+                    send_idx = i; send_force = 1; send_snapshot = *w;
+                    break;
+                case W_ENUM_H:
+                case W_ENUM_V:
+                    for (int j = 0; j < w->n_options; j++) {
+                        if (lpx >= w->seg_x[j] && lpx <= w->seg_x[j] + w->seg_w &&
+                            lpy >= w->seg_y[j] && lpy <= w->seg_y[j] + w->seg_h) {
+                            w->state = j;
+                            shadow_redraw_needed = 1;
+                            send_idx = i; send_force = 1; send_snapshot = *w;
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
         }
-    } else if (touch_down && active_knob >= 0) {
+    } else if (touch_down && active_widget >= 0) {
         int32_t lpx, lpy;
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
         (void)lpx;
+        ui_widget_t *w = &page_widgets[active_widget];
         int32_t dy_dragged = drag_start_py - lpy; /* positive = moved up */
         int new_val = drag_start_value + (int)((dy_dragged * 100) / KNOB_DRAG_RANGE_PX);
         if (new_val < 0) new_val = 0;
         else if (new_val > 100) new_val = 100;
-        if (new_val != shadow_knob_value[active_knob]) {
-            shadow_knob_value[active_knob] = new_val;
+        if (new_val != w->state) {
+            w->state = new_val;
             shadow_redraw_needed = 1;
-            send_knob = active_knob;
-            send_value = new_val;
+            send_idx = active_widget; send_force = 0; send_snapshot = *w;
         }
-    } else if (!touch_down && touch_down_prev && active_knob >= 0) {
+    } else if (!touch_down && touch_down_prev && active_widget >= 0) {
         /* Just released, mid-drag: send the final value unconditionally,
          * bypassing the throttle -- otherwise a release landing inside
          * the throttle window would leave the real DSP param on a value
          * older than what the screen (and the user) last saw. */
-        send_knob = active_knob;
-        send_value = shadow_knob_value[active_knob];
-        send_force = 1;
-        active_knob = -1;
+        send_idx = active_widget; send_force = 1; send_snapshot = page_widgets[active_widget];
+        active_widget = -1;
     } else if (!touch_down) {
-        active_knob = -1;
+        active_widget = -1;
     }
     touch_down_prev = touch_down;
 
     pthread_mutex_unlock(&touch_mu);
 
-    if (send_knob >= 0) {
-        send_knob_param(send_knob, send_value, send_force);
+    if (send_idx >= 0) {
+        send_widget_param(&send_snapshot, send_force);
     }
 }
 

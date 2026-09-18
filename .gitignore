@@ -7,3 +7,6 @@ tools/getfb
 tools/grab_test
 tools/seq_probe
 tools/seq_dump_ioctl.so
+tools/render_preview
+tools/preview*.ppm
+tools/preview*.png

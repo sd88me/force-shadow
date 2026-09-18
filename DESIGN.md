@@ -1606,6 +1606,99 @@ feature is an open product decision, not a technical one -- deferred,
 not abandoned. The same-combo-toggle (`KNOBS+SCENE-N` again) already
 provides a full, working exit path in the meantime.
 
+## The real Maze Voice control pages (2026-09-18, compiled offline, not yet loaded live)
+
+Replaces the fixed 6-knob rainbow-colored mockup with the actual designed
+UI: three tabbed pages (Voice; WaveFolder/Filter; Mod/Random/Mix),
+covering essentially the whole of Force Maze Voice's own
+`module.json` `chain_params` plus `maze_host`'s host-level `mix.*`
+controls, in the Maze Voice web GUI's own visual language. The biggest
+single feature addition to this project since the original mechanism
+was proven.
+
+**Design process**: proposed three layout directions (flat grid, framed
+sections, a vertical "spine" echoing the web GUI's own rack look) as a
+live HTML mockup artifact, rendered at the real 1280×800 device
+resolution using the web GUI's actual palette/type (rust accent `#c1552f`,
+Barlow Condensed + IBM Plex Mono) and the user's own MPC plugin-editor
+screenshots (Odyssey/TubeSynth/Bassline) for structural conventions
+(top bar, framed knob sections, bottom tab bar). Iterated live with the
+user through several rounds -- combining the original 6 module.json
+pages down to 3, pairing each oscillator param with its own EG1 depth
+in labeled rows (VCO/MOD/FM), moving `Route` into a dedicated center
+divider between WaveFolder and Filter (it describes the relationship
+*between* those two sections, not either one), and adding an Output Mix
+frame for `maze_host`'s host-level controls.
+
+**Built a bitmap font from scratch** (`src/font8x8.h`) -- the first text
+rendering this project has ever needed. Hand-transcribing ~44 glyphs
+from memory was judged too error-prone to trust blind; instead
+generated offline by rasterizing DejaVu Sans Bold via Pillow (in a
+throwaway Docker container, not installed anywhere persistent) and
+comparing ~24 size/offset/threshold combinations side by side as a
+sprite sheet before picking one (10px render, `(0,-2)` offset, >90
+luminance threshold -- the only combination that kept every letter and
+digit distinguishable at an 8×8 cell). One glyph (`J`) is hand-patched:
+DejaVu's own `J` is too thin to survive thresholding at this size, and
+happens not to appear anywhere in this UI's actual label text, but the
+font stays complete for future use. Purely a compile-time asset --
+no runtime font-rendering library, no change to the project's
+`libc`/`libpthread`/`libdl`-only dependency profile.
+
+**Built a host-side preview tool** (`tools/render_preview.c`) rather
+than iterate blind against the device -- shares the exact same drawing
+primitives (`put_px`/`fill_circle`/`draw_ring`/the new text renderer)
+force_shadow.c's real renderer uses, but writes a plain PPM image
+instead of a DRM buffer, so full-page layout could be checked visually
+(and was, repeatedly, catching a text-clipping bug and a label/knob
+overlap bug) entirely offline, no live device cycle needed per
+iteration. A genuinely reusable tool for any future addon page, not a
+one-off scaffold.
+
+**Architecture**: every widget (knob, toggle, button, 3-way enum
+selector) is one entry in a single table (`ui_widget_t page_widgets[]`)
+that both rendering and touch hit-testing read from -- built once per
+page (`build_page()`, on shadow-mode entry or tab switch), not
+recomputed per redraw, so layout math exists in exactly one place and
+visuals can never drift out of sync with what's actually touchable.
+Hit-testing is a uniform point-in-box test across every widget kind
+(even knobs, whose circular hit area is approximated as its bounding
+square -- imprecise at the corners, irrelevant given how well-separated
+every widget is). Touch semantics differ by kind: knobs use the
+existing drag state machine (touch-down starts, move updates, release
+finalizes); toggles/buttons/enum segments fire immediately on
+touch-down, no drag needed. The bottom tab bar is hit-tested the same
+way (a fixed-height strip, no separate widget record needed) and
+triggers `build_page()` for the new page on a switch.
+
+**DSP wiring generalized alongside it**: `send_maze_set()` now takes a
+pre-formatted string rather than always a float, since enum-typed
+`chain_params` (`route`, the four `rnd_*` toggles) take one of their own
+literal option strings per `module.json` ("`SET route Parallel`"), not a
+number. One real inconsistency found and handled: `mix.enabled` (a
+`maze_host` host-level control, not a `chain_param`) expects `"1"`/`"0"`
+per its own `handle_mix_set()`, not the `chain_params`' own `"on"`/`"off"`
+enum convention -- confirmed by reading `maze_host.cpp` directly rather
+than guessing, and special-cased rather than generalized for one
+exception.
+
+**Known simplification, not yet addressed**: `mod_freq`'s real range
+(0.2–1300 Hz) is documented in `module.json` as log-curved, but is
+mapped linearly here like every other param, matching this project's
+existing `shadow_knob_param` precedent (which never handled curves
+either) rather than pulling in `libm` for one param. Means dragging Mod
+Freq will feel non-linear relative to its real frequency perception --
+a real UX rough edge, flagged for the design-language pass, not
+forgotten.
+
+**Not yet loaded live.** Compiles clean (`-Wall -Wextra`, zero warnings
+despite being the largest single change to this file), dependency
+profile confirmed unchanged post-build. Next: the staged load sequence
+as always (pass-through, then static toggle-on with nothing playing,
+then interactive testing with `maze_host` running) -- this is by far
+the largest untested surface this project has shipped in one pass, so
+staging matters more here than ever.
+
 ## Not yet done
 
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
