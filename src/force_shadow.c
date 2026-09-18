@@ -150,6 +150,17 @@ struct drm_mode_fb_cmd2 {
     uint64_t modifier[4];
 };
 
+/* FB_DAMAGE_CLIPS's blob payload is an array of these (DRM UAPI, stable). */
+struct drm_mode_rect {
+    int32_t x1, y1, x2, y2;
+};
+
+struct drm_mode_create_blob {
+    uint64_t data;
+    uint32_t length;
+    uint32_t blob_id; /* out */
+};
+
 #define DRM_MODE_OBJECT_PLANE 0xeeeeeeeeu
 #define DRM_FORMAT_XRGB8888   0x34325258u  /* 'X','R','2','4' little-endian fourcc */
 
@@ -161,6 +172,7 @@ struct drm_mode_fb_cmd2 {
 #define DRM_IOCTL_MODE_ADDFB2             DRM_IOWR(0xB8, sizeof(struct drm_mode_fb_cmd2))
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES  DRM_IOWR(0xB9, sizeof(struct drm_mode_obj_get_properties))
 #define DRM_IOCTL_MODE_GETPROPERTY        DRM_IOWR(0xAA, sizeof(struct drm_mode_get_property))
+#define DRM_IOCTL_MODE_CREATEPROPBLOB     DRM_IOWR(0xBD, sizeof(struct drm_mode_create_blob))
 #define DRM_IOCTL_MODE_ATOMIC             DRM_IOWR(0xBC, sizeof(struct drm_mode_atomic))
 
 /* Cross-check against the exact live-confirmed value from DESIGN.md:
@@ -183,6 +195,8 @@ static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t plane_obj_id = 0;
 static uint32_t fb_id_prop_id = 0;
+static uint32_t damage_clips_prop_id = 0;  /* 0 if not found on this plane */
+static uint32_t damage_clips_blob_id = 0;  /* 0 if not yet created */
 static uint32_t shadow_fb_id = 0;
 static volatile int shadow_ready = 0;    /* only true once setup fully succeeded */
 static volatile int shadow_on = 0;       /* live toggle state, updated by polling */
@@ -266,7 +280,7 @@ static void resolve_plane_and_props(int fd) {
         return;
     }
 
-    uint32_t fallback_plane = 0, fallback_fb_prop = 0;
+    uint32_t fallback_plane = 0, fallback_fb_prop = 0, fallback_damage_prop = 0;
     int fallback_nprops = -1;
     uint32_t primary_plane = 0, primary_fb_prop = 0;
     int found_primary = 0;
@@ -289,33 +303,41 @@ static void resolve_plane_and_props(int fd) {
             free(props); free(vals); continue;
         }
 
-        uint32_t fb_prop = 0, crtc_prop = 0;
+        uint32_t fb_prop = 0, crtc_prop = 0, damage_prop = 0;
         int this_is_primary = 0;
+        char names_buf[512] = "";
+        size_t names_len = 0;
         for (uint32_t i = 0; i < cnt; i++) {
             char name[32];
             uint64_t primary_val = UINT64_MAX;
             if (resolve_property_name(fd, props[i], name, &primary_val) < 0) continue;
             if (strcmp(name, "FB_ID") == 0) fb_prop = props[i];
             else if (strcmp(name, "CRTC_ID") == 0) crtc_prop = props[i];
+            else if (strcmp(name, "FB_DAMAGE_CLIPS") == 0) damage_prop = props[i];
             else if (strcmp(name, "type") == 0 &&
                      primary_val != UINT64_MAX && primary_val == vals[i]) {
                 this_is_primary = 1;
             }
+            int n = snprintf(names_buf + names_len, sizeof(names_buf) - names_len,
+                              "%s%s", names_len ? "," : "", name);
+            if (n > 0) names_len += (size_t)n < sizeof(names_buf) - names_len ? (size_t)n : 0;
         }
 
         if (fb_prop && crtc_prop) {
-            logline("plane 0x%x: %u props, FB_ID=%u CRTC_ID=%u%s",
-                     pid, cnt, fb_prop, crtc_prop,
+            logline("plane 0x%x: %u props [%s], FB_ID=%u CRTC_ID=%u DAMAGE=%u%s",
+                     pid, cnt, names_buf, fb_prop, crtc_prop, damage_prop,
                      this_is_primary ? " (type=Primary)" : "");
             if (this_is_primary && !found_primary) {
                 primary_plane = pid;
                 primary_fb_prop = fb_prop;
+                damage_clips_prop_id = damage_prop;
                 found_primary = 1;
             }
             if ((int)cnt > fallback_nprops) {
                 fallback_nprops = (int)cnt;
                 fallback_plane = pid;
                 fallback_fb_prop = fb_prop;
+                fallback_damage_prop = damage_prop;
             }
         }
         free(props);
@@ -326,14 +348,15 @@ static void resolve_plane_and_props(int fd) {
     if (found_primary) {
         plane_obj_id = primary_plane;
         fb_id_prop_id = primary_fb_prop;
-        logline("resolved primary plane via type=Primary: obj=0x%x FB_ID=%u",
-                 plane_obj_id, fb_id_prop_id);
+        logline("resolved primary plane via type=Primary: obj=0x%x FB_ID=%u DAMAGE_CLIPS=%u",
+                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id);
     } else if (fallback_plane) {
         plane_obj_id = fallback_plane;
         fb_id_prop_id = fallback_fb_prop;
+        damage_clips_prop_id = fallback_damage_prop;
         logline("no plane had type=Primary; falling back to most-properties "
-                 "heuristic: obj=0x%x FB_ID=%u (%d props)",
-                 plane_obj_id, fb_id_prop_id, fallback_nprops);
+                 "heuristic: obj=0x%x FB_ID=%u DAMAGE_CLIPS=%u (%d props)",
+                 plane_obj_id, fb_id_prop_id, damage_clips_prop_id, fallback_nprops);
     } else {
         logline("no plane with both FB_ID and CRTC_ID found -- shadow mode unavailable");
     }
@@ -437,6 +460,43 @@ static void create_shadow_buffer(int fd) {
              (unsigned long long)creq.size);
 }
 
+/* Live load test #7 found (via read-only kernel debugfs state, see
+ * DESIGN.md): FB_ID substitution genuinely works at the kernel level --
+ * the kernel's own tracked atomic state shows our shadow_fb_id active on
+ * the right plane/CRTC, correct format/size -- yet nothing appears on the
+ * physical panel. Leading hypothesis: this plane also has
+ * FB_DAMAGE_CLIPS, a blob property common on command-mode DSI panels that
+ * tells the driver which rectangular region actually needs pushing to the
+ * panel each frame, for power/bandwidth savings. If MPC's own commits
+ * only declare their own (possibly small) redraw region as damaged, and
+ * we only ever swap FB_ID, the driver's internal fb= bookkeeping could be
+ * correct while only that small region -- not our full-screen content --
+ * ever actually reaches the glass.
+ *
+ * Creates one reusable blob covering the FULL buffer as damaged, once, at
+ * setup. Read-only/inert like every other setup step: creating a blob is
+ * just kernel-side data storage, it doesn't touch scanout by itself.
+ * Leaves damage_clips_blob_id 0 (substitution just skips patching this
+ * property, same fail-closed default as if it didn't exist) on failure --
+ * FB_ID-only substitution still runs either way. */
+static void create_damage_blob(int fd) {
+    if (!damage_clips_prop_id) return; /* property not found on this plane -- nothing to do */
+
+    struct drm_mode_rect rect = { 0, 0, (int32_t)SHADOW_W, (int32_t)SHADOW_H };
+    struct drm_mode_create_blob creq;
+    memset(&creq, 0, sizeof(creq));
+    creq.data = (uint64_t)(uintptr_t)&rect;
+    creq.length = sizeof(rect);
+    if (real_ioctl(fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &creq) < 0) {
+        logline("CREATEPROPBLOB (damage clips) failed: %s -- FB_ID-only substitution",
+                 strerror(errno));
+        return;
+    }
+    damage_clips_blob_id = creq.blob_id;
+    logline("full-buffer damage-clips blob ready: blob_id=%u rect=(%d,%d,%d,%d)",
+             damage_clips_blob_id, rect.x1, rect.y1, rect.x2, rect.y2);
+}
+
 static void *touch_thread_fn(void *arg); /* defined below, started here */
 
 __attribute__((constructor))
@@ -472,12 +532,15 @@ static void do_lazy_setup(void) {
     resolve_plane_and_props(fd);
     if (plane_obj_id && fb_id_prop_id) {
         create_shadow_buffer(fd);
+        create_damage_blob(fd);
     }
     if (plane_obj_id && fb_id_prop_id && shadow_fb_id) {
         shadow_ready = 1;
         logline("setup complete: plane=0x%x FB_ID_prop=%u shadow_fb_id=%u "
-                 "-- shadow mode ARMED (still off; toggle via %s)",
-                 plane_obj_id, fb_id_prop_id, shadow_fb_id, SHADOW_TOGGLE_FILE);
+                 "damage_clips_prop=%u damage_blob=%u -- shadow mode ARMED "
+                 "(still off; toggle via %s)",
+                 plane_obj_id, fb_id_prop_id, shadow_fb_id,
+                 damage_clips_prop_id, damage_clips_blob_id, SHADOW_TOGGLE_FILE);
     } else {
         logline("setup incomplete -- shadow mode unavailable, pass-through only");
     }
@@ -513,7 +576,20 @@ int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioc
  * display without a full restart) remains unsolved -- see "Not yet done"
  * in DESIGN.md -- so for now, treat toggling off as needing an `acvs`
  * restart to guarantee a clean revert, same as the established recovery
- * procedure already used throughout this project. */
+ * procedure already used throughout this project.
+ *
+ * Live load test #7 (2026-09-18): even with FB_ID correctly substituted
+ * (confirmed live via kernel debugfs -- see DESIGN.md), nothing appeared
+ * on the physical panel. Leading hypothesis: this plane's
+ * FB_DAMAGE_CLIPS property (if present) tells the driver which region to
+ * actually push to a command-mode DSI panel, and MPC's own commits may
+ * only ever declare their own small redraw region as damaged. Also
+ * substitutes that property's value (to a pre-created full-buffer damage
+ * blob, see create_damage_blob()) whenever it's present in the same
+ * commit, alongside FB_ID -- same in-place technique, same fail-closed
+ * behavior if the property isn't found in a given commit or wasn't
+ * resolved/created at setup (damage_clips_prop_id/damage_clips_blob_id
+ * both 0 in that case, so this is simply skipped). */
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
     if (!shadow_ready || !shadow_on) return;
     if (req->count_objs == 0) return;
@@ -531,10 +607,12 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
             for (uint32_t j = 0; j < this_count; j++) {
                 if (props[offset + j] == fb_id_prop_id) {
                     values[offset + j] = shadow_fb_id;
-                    return;
+                } else if (damage_clips_prop_id && damage_clips_blob_id &&
+                           props[offset + j] == damage_clips_prop_id) {
+                    values[offset + j] = damage_clips_blob_id;
                 }
             }
-            return; /* found the plane but not FB_ID in this commit -- leave alone */
+            return; /* done with this plane either way */
         }
         offset += this_count;
     }
