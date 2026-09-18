@@ -1909,8 +1909,90 @@ its real path, no top-level launcher, `LD_PRELOAD` at baseline) — a safe
 resting point, re-enabled with one command (`manage.sh ENABLE`) whenever
 next needed.
 
+## Live load test #19 (2026-09-19): true first boot-time autostart hits the platform's own known LD_PRELOAD race
+
+User asked to enable real autostart (`manage.sh ENABLE`, matching
+`force-audioin`'s own always-on convention) to test stop/start cycles of
+Maze and its shadow-mode page. This was **the first time
+`run_ForceShadow.sh` ever ran through the actual boot sequence** — every
+earlier test this project has ever done used `manage.sh ENABLE`'s own
+`systemctl restart acvs` (a live re-run of the addon kill+relaunch
+sequence, per the `mockbamod-module-creator` skill's `gotchas.md`), never
+a real power-cycle-triggered boot.
+
+**Symptom**: `KNOBS+SCENE-3` didn't engage shadow mode. Root-caused
+methodically, not guessed at:
+1. Confirmed the MidiLoop combo itself fires correctly — watched
+   `/tmp/force_shadow_page` over a real combo attempt, saw it flip
+   `3` -> (removed) -> `3` exactly matching two presses. Not a MidiLoop
+   binding problem.
+2. Checked `force_shadow.log`: only the very first setup commit was ever
+   logged, nothing since, despite the user confirming MPC's own UI was
+   fully responsive and being actively navigated. `poll_toggle()` only
+   runs piggybacked on a real intercepted `DRM_IOCTL_MODE_ATOMIC` call —
+   if the interposer isn't actually seeing MPC's real commits, the combo
+   file being written doesn't matter, it just never gets checked.
+3. First hypothesis (session-state-drift fatigue, live load test #8's
+   own precedent) didn't fit the evidence: only 4 reloads this boot's
+   uptime, nowhere near the ~100+ that caused that earlier incident. A
+   power cycle was tried anyway (cheap, and the user was already willing)
+   — it did **not** fix it on its own; `force_shadow.log` didn't even
+   exist after the fresh boot, meaning the interposer never saw a single
+   commit that boot either.
+4. Checked what MPC's process **actually received at exec time** (per
+   `gotchas.md`'s own explicit warning: "never trust a post-hoc `cat` of
+   a shared config file as proof of what a process actually received at
+   exec time — check `/proc/<pid>/environ` instead") rather than trusting
+   `/dev/shm/.LD_PRELOAD`'s own content. **Confirmed the real bug**:
+   `/proc/<MPC-pid>/environ` showed `LD_PRELOAD` missing *both*
+   `force_shadow.so` **and** `mockbaMagic.so` — a live, reproduced
+   instance of `gotchas.md`'s own documented "boot-time LD_PRELOAD race"
+   case study (MPC's one-time env read racing ahead of some addon
+   scripts' own writes). Since `mockbaMagic` — a much older, unrelated
+   addon — was *also* missing, this is unambiguously the platform's own
+   pre-existing race, not a bug introduced by `force-shadow`'s own
+   scripts (which correctly use the same `mkdir`-lock convention as
+   every other addon here) — though adding a fourth `LD_PRELOAD`-touching
+   script does measurably worsen the odds of hitting it, exactly as that
+   doc's own case study warned.
+
+**Fixed for this session by retrying, not by new code**: `gotchas.md`
+notes a plain `systemctl restart acvs` re-exercises this exact race (the
+`acvs` cgroup includes `boot.sh` itself) without needing a full power
+cycle. One retry succeeded — `/proc/<new-pid>/environ` confirmed all 4
+libraries present this time, `force_shadow.log` showed a clean single
+load and setup, and `KNOBS+SCENE-3` worked immediately afterward
+(confirmed both by the log — `shadow mode toggled ON`, real
+`SUBSTITUTING` commits, `shadow mode toggled off` on the second press —
+and by the user's own "worked").
+
+**Not yet fixed at the source.** `gotchas.md` documents this race as
+"actually fixed" via a `boot_old.sh` patch (poll for the shared file's
+*content* to stay stable across several checks, not just for the lock to
+be momentarily free) plus retrofitting the same `mkdir`-lock into
+`mockbaMagic`'s and `MidiLoop`'s own `run_*.sh` scripts — but this
+device just reproduced the exact symptom that fix was supposed to
+prevent, on a true cold boot. Either this device's SD card predates that
+fix, or the fix doesn't fully cover a 4th concurrent writer. Worth a
+real investigation before relying on this addon's autostart working
+first-try on every boot — for now, the practical mitigation is what
+already worked here: if shadow mode doesn't engage after a fresh boot,
+check `/proc/<mpc-pid>/environ` for `LD_PRELOAD` completeness before
+assuming a code bug, and `systemctl restart acvs` once to retry the race
+rather than reaching straight for a power cycle.
+
 ## Not yet done
 
+- **Investigate why the platform's own documented boot-time `LD_PRELOAD`
+  race (`gotchas.md`'s case study, supposedly already fixed at the
+  source) reproduced on this device's first real cold boot with
+  autostart enabled** (live load test #19) — either this SD card predates
+  that fix, or the fix doesn't fully cover a 4th concurrent writer.
+  Until root-caused, this addon's autostart isn't guaranteed to work on
+  the very first boot after a power cycle; the known mitigation is
+  checking `/proc/<mpc-pid>/environ` for `LD_PRELOAD` completeness and
+  retrying with `systemctl restart acvs` once (confirmed sufficient every
+  time so far).
 - ~~Power cycle the device, then retest~~ — **done, live load test #8**:
   confirmed the no-visible-effect bug was session state drift from ~100+
   same-boot restarts, not a real reproducible defect. Buffer cache
