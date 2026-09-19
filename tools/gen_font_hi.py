@@ -11,7 +11,7 @@ px -- the same cell the old scaled font used, so layouts don't move.
 from PIL import Image, ImageDraw, ImageFont
 
 CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-/>%+:"   # == font_chars in font8x8.h
-SCALES = [1.5, 2.0, 2.5]
+SCALES = [1.0, 1.5, 2.0, 2.5, 3.0]
 FONT = "/fonts/DejaVuSansMono-Bold.ttf"
 CAP = 0.729  # DejaVu cap height / em
 

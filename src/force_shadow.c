@@ -648,16 +648,18 @@ static int font_glyph_index(char ch) {
 static void draw_char_land(uint32_t *map, uint32_t stride_px,
                             int32_t x, int32_t y, char ch, float scale,
                             uint32_t color) {
-    /* LCD-style pages use natively-sized, hinted glyphs (font_hi.h) at the
-     * three scales they draw with -- 1:1 pixels instead of upscaling the
-     * 9x9 bitmap, which is what made text look soft. Cell size matches
-     * the scaled path exactly, so layout doesn't move. */
-    if (th.lcd) {
+    /* Natively-sized, hinted glyphs (font_hi.h) for every page, at the
+     * scales baked by tools/gen_font_hi.py -- 1:1 pixels instead of
+     * upscaling the 9x9 bitmap, which is what made text look soft. Cell
+     * size matches the scaled path exactly, so layout doesn't move. A
+     * scale that isn't baked falls back to the old upscaler: add it to
+     * SCALES in the generator (and to the table below) for a new design. */
+    {
         const uint8_t *hg = NULL; int32_t hw = 0, hh = 0;
         int gi = font_glyph_index(ch);
-        if (scale == 1.5f)      { hg = font_hi_1_5[gi]; hw = FONT_HI_1_5_W; hh = FONT_HI_1_5_H; }
-        else if (scale == 2.0f) { hg = font_hi_2_0[gi]; hw = FONT_HI_2_0_W; hh = FONT_HI_2_0_H; }
-        else if (scale == 2.5f) { hg = font_hi_2_5[gi]; hw = FONT_HI_2_5_W; hh = FONT_HI_2_5_H; }
+#define HI_FONT(sc, nm) if (scale == sc) { hg = font_hi_##nm[gi]; hw = FONT_HI_##nm##_W; hh = FONT_HI_##nm##_H; }
+        HI_FONT(1.0f, 1_0) else HI_FONT(1.5f, 1_5) else HI_FONT(2.0f, 2_0) else HI_FONT(2.5f, 2_5) else HI_FONT(3.0f, 3_0)
+#undef HI_FONT
         if (hg) {
             for (int32_t dy = 0; dy < hh; dy++)
                 for (int32_t dx = 0; dx < hw; dx++) {
