@@ -2314,6 +2314,119 @@ tearing from the lack of double-buffering (see the "Interactive
 dragging" note above), unrelated to this anti-aliasing change and not
 addressed here.
 
+## Live load test #24 (2026-09-19): font anti-aliasing, a real clipping bug, a 50% size pass, and a perf fix -- all same day as #23
+
+Continuation of the same conversation as live load test #23, moving to
+the font half of "Anti-aliased rendering" plus three follow-on requests
+the user made once they could see the result live: "increase the size
+of the knobs and knobs text a bit, and enum buttons" (later escalated to
+a full 50%), and a DX7 MidiLoop binding brought in line with Maze
+Voice's own single-combo redesign.
+
+**Font regenerated as 9x9, 8bpp real alpha coverage** (was 8x8, 1-bit) --
+same offline Pillow/DejaVu Sans Bold pipeline as the original font, one
+extra row/column, coverage values kept instead of thresholded to a
+single bit. `draw_char_land()` blends each pixel via the same
+`put_px_blend_land()` primitive the AA circles use.
+
+**Real bug, found live, not offline**: first deploy of the new font, the
+user reported "the text on the 3 tab buttons on bottom is all messed up
+overlapping and top bar" -- then, once every widget's text was checked,
+"actually all the text looks lightly chopped at the top." No screenshot
+mechanism existed to see this directly, so one was built: a trigger-file-
+gated raw shadow-buffer dump (`/tmp/force_shadow_dump_req` ->
+`/tmp/force_shadow_dump.raw`), pulled off and un-rotated back to
+landscape with a small offline Python script. First attempt at wiring
+this into `poll_toggle()` produced a dump that looked fine -- a false
+negative, because `poll_toggle()` only runs on real DRM atomic commits
+from MPC's own thread, which stop entirely once MPC's own UI goes idle
+(the same gap live load test #12 already flagged as under-tested); the
+dump call was moved into `maybe_redraw_shadow()` itself, which runs on
+every actual redraw regardless of source (a real commit OR the touch
+thread's own direct repaint), and kept there permanently -- a genuinely
+reusable diagnostic for the next live-only bug report, not ripped out
+after use.
+
+With a real capture in hand, root cause was in the font generation
+script, not the renderer: it sized the font at 13px rendered into a
+9px cell (before supersampling, an even more extreme ratio after), and
+centered each glyph using its own per-character ink bounding box plus
+an extra ad hoc "-1 real pixel" upward nudge borrowed from the old
+font's tuning -- for a tall ascender that combination pushed ink above
+row 0 of the render canvas, where Pillow silently discards it.
+Regenerated a second time sizing the font from DejaVu's own
+`font.getmetrics()` (ascent+descent), picking the largest size that
+still leaves real top/bottom margin in the supersampled canvas, with
+every glyph placed at the *same* vertical baseline derived from those
+metrics -- only horizontal centering stayed per-glyph (via `textbbox`,
+since widths genuinely vary). Checked via a full 44-glyph sprite sheet
+before redeploying; confirmed live afterward ("looks better").
+
+**Sizing pass, in two stages**. First stage: knob radii +15% and enum
+segments +10-15% across both real `.conf` files, capping knob *label*
+text at 1.2x (full 1.5x on values, which are always short). The user's
+own next message clarified the ask was for a uniform 50% everywhere,
+including text: "actually all the text looks lightly chopped at the
+top... i also want the knob and text and values bigger" plus an earlier
+"try a 50% increase... including knobs and buttons." Re-did knob radii
+at the full 1.5x from the *original* pre-#23 values (26->39, 30->45,
+24->36, 28->42 for Maze Voice; 50->75 for DX7), enum segments at 1.5x
+(78x22->117x33, 90x20->135x30), toggle/button boxes and their touch hit-
+boxes at 1.5x, and both knob label and value text at the full 1.5x.
+
+The Mixer/Tone frame's old 3-column layout (117px knob-center spacing)
+could not fit 1.5x label text without its longest pair ("NOISE TONE" +
+"RING LVL") overlapping by a computed ~17px -- rather than capping that
+text again, re-laid the frame out as 2 columns x 4 rows (195px spacing)
+in the `.conf` file itself, which the sizing math shows clear with
+50-90px of margin on every pair. The Envelopes frame's two knobs were
+similarly widened from thirds to quarter-marks for the same reason.
+Frame section-header titles were missed in the first pass -- caught by
+the user directly ("the box section header text is way too small as
+well") -- bumped to 1.5x with the title/separator-line offsets adjusted
+so the taller glyph doesn't touch the rule below it.
+
+**A real performance regression, also found live**: "the knob response
+feels sluggish and slow... feels like continues a bit when let go" --
+bigger knobs (~2.25x the pixel area at 1.5x radius) and heavier
+per-pixel-blended text pushed each full-page redraw (already run on
+every touch delta, per live load test #12's design) past a threshold
+where touch events queued up faster than they could be drawn, so
+dragging felt laggy and continued briefly after release -- a classic
+producer-faster-than-consumer symptom, not a new bug so much as an old
+cost profile crossing a perceptible line. Fixed at the actual hot spot:
+`circle_edge_coverage()`'s integer division only matters within ~2px of
+an edge (the AA band width), so `fill_circle_land()`/`draw_ring_land()`
+got a fast path that skips the division entirely for pixels solidly
+inside (opaque fill) or solidly outside (skipped) a circle, turning that
+cost from O(r^2) (every pixel in the bounding box) to O(r) (just the
+boundary ring) -- pixel-identical output, only the cost profile changed.
+`draw_char_land()` got a matching fix: column-to-source mapping is now
+precomputed once per glyph instead of re-dividing for every destination
+pixel (~14x fewer divisions for a 1.5x glyph). Confirmed live afterward:
+"yes better."
+
+**DX7's MidiLoop binding brought in line with Maze Voice's own
+single-combo redesign** (user: "also fix the dx7 midiloop config to be
+like maze now"): `SHIFT+SCENE-1` moved from `SCRIPT-14` (the old direct
+engine-toggle script) to `SCRIPT-19` (the page-toggle script
+`KNOBS+SCENE-1` already used) -- same procedure as live load test #22's
+own Maze Voice rebind: timestamped backup, one line changed, `diff`
+confirmed nothing else moved, validated with `midiloop test` before
+reloading.
+
+Also hit, twice, the same two already-catalogued platform issues during
+this session's deploy cycles: the boot-time `LD_PRELOAD` race (resolved
+both times with the standard `systemctl restart acvs` retry) and a
+device reboot + WiFi drop mid-deploy (self-resolved once reachable
+again -- WiFi/ethernet drop tally now at eight occurrences across the
+project's history).
+
+**Tearing** (the pre-existing cosmetic issue from the lack of double-
+buffering) was reconfirmed still present and is still not addressed --
+unrelated to anything in this pass, tracked separately in "Not yet
+done."
+
 ## Not yet done
 
 - ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real
@@ -2325,22 +2438,32 @@ addressed here.
   `tools/render_preview.c` still keeps its own independent layout
   copies, not the same file, for now -- a real follow-up, not done in
   this pass.
-- **Anti-aliased rendering** — user-raised (2026-09-19), same
-  conversation: the current renderer is deliberately minimal (flat-
-  filled shapes, an 8x8 1-bit bitmap font, zero anti-aliasing) -- that's
-  the actual source of it looking less sharp/polished than MPC's own
-  native UI, not a resolution problem. Cheapest path has two pieces:
-  ~~add edge-coverage blending to the knob circles/rings~~ -- **done,
-  live load test #23** -- and regenerate the bitmap font at higher
-  resolution with real alpha/anti-aliasing baked in (same offline
-  Pillow-based generation process already used for the current font --
-  see "The real Maze Voice control pages" section above -- just keeping
-  coverage values instead of a 1-bit threshold), still not started. A
-  bigger, more flexible option is vendoring `stb_truetype.h` (single-
-  header, public domain, no runtime dependency) for real scalable vector
-  fonts -- more capable, more surface area, more risk; only worth it if
-  the cheaper path doesn't close the gap enough. Same offline-preview-
-  first discipline applies as everything else in this file.
+- ~~Anti-aliased rendering~~ — **done, live load tests #23/#24**: both
+  pieces of the "cheap path" are in now -- edge-coverage blending on the
+  knob circles/rings, and a regenerated 9x9 8bpp real-alpha bitmap font
+  (was 8x8 1-bit) used everywhere text is drawn. A real font-generation
+  bug (glyphs clipped at the top) was found live and fixed along the
+  way -- see live load test #24 for the full story, including the
+  screen-capture diagnostic that was built to see it. Also folded in,
+  same conversation: a 50% size increase across knobs/text/enum buttons
+  (with the Mixer/Tone frame re-laid out to fit it without clashing),
+  and a real performance fix (division-heavy circle/glyph rendering was
+  making knob drags feel laggy at the bigger sizes) -- both also in live
+  load test #24. `tools/render_preview.c` still keeps its own
+  independent layout copies, not the same file, for now -- a real
+  follow-up, not done in this pass. A bigger, more flexible option for
+  the font specifically, if ever needed, is vendoring `stb_truetype.h`
+  (single-header, public domain, no runtime dependency) for real
+  scalable vector fonts -- more capable, more surface area, more risk;
+  not needed now that the coverage-based bitmap font closes the gap.
+- **Screen tearing** (a few faint, shifting-angle lines from the lack of
+  double-buffering, most visible on knobs' own color contrast) --
+  reconfirmed still present after live load test #24's font/sizing pass
+  (unrelated to that work). User asked about it directly (2026-09-19)
+  and chose to finish/document the font+sizing work first rather than
+  start this in the same session -- next real fix, when picked up, is a
+  second buffer + flip logic (a few more DRM ioctl calls), not a quick
+  tweak.
 
 - **Investigate why the platform's own documented boot-time `LD_PRELOAD`
   race (`gotchas.md`'s case study, supposedly already fixed at the

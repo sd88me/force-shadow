@@ -525,12 +525,30 @@ static inline int32_t circle_edge_coverage(int32_t d2, int32_t r) {
     return cov;
 }
 
+/* Both circle drawers below got a fast path (2026-09-19, after the 50%
+ * sizing pass made knobs big enough that the user felt real lag while
+ * dragging): circle_edge_coverage()'s integer division only matters
+ * within ~2px of an edge (see its own comment on the AA band width) --
+ * everywhere else in a filled circle's bounding box is either solidly
+ * interior (skip straight to an opaque put_px_land(), no division) or
+ * solidly exterior (skip the pixel entirely). That turns the division
+ * cost from O(r^2) (every pixel in the box) into O(r) (only the ~2px-
+ * wide boundary ring), which is what actually scales with a bigger
+ * knob radius -- the interior/exterior bulk was always wasted division
+ * work even in the original version. Pixel-identical output to the
+ * naive per-pixel version; only the cost profile changed. */
 static void fill_circle_land(uint32_t *map, uint32_t stride_px,
                               int32_t cx, int32_t cy, int32_t r,
                               uint32_t color) {
+    int32_t r_in_safe = r - 2; if (r_in_safe < 0) r_in_safe = 0;
+    int32_t r_out_safe = r + 2;
+    int32_t in2 = r_in_safe * r_in_safe, out2 = r_out_safe * r_out_safe;
     for (int32_t y = -r - 1; y <= r + 1; y++)
         for (int32_t x = -r - 1; x <= r + 1; x++) {
-            int32_t cov = circle_edge_coverage(x * x + y * y, r);
+            int32_t d2 = x * x + y * y;
+            if (d2 <= in2) { put_px_land(map, stride_px, cx + x, cy + y, color); continue; }
+            if (d2 > out2) continue;
+            int32_t cov = circle_edge_coverage(d2, r);
             if (cov <= 0) continue;
             if (cov >= 255) put_px_land(map, stride_px, cx + x, cy + y, color);
             else put_px_blend_land(map, stride_px, cx + x, cy + y, color, cov);
@@ -541,9 +559,19 @@ static void draw_ring_land(uint32_t *map, uint32_t stride_px,
                             int32_t cx, int32_t cy, int32_t r, int32_t thick,
                             uint32_t color) {
     int32_t r_in = r - thick;
+    int32_t band_in_safe = r_in + 2, band_out_safe = r - 2;
+    int32_t hole_safe = r_in - 2; if (hole_safe < 0) hole_safe = 0;
+    int32_t outer_safe = r + 2;
+    int32_t band_in2 = band_in_safe * band_in_safe, band_out2 = band_out_safe * band_out_safe;
+    int32_t hole2 = hole_safe * hole_safe, outer2 = outer_safe * outer_safe;
     for (int32_t y = -r - 1; y <= r + 1; y++)
         for (int32_t x = -r - 1; x <= r + 1; x++) {
             int32_t d2 = x * x + y * y;
+            if (d2 < hole2 || d2 > outer2) continue;              /* clear of the ring entirely */
+            if (d2 >= band_in2 && d2 <= band_out2 && band_in_safe <= band_out_safe) {
+                put_px_land(map, stride_px, cx + x, cy + y, color); /* solidly inside the ring band */
+                continue;
+            }
             int32_t outer_cov = circle_edge_coverage(d2, r);
             int32_t inner_cov = 255 - circle_edge_coverage(d2, r_in);
             int32_t cov = outer_cov < inner_cov ? outer_cov : inner_cov;
@@ -559,36 +587,73 @@ static void draw_ring_land(uint32_t *map, uint32_t stride_px,
  * only difference) and renders to a plain PPM image, so the whole
  * multi-page layout below was checked visually before ever touching the
  * device. See DESIGN.md for the preview screenshots and font generation
- * notes. */
+ * notes.
+ *
+ * font8x8.h was regenerated (2026-09-19) from 8x8 1-bit glyphs to 9x9
+ * 8bpp alpha-coverage glyphs -- draw_char_land() below now blends each
+ * pixel via put_px_blend_land() (same primitive knob circles use)
+ * instead of a hard fill_rect_land() per set bit.
+ *
+ * `scale` is a float, not an int (2026-09-19, same day, after the user
+ * found the integer-scale-1 knob label/value text still too small):
+ * draw_char_land() walks *destination* pixels and maps each one back to
+ * a source glyph pixel via plain division (nearest-neighbor upscale of
+ * the already-smooth coverage bitmap -- no libm needed, this is just
+ * float multiply/divide, not a transcendental call, so the project's
+ * no-libm dependency profile is untouched), instead of only supporting
+ * whole-integer replication. Lets a specific widget (knob label/value)
+ * pick something like 1.5x without forcing every other integer-scaled
+ * caller (top bar, tab bar, frame titles) to change too. */
+#define GLYPH_CELL 9
 static int font_glyph_index(char ch) {
     for (size_t i = 0; font_chars[i]; i++)
         if (font_chars[i] == ch) return (int)i;
     return 0; /* space */
 }
+/* Column-to-source mapping precomputed once per glyph (2026-09-19, same
+ * pass that sped up the circle drawers above) instead of re-dividing for
+ * every (dx,dy) pair -- the old version did one division per destination
+ * PIXEL (up to ~14x14=196 for a 1.5x knob-value glyph), this does one per
+ * destination COLUMN (~14), reusing it across every row. Same
+ * nearest-neighbor mapping, same output, just not redundantly recomputed
+ * down every row. */
+#define GLYPH_MAX_OUT_CELL 40  /* generous headroom past any scale this project uses */
 static void draw_char_land(uint32_t *map, uint32_t stride_px,
-                            int32_t x, int32_t y, char ch, int32_t scale,
+                            int32_t x, int32_t y, char ch, float scale,
                             uint32_t color) {
     const uint8_t *g = font8x8[font_glyph_index(ch)];
-    for (int32_t row = 0; row < 8; row++)
-        for (int32_t col = 0; col < 8; col++)
-            if (g[row] & (1 << (7 - col)))
-                fill_rect_land(map, stride_px, x + col*scale, y + row*scale,
-                                scale, scale, color);
+    int32_t out_cell = (int32_t)(GLYPH_CELL * scale + 0.5f);
+    if (out_cell > GLYPH_MAX_OUT_CELL) out_cell = GLYPH_MAX_OUT_CELL;
+    int32_t col_of[GLYPH_MAX_OUT_CELL];
+    for (int32_t dx = 0; dx < out_cell; dx++) {
+        int32_t col = (int32_t)((float)dx / scale);
+        col_of[dx] = (col >= GLYPH_CELL) ? GLYPH_CELL - 1 : col;
+    }
+    for (int32_t dy = 0; dy < out_cell; dy++) {
+        int32_t row = (int32_t)((float)dy / scale);
+        if (row >= GLYPH_CELL) row = GLYPH_CELL - 1;
+        const uint8_t *grow = g + row * GLYPH_CELL;
+        for (int32_t dx = 0; dx < out_cell; dx++) {
+            int32_t cov = grow[col_of[dx]];
+            if (cov <= 0) continue;
+            put_px_blend_land(map, stride_px, x + dx, y + dy, color, cov);
+        }
+    }
 }
-static int32_t text_width_land(const char *s, int32_t scale) {
-    return (int32_t)strlen(s) * 9 * scale - scale;
+static int32_t text_width_land(const char *s, float scale) {
+    return (int32_t)((float)strlen(s) * (GLYPH_CELL + 1) * scale - scale);
 }
 static void draw_text_land(uint32_t *map, uint32_t stride_px,
-                            int32_t x, int32_t y, const char *s, int32_t scale,
+                            int32_t x, int32_t y, const char *s, float scale,
                             uint32_t color) {
     int32_t cx = x;
     for (const char *p = s; *p; p++) {
         draw_char_land(map, stride_px, cx, y, *p, scale, color);
-        cx += 9 * scale;
+        cx += (int32_t)((GLYPH_CELL + 1) * scale);
     }
 }
 static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
-                              int32_t cx, int32_t y, const char *s, int32_t scale,
+                              int32_t cx, int32_t y, const char *s, float scale,
                               uint32_t color) {
     draw_text_land(map, stride_px, cx - text_width_land(s, scale)/2, y, s, scale, color);
 }
@@ -763,7 +828,7 @@ static int add_toggle(int32_t cx, int32_t cy, const char *label,
     ui_widget_t *w = &page_widgets[n_page_widgets];
     memset(w, 0, sizeof(*w));
     w->kind = W_TOGGLE; w->cx = cx; w->cy = cy;
-    w->hit_hw = 20; w->hit_hh = 12;
+    w->hit_hw = 30; w->hit_hh = 18; /* matches render_widget's 1.5x pw/ph=51/27 */
     strncpy(w->label, label, sizeof(w->label)-1);
     strncpy(w->param_key, key, sizeof(w->param_key)-1);
     w->state = initial_on ? 1 : 0;
@@ -773,7 +838,7 @@ static int add_button(int32_t cx, int32_t cy, const char *label, const char *key
     ui_widget_t *w = &page_widgets[n_page_widgets];
     memset(w, 0, sizeof(*w));
     w->kind = W_BUTTON; w->cx = cx; w->cy = cy;
-    w->hit_hw = text_width_land(label, 1)/2 + 20; w->hit_hh = 18;
+    w->hit_hw = text_width_land(label, 1.5f)/2 + 30; w->hit_hh = 27; /* matches render_widget's 1.5x button box */
     strncpy(w->label, label, sizeof(w->label)-1);
     strncpy(w->param_key, key, sizeof(w->param_key)-1);
     return n_page_widgets++;
@@ -788,13 +853,13 @@ static int add_enum(int32_t cx, int32_t cy, widget_kind_t kind, const char *labe
     w->n_options = n; w->state = active;
     for (int i = 0; i < n; i++) w->options[i] = opts[i];
     if (kind == W_ENUM_H) {
-        w->seg_w = 78; w->seg_h = 22;
+        w->seg_w = 117; w->seg_h = 33;
         int32_t total = n*w->seg_w + (n-1)*2;
         int32_t x0 = cx - total/2;
         for (int i = 0; i < n; i++) { w->seg_x[i] = x0 + i*(w->seg_w+2); w->seg_y[i] = cy - w->seg_h/2; }
         w->hit_hw = total/2; w->hit_hh = w->seg_h/2;
     } else {
-        w->seg_w = 90; w->seg_h = 20;
+        w->seg_w = 135; w->seg_h = 30;
         int32_t y0 = cy - (n*(w->seg_h+2))/2;
         for (int i = 0; i < n; i++) { w->seg_x[i] = cx - w->seg_w/2; w->seg_y[i] = y0 + i*(w->seg_h+2); }
         w->hit_hw = w->seg_w/2; w->hit_hh = (n*(w->seg_h+2))/2;
@@ -1163,8 +1228,12 @@ static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t
     fill_rect_land(map, stride_px, f->x, f->y, 1, f->h, PLATE_LINE);
     fill_rect_land(map, stride_px, f->x + f->w - 1, f->y, 1, f->h, PLATE_LINE);
     fill_rect_land(map, stride_px, f->x, f->y + f->h - 1, f->w, 1, PLATE_LINE);
-    draw_text_land(map, stride_px, f->x + 18, f->y + 16, f->title, 1, UI_ACCENT_HI);
-    fill_rect_land(map, stride_px, f->x + 18, f->y + 30, f->w - 36, 1, PLATE_LINE);
+    /* Bumped to 1.5x (2026-09-19, the 50% sizing pass -- missed the first
+     * time through, user: "the box section header text is way too small
+     * as well"); separator pushed from y+30 to y+36 so the taller glyph
+     * (14px at 1.5x vs 9px before) doesn't touch it. */
+    draw_text_land(map, stride_px, f->x + 18, f->y + 14, f->title, 1.5f, UI_ACCENT_HI);
+    fill_rect_land(map, stride_px, f->x + 18, f->y + 36, f->w - 36, 1, PLATE_LINE);
 }
 
 static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *w) {
@@ -1180,35 +1249,48 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         fill_circle_land(map, stride_px, dx, dy, w->radius/7 + 2, UI_ACCENT);
         float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
         snprintf(valbuf, sizeof(valbuf), "%.0f", real);
-        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 10, w->label, 1, UI_INK);
-        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 22, valbuf, 1, UI_INK_FAINT);
+        /* Label/value text at the full 1.5x the user asked for (2026-09-19:
+         * "increase everything by 50%... including knobs and buttons").
+         * An earlier pass capped the label at 1.2x because the Mixer/Tone
+         * frame's old 3-across knob row (117px center spacing) would have
+         * clashed at 1.5x -- resolved properly this time by re-laying that
+         * frame out as 2 columns x 4 rows instead (195px spacing, see the
+         * Maze Voice shadow_page.conf's own MIXER / TONE section), rather
+         * than capping the text increase the user explicitly asked for. */
+        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 12, w->label, 1.5f, UI_INK);
+        draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 29, valbuf, 1.5f, UI_INK_FAINT);
         break;
     }
     case W_TOGGLE: {
-        int32_t pw = 34, ph = 18;
+        int32_t pw = 51, ph = 27;
         fill_rect_land(map, stride_px, w->cx - pw/2, w->cy - ph/2, pw, ph, 0xFF050403u);
         int32_t lx = w->state ? (w->cx + pw/2 - ph/2) : (w->cx - pw/2 + ph/2);
-        fill_circle_land(map, stride_px, lx, w->cy, ph/2 - 3, w->state ? UI_ACCENT_HI : 0xFF4C473Du);
-        draw_text_land_c(map, stride_px, w->cx, w->cy + ph/2 + 8, w->label, 1, UI_INK);
+        fill_circle_land(map, stride_px, lx, w->cy, ph/2 - 4, w->state ? UI_ACCENT_HI : 0xFF4C473Du);
+        draw_text_land_c(map, stride_px, w->cx, w->cy + ph/2 + 10, w->label, 1.5f, UI_INK);
         break;
     }
     case W_BUTTON: {
-        int32_t bw = text_width_land(w->label, 1) + 24, bh = 26;
+        int32_t bw = text_width_land(w->label, 1.5f) + 36, bh = 39;
         fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, UI_ACCENT);
-        draw_text_land_c(map, stride_px, w->cx, w->cy - 3, w->label, 1, BTN_TEXT);
+        draw_text_land_c(map, stride_px, w->cx, w->cy - 5, w->label, 1.5f, BTN_TEXT);
         break;
     }
     case W_ENUM_H:
     case W_ENUM_V: {
-        int32_t label_y = (w->kind == W_ENUM_H) ? (w->cy - 30) : (w->cy - w->hit_hh - 20);
-        draw_text_land_c(map, stride_px, w->cx, label_y, w->label, 1,
+        /* label_y for enum_h derives from seg_h (2026-09-19, the 50%
+         * sizing pass) instead of a fixed "-30" -- with seg_h now 33
+         * (was 22), a fixed offset put the label's bottom edge touching
+         * the first segment's top edge; scaling the gap with seg_h keeps
+         * it clear regardless of segment size. */
+        int32_t label_y = (w->kind == W_ENUM_H) ? (w->cy - w->seg_h/2 - 22) : (w->cy - w->hit_hh - 24);
+        draw_text_land_c(map, stride_px, w->cx, label_y, w->label, 1.5f,
                           w->kind == W_ENUM_V ? UI_ACCENT_HI : UI_INK);
         for (int i = 0; i < w->n_options; i++) {
             int active = (i == w->state);
             fill_rect_land(map, stride_px, w->seg_x[i], w->seg_y[i], w->seg_w, w->seg_h,
                             active ? SEG_ACTIVE : SEG_INACTIVE);
-            draw_text_land_c(map, stride_px, w->seg_x[i] + w->seg_w/2, w->seg_y[i] + w->seg_h/2 - 4,
-                              w->options[i], 1, active ? SEG_ACTIVE_TX : UI_INK_DIM);
+            draw_text_land_c(map, stride_px, w->seg_x[i] + w->seg_w/2, w->seg_y[i] + w->seg_h/2 - 6,
+                              w->options[i], 1.5f, active ? SEG_ACTIVE_TX : UI_INK_DIM);
         }
         break;
     }
@@ -1228,7 +1310,7 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
  * principle as every other widget's hit box. Not a page_widgets[] entry:
  * it must stay visible/tappable across every tab of the active addon,
  * while page_widgets[] gets wiped and rebuilt on every tab switch. */
-#define ENGINE_BTN_W 160
+#define ENGINE_BTN_W 220
 #define ENGINE_BTN_H 40
 #define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
 #define ENGINE_BTN_Y 16
@@ -1504,6 +1586,32 @@ static void maybe_redraw_shadow(void) {
 
     render_shadow_page(shadow_map, shadow_stride_px, widgets_snap, n_widgets_snap,
                         frames_snap, n_frames_snap, page_snap, addon_snap, engine_on);
+
+    /* Screen-capture diagnostic (2026-09-19): there's no way to see this
+     * device's real screen remotely otherwise, which made a live-only bug
+     * report ("text looks chopped/overlapping") hard to pin down without
+     * guessing. On request (an explicit trigger file -- zero cost the
+     * rest of the time, one stat() per redraw), dumps the raw shadow
+     * buffer to disk for offline conversion/un-rotation into a viewable
+     * image. Deliberately placed here rather than in poll_toggle() (where
+     * an earlier attempt lived): poll_toggle() only runs on real DRM
+     * atomic commits from MPC's own thread, which stop entirely once
+     * MPC's own UI goes idle (exactly the scenario live load test #12
+     * already flagged as under-tested) -- this function runs on every
+     * actual redraw regardless of source (a real commit OR the touch
+     * thread's own direct repaint), so it reliably captures whatever the
+     * panel is actually showing right now. Kept as a permanent tool, not
+     * removed after use -- worth having for the next live-only bug. */
+    if (access("/tmp/force_shadow_dump_req", F_OK) == 0) {
+        FILE *df = fopen("/tmp/force_shadow_dump.raw", "wb");
+        if (df) {
+            fwrite(shadow_map, 1, (size_t)shadow_stride_px * SHADOW_H * 4, df);
+            fclose(df);
+            logline("dumped shadow_map to /tmp/force_shadow_dump.raw (%u x %u, stride_px=%u)",
+                     (unsigned)SHADOW_W, (unsigned)SHADOW_H, shadow_stride_px);
+        }
+        unlink("/tmp/force_shadow_dump_req");
+    }
 }
 
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {

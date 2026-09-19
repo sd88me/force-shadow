@@ -102,24 +102,37 @@ static void draw_hline(int x0, int y, int w, uint32_t color) { fill_rect(x0, y, 
 static void draw_vline(int x, int y0, int h, uint32_t color) { fill_rect(x, y0, 1, h, color); }
 
 /* ---- text (font8x8.h) ---- */
+#define GLYPH_CELL 9
 static int font_glyph_index(char ch) {
     for (size_t i = 0; i < strlen(font_chars); i++)
         if (font_chars[i] == ch) return (int)i;
     return 0; /* space */
 }
-static void draw_char(int x, int y, char ch, int scale, uint32_t color) {
+/* `scale` is a float here too, mirroring force_shadow.c's own fractional-
+ * scale support (2026-09-19) -- nearest-neighbor destination-pixel
+ * upscale of the coverage bitmap, so a specific widget (knob label/value)
+ * can use e.g. 1.5x without every integer-scaled caller changing too. */
+static void draw_char(int x, int y, char ch, float scale, uint32_t color) {
     const uint8_t *g = font8x8[font_glyph_index(ch)];
-    for (int row = 0; row < 8; row++)
-        for (int col = 0; col < 8; col++)
-            if (g[row] & (1 << (7 - col)))
-                fill_rect(x + col*scale, y + row*scale, scale, scale, color);
+    int out_cell = (int)(GLYPH_CELL * scale + 0.5f);
+    for (int dy = 0; dy < out_cell; dy++) {
+        int row = (int)((float)dy / scale);
+        if (row >= GLYPH_CELL) row = GLYPH_CELL - 1;
+        for (int dx = 0; dx < out_cell; dx++) {
+            int col = (int)((float)dx / scale);
+            if (col >= GLYPH_CELL) col = GLYPH_CELL - 1;
+            int cov = g[row * GLYPH_CELL + col];
+            if (cov <= 0) continue;
+            put_px_blend(x + dx, y + dy, color, cov);
+        }
+    }
 }
-static int text_width(const char *s, int scale) { return (int)strlen(s) * 9 * scale - scale; }
-static void draw_text(int x, int y, const char *s, int scale, uint32_t color) {
+static int text_width(const char *s, float scale) { return (int)((float)strlen(s) * (GLYPH_CELL + 1) * scale - scale); }
+static void draw_text(int x, int y, const char *s, float scale, uint32_t color) {
     int cx = x;
-    for (const char *p = s; *p; p++) { draw_char(cx, y, *p, scale, color); cx += 9*scale; }
+    for (const char *p = s; *p; p++) { draw_char(cx, y, *p, scale, color); cx += (int)((GLYPH_CELL + 1)*scale); }
 }
-static void draw_text_c(int cx, int y, const char *s, int scale, uint32_t color) {
+static void draw_text_c(int cx, int y, const char *s, float scale, uint32_t color) {
     draw_text(cx - text_width(s, scale)/2, y, s, scale, color);
 }
 
@@ -137,41 +150,44 @@ static void widget_knob(int cx, int cy, int r, int pct, const char *label, const
     fill_circle(cx, cy, r, KNOB_FACE);
     int dx, dy; knob_dot(cx, cy, r, pct, &dx, &dy);
     fill_circle(dx, dy, r/7 + 2, ACCENT);
-    draw_text_c(cx, cy + r + 10, label, 1, INK);
-    draw_text_c(cx, cy + r + 22, value, 1, INK_FAINT);
+    /* Mirrors force_shadow.c's render_widget() -- full 1.5x on both label
+     * and value now (2026-09-19: "increase everything by 50%"). */
+    draw_text_c(cx, cy + r + 12, label, 1.5f, INK);
+    draw_text_c(cx, cy + r + 29, value, 1.5f, INK_FAINT);
 }
 static void widget_toggle(int cx, int cy, const char *label, int on) {
-    int pw = 34, ph = 18;
+    int pw = 51, ph = 27;
     fill_rect(cx - pw/2, cy - ph/2, pw, ph, 0x050403);
     draw_ring(cx - pw/2 + ph/2, cy, ph/2 - 2, 1, PLATE_LINE);
     int lx = on ? (cx + pw/2 - ph/2) : (cx - pw/2 + ph/2);
-    fill_circle(lx, cy, ph/2 - 3, on ? ACCENT_HI : 0x4c473d);
-    draw_text_c(cx, cy + ph/2 + 8, label, 1, INK);
+    fill_circle(lx, cy, ph/2 - 4, on ? ACCENT_HI : 0x4c473d);
+    draw_text_c(cx, cy + ph/2 + 10, label, 1.5f, INK);
 }
 static void widget_button(int cx, int cy, const char *label) {
-    int w = text_width(label, 1) + 24, h = 26;
+    int w = text_width(label, 1.5f) + 36, h = 39;
     fill_rect(cx - w/2, cy - h/2, w, h, ACCENT);
-    draw_text_c(cx, cy - 3, label, 1, 0xfdf3ea);
+    draw_text_c(cx, cy - 5, label, 1.5f, 0xfdf3ea);
 }
 static void widget_enum_h(int cx, int cy, const char *label, const char **opts, int n, int active) {
-    draw_text_c(cx, cy - 30, label, 1, INK);
-    int seg_w = 78, seg_h = 22, gap = 2;
+    int seg_w = 117, seg_h = 33, gap = 2;
+    draw_text_c(cx, cy - seg_h/2 - 22, label, 1.5f, INK);
     int total = n * seg_w + (n-1)*gap;
     int x0 = cx - total/2;
     for (int i = 0; i < n; i++) {
         int x = x0 + i*(seg_w+gap);
         fill_rect(x, cy - seg_h/2, seg_w, seg_h, i == active ? 0xf2f1ee : 0x050403);
-        draw_text_c(x + seg_w/2, cy - 3, opts[i], 1, i == active ? 0x1c1a17 : INK_DIM);
+        draw_text_c(x + seg_w/2, cy - seg_h/2 + seg_h/2 - 6, opts[i], 1.5f, i == active ? 0x1c1a17 : INK_DIM);
     }
 }
 static void widget_enum_v(int cx, int cy, const char *label, const char **opts, int n, int active) {
-    draw_text_c(cx, cy - (n*24)/2 - 20, label, 1, ACCENT_HI);
-    int seg_w = 90, seg_h = 20, gap = 2;
-    int y0 = cy - (n*(seg_h+gap))/2;
+    int seg_w = 135, seg_h = 30, gap = 2;
+    int hit_hh = (n*(seg_h+gap))/2;
+    draw_text_c(cx, cy - hit_hh - 24, label, 1.5f, ACCENT_HI);
+    int y0 = cy - hit_hh;
     for (int i = 0; i < n; i++) {
         int y = y0 + i*(seg_h+gap);
         fill_rect(cx - seg_w/2, y, seg_w, seg_h, i == active ? 0xf2f1ee : 0x050403);
-        draw_text_c(cx, y + 5, opts[i], 1, i == active ? 0x1c1a17 : INK_DIM);
+        draw_text_c(cx, y + seg_h/2 - 6, opts[i], 1.5f, i == active ? 0x1c1a17 : INK_DIM);
     }
 }
 static void frame_box(int x, int y, int w, int h, const char *title) {
@@ -180,8 +196,8 @@ static void frame_box(int x, int y, int w, int h, const char *title) {
     fill_rect(x, y, 1, h, PLATE_LINE);
     fill_rect(x+w-1, y, 1, h, PLATE_LINE);
     fill_rect(x, y+h-1, w, 1, PLATE_LINE);
-    draw_text(x + 18, y + 16, title, 1, ACCENT_HI);
-    fill_rect(x + 18, y + 30, w - 36, 1, PLATE_LINE);
+    draw_text(x + 18, y + 14, title, 1.5f, ACCENT_HI);
+    fill_rect(x + 18, y + 36, w - 36, 1, PLATE_LINE);
 }
 
 /* ---- chrome: top bar + tab bar ---- */
@@ -199,7 +215,7 @@ static const char *TABS[] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MI
 /* Top-bar engine on/off button (2026-09-19) -- replaces the old static
  * "LIVE" text. Geometry kept in sync with force_shadow.c's own
  * ENGINE_BTN_X/Y/W/H. */
-#define ENGINE_BTN_W 160
+#define ENGINE_BTN_W 220
 #define ENGINE_BTN_H 40
 #define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
 #define ENGINE_BTN_Y 16
@@ -253,33 +269,43 @@ static void page_voice(void) {
             int ry = ry0 + i*rh + rh/2;
             draw_text(x0 + 18, ry - 4, rl[i], 1, ACCENT_HI);
             int kx0 = x0 + 85, kx1 = x0 + fw - 70;
-            widget_knob(kx0, ry, 26, rows[i].p1, rows[i].l1, rows[i].v1);
-            widget_knob(kx1, ry, 26, rows[i].p2, rows[i].l2, rows[i].v2);
+            widget_knob(kx0, ry, 39, rows[i].p1, rows[i].l1, rows[i].v1);
+            widget_knob(kx1, ry, 39, rows[i].p2, rows[i].l2, rows[i].v2);
         }
     }
 
     frame_box(x1, y, fw, h, "ENVELOPES");
     {
+        /* Widened from the old fw/3, 2fw/3 spacing (2026-09-19, the 50%
+         * sizing pass): quarter marks instead of thirds, matching the
+         * Mixer/Tone frame's own new spacing scheme below. */
         int ry = y + h/2 + 10;
-        widget_knob(x1 + fw/3, ry, 30, 60, "ENV1 DEC", "60");
-        widget_knob(x1 + 2*fw/3, ry, 30, 70, "VCA DECAY", "70");
+        widget_knob(x1 + fw/4, ry, 45, 60, "ENV1 DEC", "60");
+        widget_knob(x1 + 3*fw/4, ry, 45, 70, "VCA DECAY", "70");
     }
 
     frame_box(x2, y, fw, h, "MIXER / TONE");
     {
+        /* Re-laid out 3 columns x 3 rows -> 2 columns x 4 rows
+         * (2026-09-19, the 50% sizing pass): the old 3-across 117px
+         * column spacing couldn't fit 1.5x knob text without the longest
+         * label pair overlapping -- 2 columns at quarter marks (195px
+         * spacing) fixes that with real margin to spare. */
         struct { const char *l,*v; int p; } items[7] = {
-            {"VCO LVL","100",50}, {"MOD LVL","50",25}, {"NOISE LVL","0",0},
-            {"NOISE TONE","0",50}, {"RING LVL","0",0}, {"TONE/SAT","0",0},
+            {"VCO LVL","100",50}, {"MOD LVL","50",25},
+            {"NOISE LVL","0",0}, {"NOISE TONE","0",50},
+            {"RING LVL","0",0}, {"TONE/SAT","0",0},
             {"OUT LEVEL","80",80},
         };
-        int cols = 3, rowsN = 3;
-        int cw = (fw - 36) / cols, rh = (h - 50) / rowsN;
-        for (int i = 0; i < 7; i++) {
-            int col = i % cols, row = i / cols;
-            int cx = x2 + 18 + cw*col + cw/2;
+        int colx[2] = { x2 + fw/4, x2 + 3*fw/4 };
+        int rh = (h - 50) / 4;
+        for (int i = 0; i < 6; i++) {
+            int col = i % 2, row = i / 2;
             int cyk = y + 50 + rh*row + rh/2;
-            widget_knob(cx, cyk, 24, items[i].p, items[i].l, items[i].v);
+            widget_knob(colx[col], cyk, 36, items[i].p, items[i].l, items[i].v);
         }
+        widget_knob((colx[0]+colx[1])/2, y + 50 + rh*3 + rh/2, 36,
+                    items[6].p, items[6].l, items[6].v);
     }
 }
 
@@ -299,7 +325,7 @@ static void page_wavefolder_filter(void) {
         int cw = fw/2, rh = (h-50)/2;
         for (int i = 0; i < 4; i++) {
             int col = i%2, row = i/2;
-            widget_knob(x0 + cw*col + cw/2, y+50+rh*row+rh/2, 28, items[i].p, items[i].l, items[i].v);
+            widget_knob(x0 + cw*col + cw/2, y+50+rh*row+rh/2, 42, items[i].p, items[i].l, items[i].v);
         }
     }
 
@@ -307,7 +333,7 @@ static void page_wavefolder_filter(void) {
         int cx = xdiv + divw/2, cy = y + h/2;
         const char *ropts[3] = {"VCW>VCF","PARALLEL","VCF>VCW"};
         widget_enum_v(cx, cy - 90, "ROUTE", ropts, 3, 1);
-        widget_knob(cx, cy + 70, 28, 50, "BLEND", "0");
+        widget_knob(cx, cy + 70, 42, 50, "BLEND", "0");
     }
 
     frame_box(x1, y, fw, h, "FILTER");
@@ -319,7 +345,7 @@ static void page_wavefolder_filter(void) {
         int cw = fw/2, rh = (h-50)/3;
         for (int i = 0; i < 6; i++) {
             int col = i%2, row = i/2;
-            widget_knob(x1 + cw*col + cw/2, y+50+rh*row+rh/2, 26, items[i].p, items[i].l, items[i].v);
+            widget_knob(x1 + cw*col + cw/2, y+50+rh*row+rh/2, 39, items[i].p, items[i].l, items[i].v);
         }
     }
 }
@@ -332,8 +358,8 @@ static void page_mod_random_mix(void) {
     int y = CONTENT_Y, h = CONTENT_H;
 
     frame_box(x0, y, fw, h, "KEY TRACK");
-    widget_knob(x0 + fw/2, y + h/3, 30, 100, "VCO KEY", "100");
-    widget_knob(x0 + fw/2, y + 2*h/3, 30, 100, "MOD KEY", "100");
+    widget_knob(x0 + fw/2, y + h/3, 45, 100, "VCO KEY", "100");
+    widget_knob(x0 + fw/2, y + 2*h/3, 45, 100, "MOD KEY", "100");
 
     frame_box(x1, y, fw, h, "RANDOMISE");
     {
@@ -348,7 +374,7 @@ static void page_mod_random_mix(void) {
     {
         int ry0 = y + 55, rh = (h - 55) / 3;
         widget_toggle(x2 + fw/2, ry0 + rh*0 + rh/2, "VOICE ON/OFF", 1);
-        widget_knob(x2 + fw/2, ry0 + rh*1 + rh/2, 28, 66, "GAIN", "100 %");
+        widget_knob(x2 + fw/2, ry0 + rh*1 + rh/2, 42, 66, "GAIN", "100 %");
         const char *chopts[3] = {"L","R","L+R"};
         widget_enum_h(x2 + fw/2, ry0 + rh*2 + rh/2, "CHANNEL", chopts, 3, 2);
     }
