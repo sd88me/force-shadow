@@ -626,61 +626,56 @@ static ui_frame_t page_frames[MAX_FRAMES];
 static int n_page_frames = 0;
 static int current_page = 0;  /* current TAB within active_addon, not the addon itself */
 
-/* Forward-declared: addon_table[] below needs its address, but its real
- * definition (the layout logic) reads more naturally further down, next
- * to where it used to be the file's only page builder. */
-static void build_maze_voice_tab(int tab);
-
 #define MAX_TABS 4
+/* Fixed-size char arrays, not `const char *`, for every string field here
+ * (2026-09-19, the "per-addon data-driven GUI" work) -- unifies the two
+ * ways an entry gets populated: a compile-time initializer (string
+ * literals, as before) for a hand-tuned page like Maze Voice's, or
+ * discover_data_driven_addons()'s own parser copying values out of an
+ * addon's own shadow_page.conf at startup. A `const char *` would dangle
+ * for the second case (nothing would own the parsed string's storage);
+ * an embedded array sidesteps that entirely, at the cost of a fixed cap
+ * per field (generous, see each field's own size below). */
 typedef struct {
-    const char *ctrl_sock;      /* this addon's own control-socket path */
-    const char *display_name;   /* shown in the top bar, e.g. "MAZE VOICE" */
+    char ctrl_sock[64];        /* this addon's own control-socket path */
+    char display_name[24];     /* shown in the top bar, e.g. "MAZE VOICE" */
     int num_tabs;
-    const char *tab_names[MAX_TABS];
+    char tab_names[MAX_TABS][24];
     void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
 
     /* Engine on/off, driven from the top-bar button (2026-09-19) instead
      * of a separate SHIFT+SCENE-N combo -- see send_engine_toggle()'s own
      * comment for why this goes through nodeServer's /moduler HTTP API
      * rather than fork/exec'ing from inside MPC's own process.
-     * engine_process_name NULL = this addon has no engine to toggle (or
+     * engine_process_name[0]==0 = this addon has no engine to toggle (or
      * doesn't need one shown), and the button is simply not drawn. The
      * other three fields must come from that addon's own NSMODULE.json
      * verbatim -- moduler's UPDATE endpoint overwrites the file with
      * whatever ARGUMENTS we send, so re-sending anything paraphrased or
      * stale would corrupt it. */
-    const char *engine_process_name;   /* NSMODULE.json's PROCESSNAME */
-    const char *engine_nsmodule_path;  /* absolute path to that NSMODULE.json */
-    const char *engine_dirname;        /* NSMODULE.json's DIRNAME */
-    const char *engine_arguments_json; /* NSMODULE.json's ARGUMENTS array, as literal JSON text */
+    char engine_process_name[32];    /* NSMODULE.json's PROCESSNAME */
+    char engine_nsmodule_path[160];  /* absolute path to that NSMODULE.json */
+    char engine_dirname[32];         /* NSMODULE.json's DIRNAME */
+    char engine_arguments_json[768]; /* NSMODULE.json's ARGUMENTS array, as literal JSON text */
 } addon_descriptor_t;
 
 /* One entry per KNOBS+SCENE-N slot already reserved in USER-SCRIPTS.sh/
  * midiloop.config. A slot with no entry here (NULL build_tab) is a safe,
- * silent no-op -- poll_toggle() below refuses to activate it. To add a
- * new addon's page: add its entry here (find its own ctrl_sock path from
- * its NSMODULE.json ARGUMENTS, its params from its own module.json), and
- * write a build_<addon>_tab() function -- see docs/adding-a-page.md. */
-static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
-    [ADDON_MAZE_VOICE] = {
-        .ctrl_sock = "/tmp/maze_ctrl.sock",
-        .display_name = "MAZE VOICE",
-        .num_tabs = 3,
-        .tab_names = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
-        .build_tab = build_maze_voice_tab,
-        .engine_process_name = "maze_host",
-        .engine_nsmodule_path = "/media/662522/AddOns/ForceMazeVoice/NSMODULE.json",
-        .engine_dirname = "ForceMazeVoice",
-        .engine_arguments_json =
-            "[{\"NAME\":\"module-dir flag\",\"VALUE\":\"--module-dir\"},"
-            "{\"NAME\":\"module directory (chain_params/ui_hierarchy source)\","
-            "\"VALUE\":\"/media/662522/AddOns/ForceMazeVoice\"},"
-            "{\"NAME\":\"ctrl-sock flag\",\"VALUE\":\"--ctrl-sock\"},"
-            "{\"NAME\":\"control socket path\",\"VALUE\":\"/tmp/maze_ctrl.sock\"},"
-            "{\"NAME\":\"control-channel flag\",\"VALUE\":\"--control-channel\"},"
-            "{\"NAME\":\"Q-Link control channel (1-16)\",\"VALUE\":\"1\"}]",
-    },
-};
+ * silent no-op -- poll_toggle() below refuses to activate it. Not `const`:
+ * discover_data_driven_addons() fills in any slot still at its
+ * zero-initialized default from that addon's own shadow_page.conf, found
+ * on disk at startup -- see that function's own comment.
+ *
+ * Empty at compile time now (2026-09-19) -- Maze Voice, this table's
+ * only occupant until live load test #22, has been ported to its own
+ * shadow_page.conf (deployed in its own AddOns folder) to prove the
+ * data-driven loader against a real, already-live-tested page, not just
+ * a new minimal one. A hand-tuned compile-time entry is still supported
+ * (and still always wins over a same-numbered file on disk) for a
+ * future page whose layout genuinely needs real code -- e.g. per-row
+ * loops driven by a params array, the way build_maze_voice_tab() used
+ * to -- see docs/adding-a-page.md. */
+static addon_descriptor_t addon_table[NUM_ADDON_SLOTS];
 
 /* Cached "is the active addon's engine process actually running" state --
  * refreshed at poll_toggle()'s own ~2/sec cadence (see there), read by
@@ -766,112 +761,355 @@ static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *ti
     strncpy(f->title, title, sizeof(f->title)-1);
 }
 
-/* Ported directly from tools/render_preview.c's page_voice()/
- * page_wavefolder_filter()/page_mod_random_mix() -- same layout math,
- * verified visually there first. pmin/pmax/initial values come from
- * module.json's chain_params (force-maze/maze-voice) directly; mix.*
- * entries are maze_host's own host-level controls (see
- * handle_mix_set()/handle_mix_get() in that project's maze_host.cpp),
- * not chain_params, hence the separate "mix." key namespace. */
-static void build_maze_voice_tab(int page) {
-    n_page_widgets = 0;
-    n_page_frames = 0;
-    int32_t margin = 36, gap = 20;
-    int32_t y = CONTENT_Y, h = CONTENT_H;
+/* ---- Per-addon data-driven pages (2026-09-19) ----
+ *
+ * Every addon's page (Maze Voice included, since live load test #22
+ * ported it from an earlier hand-tuned-C version to prove this loader
+ * against a real, already-live-tested page, not just a new minimal one)
+ * ships as a plain text file (SHADOW_PAGE_CONF_NAME) in that addon's own
+ * AddOns folder, discovered and parsed once at startup by
+ * discover_data_driven_addons() below -- not compiled into this file,
+ * so a new addon's page needs no ForceShadow edit-rebuild-redeploy
+ * cycle (raised by the user, tracked in DESIGN.md's "Not yet done"
+ * before this section existed). A compile-time addon_table[] entry is
+ * still supported for a page whose layout genuinely needs real code
+ * (e.g. per-row loops driven by a params array) -- see
+ * docs/adding-a-page.md -- it always wins over a same-numbered file on
+ * disk; today's table has none.
+ *
+ * Deliberately a small custom line-oriented format, not JSON: this
+ * project already hand-rolls everything it touches (the DRM structs,
+ * the bitmap font, the trig tables) rather than reach for a library, and
+ * a real JSON parser (nested objects/arrays, string escaping) is a lot
+ * of new surface area for a benefit -- interop with other JSON tooling
+ * -- nothing on this device actually needs. This format needs no
+ * escaping and is trivially hand-editable. Format:
+ *
+ *   # comments and blank lines ignored
+ *   page=<1-7, must match a KNOBS+SCENE-N/SHIFT+SCENE-N slot>
+ *   ctrl_sock=<path>
+ *   display_name=<shown in the top bar>
+ *   engine_process_name=<PROCESSNAME -- omit the whole engine_* block for no button>
+ *   engine_nsmodule_path=<absolute path to that addon's own NSMODULE.json>
+ *   engine_dirname=<DIRNAME>
+ *   engine_arguments_json=<that NSMODULE.json's ARGUMENTS array, verbatim, one line>
+ *
+ *   [tab <name>]
+ *   frame x=<n> y=<n> w=<n> h=<n> title="<text>"
+ *   knob cx=<n> cy=<n> r=<n> label="<text>" key=<name> min=<f> max=<f> pct=<0-100>
+ *   toggle cx=<n> cy=<n> label="<text>" key=<name> on=<0|1>
+ *   button cx=<n> cy=<n> label="<text>" key=<name>
+ *   enum_h cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
+ *   enum_v cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
+ *
+ * Repeat [tab ...] for each tab, in the order they should appear. Values
+ * needing a space (labels, titles, options lists) take double quotes;
+ * everything else is a bare token. See force-dx7's own AddOns folder for
+ * a complete, real, live-tested example (a minimal DX7 test page).
+ */
 
-    if (page == 0) {
-        int32_t fw = (LAND_W - 2*margin - 2*gap) / 3;
-        int32_t x0 = margin, x1 = x0 + fw + gap, x2 = x1 + fw + gap;
-        add_frame(x0, y, fw, h, "OSCILLATOR");
-        add_frame(x1, y, fw, h, "ENVELOPES");
-        add_frame(x2, y, fw, h, "MIXER / TONE");
+#define SHADOW_PAGE_CONF_NAME "shadow_page.conf"
+#define SHADOW_PAGE_STRING_POOL_SIZE 8192
+/* Sized for engine_arguments_json's own line: "engine_arguments_json="
+ * (23 bytes) plus up to sizeof(addon_descriptor_t.engine_arguments_json)
+ * (768) of value, plus margin. */
+#define SHADOW_PAGE_MAX_LINE 900
+#define SHADOW_PAGE_MAX_TOKENS 16
 
-        struct { const char *l1,*k1; const char *l2,*k2; int p1,p2; } rows[3] = {
-            {"VCO TUNE","vco_tune", "VCO EG1","vco_eg1", 50,50},
-            {"MOD FREQ","mod_freq", "MOD EG1","mod_eg1", 42,50},
-            {"FM DEPTH","fm_depth", "FM EG1","fm_eg1",   0,50},
-        };
-        float pmin1[3] = { -24.0f, 0.2f, 0.0f }, pmax1[3] = { 24.0f, 1300.0f, 100.0f };
-        int32_t ry0 = y + 50, rh = (h - 60) / 3;
-        for (int i = 0; i < 3; i++) {
-            int32_t ry = ry0 + i*rh + rh/2;
-            int32_t kx0 = x0 + 85, kx1 = x0 + fw - 70;
-            add_knob(kx0, ry, 26, rows[i].l1, rows[i].k1, pmin1[i], pmax1[i], rows[i].p1);
-            add_knob(kx1, ry, 26, rows[i].l2, rows[i].k2, -100.0f, 100.0f, rows[i].p2);
+/* One addon's worth of pre-built tabs, captured once at parse time by
+ * actually calling the real add_knob()/add_toggle()/etc builder
+ * functions (the same ones a compile-time addon_table[] entry would use)
+ * into the normal page_widgets[]/page_frames[] scratch arrays, then
+ * copying the result out here -- rather than reimplementing widget-
+ * geometry math (hit boxes, enum segment layout) a second time for the
+ * data-driven path. generic_data_driven_build_tab() below copies a
+ * stored snapshot back in whenever that tab is actually shown. */
+typedef struct {
+    int n_widgets;
+    ui_widget_t widgets[MAX_WIDGETS];
+    int n_frames;
+    ui_frame_t frames[MAX_FRAMES];
+} tab_snapshot_t;
+static tab_snapshot_t data_addon_tabs[NUM_ADDON_SLOTS][MAX_TABS];
+
+/* Backing storage for enum widgets' own option strings: add_enum() only
+ * stores pointers (ui_widget_t.options[]), it doesn't copy -- fine for
+ * the compile-time page, whose option strings are string literals (live
+ * for the whole process), not fine for parsed-from-a-file strings that
+ * would otherwise point into a stack buffer reused for the next line.
+ * A flat pool with no individual frees (freed only by process exit,
+ * matching this file's own established "never explicitly torn down"
+ * static-resource convention) is enough: parsing runs once, at startup. */
+static char shadow_page_pool[SHADOW_PAGE_STRING_POOL_SIZE];
+static size_t shadow_page_pool_used = 0;
+static const char *shadow_page_pool_store(const char *s) {
+    size_t len = strlen(s) + 1;
+    if (shadow_page_pool_used + len > sizeof(shadow_page_pool)) return "";
+    char *dst = shadow_page_pool + shadow_page_pool_used;
+    memcpy(dst, s, len);
+    shadow_page_pool_used += len;
+    return dst;
+}
+
+/* Only ever called from the currently-active addon's own build_tab
+ * dispatch (see addon_table[]'s own build_tab field), so `active_addon`/
+ * `tab` are always in range by construction. */
+static void generic_data_driven_build_tab(int tab) {
+    const tab_snapshot_t *snap = &data_addon_tabs[active_addon][tab];
+    n_page_widgets = snap->n_widgets;
+    memcpy(page_widgets, snap->widgets, sizeof(ui_widget_t) * (size_t)snap->n_widgets);
+    n_page_frames = snap->n_frames;
+    memcpy(page_frames, snap->frames, sizeof(ui_frame_t) * (size_t)snap->n_frames);
+}
+
+/* Splits `line` in place into up to `max` tokens, space/tab-separated,
+ * except a double-quoted value (quotes stripped in place via memmove,
+ * spaces inside preserved) counts as part of the same token -- so
+ * `label="VCO TUNE" key=vco_tune` yields exactly two tokens,
+ * `label=VCO TUNE` and `key=vco_tune`, not four. Mutates line; returns
+ * the token count. */
+static int shadow_page_tokenize(char *line, char *tokens[], int max) {
+    int n = 0;
+    char *p = line;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') break;
+        tokens[n++] = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            if (*p == '"') {
+                memmove(p, p + 1, strlen(p)); /* drop opening quote */
+                char *close = strchr(p, '"');
+                if (close) {
+                    memmove(close, close + 1, strlen(close)); /* drop closing quote */
+                    p = close;
+                } else {
+                    p += strlen(p);
+                }
+                continue;
+            }
+            p++;
         }
-
-        int32_t ery = y + h/2 + 10;
-        add_knob(x1 + fw/3, ery, 30, "ENV1 DEC", "env1_decay", 0.0f, 100.0f, 60);
-        add_knob(x1 + 2*fw/3, ery, 30, "VCA DECAY", "env2_decay", 0.0f, 100.0f, 70);
-
-        struct { const char *l,*k; float mn,mx; int p; } mix[7] = {
-            {"VCO LVL","vco_lvl", 0,200, 50}, {"MOD LVL","mod_lvl", 0,200, 25},
-            {"NOISE LVL","noise_lvl", 0,200, 0}, {"NOISE TONE","noise_tone", -100,100, 50},
-            {"RING LVL","ring_lvl", 0,100, 0}, {"TONE/SAT","sat", 0,100, 0},
-            {"OUT LEVEL","level", 0,100, 80},
-        };
-        int32_t cols = 3, rowsN = 3;
-        int32_t cw = (fw - 36) / cols, mrh = (h - 50) / rowsN;
-        for (int i = 0; i < 7; i++) {
-            int32_t col = i % cols, row = i / cols;
-            int32_t cx = x2 + 18 + cw*col + cw/2, cyk = y + 50 + mrh*row + mrh/2;
-            add_knob(cx, cyk, 24, mix[i].l, mix[i].k, mix[i].mn, mix[i].mx, mix[i].p);
-        }
-    } else if (page == 1) {
-        int32_t divw = 140;
-        int32_t fw = (LAND_W - 2*margin - 2*gap - divw) / 2;
-        int32_t x0 = margin, xdiv = x0 + fw + gap, x1 = xdiv + divw + gap;
-        add_frame(x0, y, fw, h, "WAVEFOLDER");
-        add_frame(x1, y, fw, h, "FILTER");
-
-        struct { const char *l,*k; float mn,mx; int p; } wf[4] = {
-            {"FOLD DRIVE","fold_drive", 0,100, 0}, {"FOLD BIAS","fold_bias", -100,100, 50},
-            {"FOLD EG1","fold_eg1", -100,100, 50}, {"FOLD KEY","fold_key", 0,100, 0},
-        };
-        int32_t cw = fw/2, wrh = (h-50)/2;
-        for (int i = 0; i < 4; i++) {
-            int32_t col = i%2, row = i/2;
-            add_knob(x0 + cw*col + cw/2, y+50+wrh*row+wrh/2, 28, wf[i].l, wf[i].k, wf[i].mn, wf[i].mx, wf[i].p);
-        }
-
-        int32_t dcx = xdiv + divw/2, dcy = y + h/2;
-        static const char *ropts[3] = {"VCW>VCF","Parallel","VCF>VCW"};
-        add_enum(dcx, dcy - 90, W_ENUM_V, "ROUTE", "route", ropts, 3, 1);
-        add_knob(dcx, dcy + 70, 28, "BLEND", "blend", -100.0f, 100.0f, 50);
-
-        struct { const char *l,*k; float mn,mx; int p; } fl[6] = {
-            {"CUTOFF","cutoff", 0,100, 100}, {"RESONANCE","reso", 0,100, 0},
-            {"LP-BP","filter_mode", 0,100, 0}, {"CUT EG1","cutoff_eg1", -100,100, 65},
-            {"CUT KEY","cutoff_key", 0,100, 0}, {"FILT DRIVE","filt_drive", 0,100, 0},
-        };
-        cw = fw/2; int32_t frh = (h-50)/3;
-        for (int i = 0; i < 6; i++) {
-            int32_t col = i%2, row = i/2;
-            add_knob(x1 + cw*col + cw/2, y+50+frh*row+frh/2, 26, fl[i].l, fl[i].k, fl[i].mn, fl[i].mx, fl[i].p);
-        }
-    } else {
-        int32_t fw = (LAND_W - 2*margin - 2*gap) / 3;
-        int32_t x0 = margin, x1 = x0 + fw + gap, x2 = x1 + fw + gap;
-        add_frame(x0, y, fw, h, "KEY TRACK");
-        add_frame(x1, y, fw, h, "RANDOMISE");
-        add_frame(x2, y, fw, h, "OUTPUT MIX");
-
-        add_knob(x0 + fw/2, y + h/3, 30, "VCO KEY", "vco_key", 0.0f, 100.0f, 100);
-        add_knob(x0 + fw/2, y + 2*h/3, 30, "MOD KEY", "mod_key", 0.0f, 100.0f, 100);
-
-        static const char *rlabels[4] = {"RND VOICE","RND FOLD","RND FILT","RND TONE"};
-        static const char *rkeys[4] = {"rnd_voice","rnd_wavefolder","rnd_filter","rnd_tone"};
-        int32_t rry0 = y + 55, rrh = (h - 110) / 4;
-        for (int i = 0; i < 4; i++)
-            add_toggle(x1 + fw/2, rry0 + rrh*i + rrh/2, rlabels[i], rkeys[i], 1);
-        add_button(x1 + fw/2, y + h - 30, "GENERATE", "rnd_go");
-
-        int32_t mry0 = y + 55, mrh2 = (h - 55) / 3;
-        add_toggle(x2 + fw/2, mry0 + mrh2*0 + mrh2/2, "VOICE ON/OFF", "mix.enabled", 1);
-        add_knob(x2 + fw/2, mry0 + mrh2*1 + mrh2/2, 28, "GAIN", "mix.gain", 0.0f, 150.0f, 66);
-        static const char *chopts[3] = {"L","R","L+R"};
-        add_enum(x2 + fw/2, mry0 + mrh2*2 + mrh2/2, W_ENUM_H, "CHANNEL", "mix.channel", chopts, 3, 2);
+        if (*p) { *p = 0; p++; }
     }
+    return n;
+}
+
+/* Splits one "key=value" token in place. Returns 0 (and leaves *key/
+ * *val untouched) if there's no '='. */
+static int shadow_page_split_kv(char *tok, char **key, char **val) {
+    char *eq = strchr(tok, '=');
+    if (!eq) return 0;
+    *eq = 0;
+    *key = tok;
+    *val = eq + 1;
+    return 1;
+}
+
+/* Splits every "key=value" token (tokens[1..n-1], skipping the leading
+ * type keyword at [0]) into parallel key/value arrays, exactly once.
+ *
+ * Live load test #22 found the earlier version of this (a kv_get() that
+ * split tokens lazily, on each individual field lookup) had a real bug:
+ * shadow_page_split_kv() mutates its token in place (writes a NUL over
+ * its own '='), and looking up field N necessarily *scans past* fields
+ * 1..N-1 first -- silently re-splitting (and thereby corrupting, since
+ * a token with its '=' already replaced can never be found again) any
+ * field that happened to sit *before* another field this same line
+ * queried earlier. Every DX7 knob on this project's first live test
+ * came out with r=0/min=0/max=0/pct=0 (only cx/cy/label/key survived,
+ * since those were queried first, before anything had a chance to be
+ * incidentally scanned-past-and-corrupted) -- a textbook case for why a
+ * lookup helper repeatedly called against the same data shouldn't also
+ * mutate that data as a side effect. Splitting everything up front, once,
+ * makes every subsequent lookup a pure, repeatable, order-independent
+ * read. */
+typedef struct { const char *k, *v; } shadow_page_kv_t;
+static int shadow_page_split_all(char *tokens[], int n, shadow_page_kv_t kv[], int max_kv) {
+    int nkv = 0;
+    for (int i = 1; i < n && nkv < max_kv; i++) {
+        char *k, *v;
+        if (shadow_page_split_kv(tokens[i], &k, &v)) { kv[nkv].k = k; kv[nkv].v = v; nkv++; }
+    }
+    return nkv;
+}
+/* Returns "" (never NULL) if not found, so callers can pass the result
+ * straight to atoi/atof/strcmp without a NULL check. */
+static const char *shadow_page_kv_get(shadow_page_kv_t kv[], int n, const char *key) {
+    for (int i = 0; i < n; i++) if (strcmp(kv[i].k, key) == 0) return kv[i].v;
+    return "";
+}
+
+/* Parses one already-open shadow_page.conf. `path` is only for log
+ * messages. Populates addon_table[slot] and data_addon_tabs[slot][..]
+ * directly (via the real add_knob()/add_toggle()/etc builders, same as
+ * any compile-time page) -- the caller (discover_data_driven_addons())
+ * has already verified `slot` is empty (build_tab == NULL) before
+ * calling this, so a hand-tuned compile-time page can never be
+ * overridden by a file on disk. */
+static void parse_shadow_page_conf(FILE *f, const char *path) {
+    addon_descriptor_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    int slot = -1;
+    int in_tab = -1; /* -1 = still in the top-level key=value section */
+    char line[SHADOW_PAGE_MAX_LINE];
+
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (!*trimmed || *trimmed == '#') continue;
+
+        if (trimmed[0] == '[') {
+            char *close = strchr(trimmed, ']');
+            if (close && strncmp(trimmed + 1, "tab ", 4) == 0) {
+                *close = 0;
+                if (slot < 0 || parsed.num_tabs >= MAX_TABS) continue;
+                in_tab = parsed.num_tabs++;
+                strncpy(parsed.tab_names[in_tab], trimmed + 5, sizeof(parsed.tab_names[in_tab]) - 1);
+                n_page_widgets = 0;
+                n_page_frames = 0;
+            }
+            continue;
+        }
+
+        /* engine_arguments_json's own value is literal JSON: full of
+         * embedded quotes and spaces that don't follow this format's own
+         * `key="quoted value"` convention (its quotes delimit JSON
+         * strings, not this parser's tokens). Handled as a raw
+         * take-the-rest-of-the-line special case, entirely bypassing
+         * shadow_page_tokenize() below, rather than trying to make one
+         * quoting convention serve both jobs. */
+        #define ENGINE_ARGS_PREFIX "engine_arguments_json="
+        if (in_tab < 0 && strncmp(trimmed, ENGINE_ARGS_PREFIX, strlen(ENGINE_ARGS_PREFIX)) == 0) {
+            strncpy(parsed.engine_arguments_json, trimmed + strlen(ENGINE_ARGS_PREFIX),
+                     sizeof(parsed.engine_arguments_json) - 1);
+            continue;
+        }
+        #undef ENGINE_ARGS_PREFIX
+
+        char *toks[SHADOW_PAGE_MAX_TOKENS];
+        int nt = shadow_page_tokenize(trimmed, toks, SHADOW_PAGE_MAX_TOKENS);
+        if (nt == 0) continue;
+
+        if (in_tab < 0) {
+            /* Top-level key=value line. */
+            char *k, *v;
+            if (!shadow_page_split_kv(toks[0], &k, &v)) continue;
+            if (strcmp(k, "page") == 0) {
+                int p = atoi(v);
+                if (p <= ADDON_NONE || p >= NUM_ADDON_SLOTS || addon_table[p].build_tab) {
+                    logline("shadow_page[%s]: page=%s invalid or already taken -- skipping file", path, v);
+                    return;
+                }
+                slot = p;
+            }
+            else if (strcmp(k, "ctrl_sock") == 0) strncpy(parsed.ctrl_sock, v, sizeof(parsed.ctrl_sock) - 1);
+            else if (strcmp(k, "display_name") == 0) strncpy(parsed.display_name, v, sizeof(parsed.display_name) - 1);
+            else if (strcmp(k, "engine_process_name") == 0) strncpy(parsed.engine_process_name, v, sizeof(parsed.engine_process_name) - 1);
+            else if (strcmp(k, "engine_nsmodule_path") == 0) strncpy(parsed.engine_nsmodule_path, v, sizeof(parsed.engine_nsmodule_path) - 1);
+            else if (strcmp(k, "engine_dirname") == 0) strncpy(parsed.engine_dirname, v, sizeof(parsed.engine_dirname) - 1);
+            /* engine_arguments_json is handled earlier, as a raw
+             * whole-line special case -- see above. */
+            continue;
+        }
+
+        /* Inside a [tab ...] section: toks[0] is the widget type keyword. */
+        const char *type = toks[0];
+        shadow_page_kv_t kv[SHADOW_PAGE_MAX_TOKENS];
+        int nkv = shadow_page_split_all(toks, nt, kv, SHADOW_PAGE_MAX_TOKENS);
+        int32_t cx = atoi(shadow_page_kv_get(kv, nkv, "cx"));
+        int32_t cy = atoi(shadow_page_kv_get(kv, nkv, "cy"));
+        const char *label = shadow_page_kv_get(kv, nkv, "label");
+        const char *key = shadow_page_kv_get(kv, nkv, "key");
+
+        if (strcmp(type, "frame") == 0) {
+            add_frame(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
+                      atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
+                      shadow_page_kv_get(kv, nkv, "title"));
+        } else if (strcmp(type, "knob") == 0) {
+            add_knob(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "r")), label, key,
+                     (float)atof(shadow_page_kv_get(kv, nkv, "min")),
+                     (float)atof(shadow_page_kv_get(kv, nkv, "max")),
+                     atoi(shadow_page_kv_get(kv, nkv, "pct")));
+        } else if (strcmp(type, "toggle") == 0) {
+            add_toggle(cx, cy, label, key, atoi(shadow_page_kv_get(kv, nkv, "on")));
+        } else if (strcmp(type, "button") == 0) {
+            add_button(cx, cy, label, key);
+        } else if (strcmp(type, "enum_h") == 0 || strcmp(type, "enum_v") == 0) {
+            char optbuf[128];
+            strncpy(optbuf, shadow_page_kv_get(kv, nkv, "options"), sizeof(optbuf) - 1);
+            optbuf[sizeof(optbuf) - 1] = 0;
+            const char *opts[MAX_OPTIONS];
+            int n_opts = 0;
+            for (char *tok = strtok(optbuf, ","); tok && n_opts < MAX_OPTIONS; tok = strtok(NULL, ",")) {
+                opts[n_opts++] = shadow_page_pool_store(tok);
+            }
+            add_enum(cx, cy, strcmp(type, "enum_h") == 0 ? W_ENUM_H : W_ENUM_V, label, key,
+                     opts, n_opts, atoi(shadow_page_kv_get(kv, nkv, "active")));
+        } else {
+            logline("shadow_page[%s]: unknown widget type '%s' -- ignored", path, type);
+            continue;
+        }
+
+        /* Snapshot this tab's result so far -- cheap (a plain struct
+         * copy of small, bounded arrays), and simpler than tracking
+         * exactly when a [tab] section ends (the next [tab ...] line,
+         * or end of file). */
+        tab_snapshot_t *snap = &data_addon_tabs[slot][in_tab];
+        snap->n_widgets = n_page_widgets;
+        memcpy(snap->widgets, page_widgets, sizeof(ui_widget_t) * (size_t)n_page_widgets);
+        snap->n_frames = n_page_frames;
+        memcpy(snap->frames, page_frames, sizeof(ui_frame_t) * (size_t)n_page_frames);
+    }
+
+    if (slot < 0 || parsed.num_tabs == 0) {
+        logline("shadow_page[%s]: no valid page= line or no tabs found -- ignoring file", path);
+        return;
+    }
+    parsed.build_tab = generic_data_driven_build_tab;
+    addon_table[slot] = parsed;
+    logline("shadow_page[%s]: loaded addon slot %d ('%s'), %d tab(s)",
+             path, slot, parsed.display_name, parsed.num_tabs);
+}
+
+/* Scans every AddOns/<name>/ directory for a SHADOW_PAGE_CONF_NAME file
+ * and parses each one found, populating any addon_table[] slot still at
+ * its zero-initialized default (a hand-tuned compile-time entry, should
+ * one ever exist again, always wins -- see parse_shadow_page_conf()'s
+ * own check). Called once from do_lazy_setup(), before shadow_ready is
+ * ever set true, so there's no concurrency concern reusing the
+ * page_widgets[]/page_frames[] scratch arrays here the same way a normal
+ * tab switch does during ordinary operation. mmPath is read from
+ * /dev/shm/.mmPath (the same file every MockbaMod shell script sources
+ * via env.sh) rather than hardcoded, so this isn't tied to one device's
+ * own serial
+ * number the way this file's compile-time Maze Voice entry still is. */
+static void discover_data_driven_addons(void) {
+    FILE *mp = fopen("/dev/shm/.mmPath", "r");
+    if (!mp) return;
+    char mm_path[128] = {0};
+    if (!fgets(mm_path, sizeof(mm_path), mp)) { fclose(mp); return; }
+    fclose(mp);
+    char *nl = strchr(mm_path, '\n');
+    if (nl) *nl = 0;
+
+    char addons_dir[192];
+    snprintf(addons_dir, sizeof(addons_dir), "%s/AddOns", mm_path);
+    DIR *d = opendir(addons_dir);
+    if (!d) return;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char conf_path[256];
+        snprintf(conf_path, sizeof(conf_path), "%s/%s/%s", addons_dir, de->d_name, SHADOW_PAGE_CONF_NAME);
+        FILE *f = fopen(conf_path, "r");
+        if (!f) continue;
+        parse_shadow_page_conf(f, conf_path);
+        fclose(f);
+    }
+    closedir(d);
 }
 
 static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t *f) {
@@ -960,14 +1198,14 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     fill_rect_land(map, stride_px, 0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     fill_rect_land(map, stride_px, 0, TOPBAR_H, LAND_W, 1, PLATE_LINE);
     char title[40];
-    snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name ? ad->display_name : "");
+    snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
     draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
 
     /* Engine on/off (2026-09-19): replaces the old static "LIVE" text --
      * dim/grey when the engine's off, lit accent when it's on, matching
      * this project's own web GUIs' toggle convention. Only drawn for an
      * addon that actually has an engine to control. */
-    if (ad->engine_process_name) {
+    if (ad->engine_process_name[0]) {
         uint32_t bg = engine_on_snap ? UI_ACCENT : PLATE_LINE;
         uint32_t fg = engine_on_snap ? UI_INK : UI_INK_FAINT;
         fill_rect_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bg);
@@ -1129,6 +1367,7 @@ static int setup_fd = -1; /* set just before triggering setup_once */
 static void do_lazy_setup(void) {
     int fd = setup_fd;
     logline("first real atomic commit seen on fd=%d -- running one-time setup", fd);
+    discover_data_driven_addons();
     resolve_plane_and_props(fd);
     if (plane_obj_id && fb_id_prop_id) {
         create_shadow_buffer(fd);
@@ -1317,7 +1556,7 @@ static void poll_toggle(void) {
         shadow_redraw_needed = 1;
     }
     shadow_on = (active_addon != ADDON_NONE);
-    engine_on = (active_addon != ADDON_NONE && addon_table[active_addon].engine_process_name)
+    engine_on = (active_addon != ADDON_NONE && addon_table[active_addon].engine_process_name[0])
                     ? is_process_running(addon_table[active_addon].engine_process_name)
                     : 0;
 }
@@ -1542,7 +1781,7 @@ static int is_process_running(const char *name) {
 #define NODESERVER_PORT 8080
 static void send_engine_toggle(int addon_id, int want_running) {
     const addon_descriptor_t *ad = &addon_table[addon_id];
-    if (!ad->engine_process_name || !ad->engine_nsmodule_path) {
+    if (!ad->engine_process_name[0] || !ad->engine_nsmodule_path[0]) {
         logline("engine_toggle: addon %d has no engine configured -- dropped", addon_id);
         return;
     }
@@ -1719,7 +1958,7 @@ static void update_touch_state(const struct input_event *ev) {
         const addon_descriptor_t *ad_active = &addon_table[active_addon];
         int32_t tabbar_y = LAND_H - TABBAR_H;
         int num_tabs = ad_active->num_tabs;
-        if (ad_active->engine_process_name &&
+        if (ad_active->engine_process_name[0] &&
             lpx >= ENGINE_BTN_X && lpx <= ENGINE_BTN_X + ENGINE_BTN_W &&
             lpy >= ENGINE_BTN_Y && lpy <= ENGINE_BTN_Y + ENGINE_BTN_H) {
             /* Optimistic flip for instant visual feedback -- poll_toggle()'s

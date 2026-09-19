@@ -2156,34 +2156,117 @@ tally in "Not yet done" below, now due for an update).
 `engine_*` fields and its own `SHIFT+SCENE-N` rebind, nothing else. See
 `docs/adding-a-page.md`'s own updated sections for the full how-to.
 
+## Live load test #22 (2026-09-19): per-addon data-driven pages, a real parsing bug found live, and Maze Voice's own page ported to prove it
+
+Implemented the first "Not yet done" idea from the previous session's
+own user-raised scope items: decoupling a page's *definition* from
+`force_shadow.c` itself, so a new addon's page ships in that addon's own
+repo/install (`shadow_page.conf`, next to its `NSMODULE.json`) instead
+of requiring a ForceShadow edit-rebuild-redeploy cycle.
+
+**Format chosen with the user, not assumed**: asked directly (JSON vs. a
+small custom format) rather than picking unilaterally, since it shapes
+how every future page gets authored. Landed on a custom line-oriented
+format (`key=value` lines, `[tab <name>]` sections, quoted values for
+anything with a space) — no escaping edge cases, no new dependency,
+matches this project's own hand-rolled-everything ethos (the DRM
+structs, the bitmap font) more than reaching for a real JSON parser
+would.
+
+**`addon_descriptor_t` converted from `const char *` fields to fixed
+char arrays** (`ctrl_sock[64]`, `display_name[24]`, `engine_*[...]`,
+etc.) — a real, deliberate change, not cosmetic: a `const char *`
+pointing into a parsed file's own scratch buffer would dangle once that
+buffer's reused for the next line; an embedded array owns its own
+storage. `addon_table[]` itself dropped `const` (a data-driven slot gets
+filled in at runtime) but stays empty at compile time by default.
+
+**Parser** (`shadow_page_tokenize()`, `shadow_page_split_all()`/
+`shadow_page_kv_get()`, `parse_shadow_page_conf()`,
+`discover_data_driven_addons()`): reads every `AddOns/<name>/
+shadow_page.conf` found (via `/dev/shm/.mmPath`, not a hardcoded serial
+number) once at setup, and — critically — calls the *real*
+`add_knob()`/`add_toggle()`/`add_button()`/`add_enum()`/`add_frame()`
+builder functions per widget line (the exact same ones a compile-time
+page uses), captures the resulting `page_widgets[]`/`page_frames[]` into
+a per-(addon,tab) `tab_snapshot_t`, then a new
+`generic_data_driven_build_tab()` copies a stored snapshot back in
+whenever that tab is shown. This means the geometry/hit-box math (knob
+hit radius, enum segment layout) is never reimplemented for the
+data-driven path — only parsed data flows through it.
+
+**Proved first on a brand-new addon (DX7), deliberately minimal**: 4 of
+its own real `module.json` params (`output_level`, `algorithm`,
+`feedback`, `octave_transpose`), knobs only (DX7's own `dx7_host.cpp`
+uses plain `atoi()` for every param, confirmed by reading it, so this
+avoided also having to solve a toggle value-convention question in the
+same pass). **Loaded correctly on the very first attempt** — the
+discovery/parsing infrastructure itself had no bugs.
+
+**A real, distinct bug found live in the per-widget field parsing,
+not the discovery mechanism**: DX7's knobs rendered ("don't look like
+knobs... didn't try interacting") with every field *after* `label`/`key`
+in file order (`r`, `min`, `max`, `pct`) silently zeroed. Root-caused by
+adding a temporary raw-token dump (confirmed tokenizing itself was
+byte-perfect) before suspecting the lookup helper itself: the original
+`shadow_page_kv_get()` split each candidate token *lazily*, in place,
+scanning from the start on every single field lookup — meaning looking
+up `label` (which requires scanning past `r=50` first) silently
+mutated (and thereby permanently broke) `r`'s own token as a side
+effect, before `r` was ever actually queried for itself. A lookup
+helper that mutates the data it's repeatedly searching, as a side
+effect of the search itself, is the general lesson -- fixed by splitting
+every token exactly once up front (`shadow_page_split_all()`) into a
+parallel key/value array, making every subsequent lookup a pure,
+order-independent read. Confirmed by re-deploying with a one-line
+verification log: every field came back correct on the first try after
+the fix.
+
+**Then ported Maze Voice itself** — this table's one compile-time
+occupant until now — to prove the loader against a real, already-fully-
+live-tested 3-tab page, not just a new minimal one. Extracted every
+position/range value from the *real* C layout code's own computed
+output (a temporary `dump_maze_voice_layout_TEMP()`, called once,
+capturing `build_maze_voice_tab()`'s exact `page_widgets[]`/
+`page_frames[]` for all 3 tabs in `.conf` syntax directly to the log),
+rather than re-deriving the same arithmetic by hand a second time and
+risking a transcription error. Removed `build_maze_voice_tab()` and its
+compile-time `addon_table[]` registration entirely afterward (along
+with the temporary dump function) — `addon_table[]` is now empty at
+compile time, Maze Voice included.
+
+**Confirmed live, end to end, on the real page**: all 3 tabs render and
+switch correctly; the engine button starts/stops `maze_host` via the
+same `/moduler` HTTP mechanism as before; a knob drag (`vco_tune`) sends
+correct, scaled `SET` commands with clean `OK` replies; the Generate
+button (`rnd_go`) and toggles (`rnd_tone`, `rnd_filter`) all dispatch
+correctly. User: "yes looks good." Both `.conf` files (Maze Voice's full
+one, DX7's minimal one) were also committed into their own addon repos
+(`force-maze/maze-voice/addon/`, `force-dx7/addon/`), not left in
+ForceShadow's own tree — the whole point of this work.
+
+**DX7's own page deliberately left minimal, not fully built out** (user:
+"park fully developing the DX7 gui for later") — 4 params proves the
+loader; a complete page covering DX7's real full parameter set is
+separate future work, not started here.
+
+Also hit, twice more this session, the same two already-catalogued
+platform issues: the boot-time `LD_PRELOAD` race (live load test #19's
+own mitigation — retry with `systemctl restart acvs` — worked both
+times) and a WiFi/ethernet drop mid-deploy (self-resolved once
+reachable again, no lasting harm).
+
 ## Not yet done
 
-- **Per-addon data-driven GUI** — user-raised (2026-09-19): today
-  `addon_table[]` and every `build_<addon>_tab()` live inside
-  `force_shadow.c` itself, so adding a page for a new addon means
-  editing, rebuilding, and redeploying ForceShadow, not something the
-  addon's own repo/install can carry on its own. Scope: define a small
-  per-addon page-definition file (its `ctrl_sock`/engine fields plus a
-  list of tabs, each a list of widgets with kind/position/key/range/
-  options) shipped in that addon's own folder (e.g.
-  `AddOns/<Addon>/shadow_page.<ext>`); `force_shadow.so` scans for these
-  at setup and builds `addon_table[]` from them at runtime instead of
-  compile time. The rendering engine and touch hit-testing can't move
-  out (they own the DRM buffer and touch device directly) -- only the
-  "what to draw" data moves per-addon. A nice side effect: `tools/
-  render_preview.c` could consume the exact same file, closing the "two
-  copies of every layout, kept in sync by hand" gap that exists today
-  between it and `force_shadow.c`'s own `build_<addon>_tab()` functions.
-  Open question, deliberately not settled yet: JSON (more "standard,"
-  needs either vendoring a tiny parser like `jsmn` or hand-rolling one)
-  vs. a simpler custom line-oriented format (zero parsing risk, no
-  escaping, trivially hand-editable, no new dependency -- more in
-  keeping with this project's own hand-rolled-everything ethos, e.g.
-  the DRM structs and the bitmap font). Effort: medium, comparable in
-  size to live load test #20's active-addon-selector work. Risk of
-  locking in a schema before it's proven against real, varied needs --
-  worth building one or two more pages the current (hardcoded) way
-  first if that hasn't already happened by the time this is picked up.
+- ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real
+  `shadow_page.conf` format (custom line-oriented, chosen with the user
+  over JSON), discovered per-addon at setup, proven on a new addon (DX7,
+  minimal) and then on Maze Voice's own full real page (ported from
+  compile-time C, which no longer exists in `addon_table[]` at all). See
+  `docs/adding-a-page.md`'s own "The page file format" section.
+  `tools/render_preview.c` still keeps its own independent layout
+  copies, not the same file, for now -- a real follow-up, not done in
+  this pass.
 - **Anti-aliased rendering** — user-raised (2026-09-19), same
   conversation: the current renderer is deliberately minimal (flat-
   filled shapes, an 8x8 1-bit bitmap font, zero anti-aliasing) -- that's
@@ -2217,19 +2300,19 @@ tally in "Not yet done" below, now due for an update).
   same-boot restarts, not a real reproducible defect. Buffer cache
   coherency is no longer suspected as a result; no separate investigation
   needed there.
-- **Investigate the WiFi/ethernet drop pattern** — now at least five
+- **Investigate the WiFi/ethernet drop pattern** — now at least six
   occurrences across live testing (live load test #5, #8, #16's retest,
-  and two more during #21's own session), zero during idle periods,
-  still no confirmed causal mechanism despite this doc's own "look for a
-  common trigger on the third occurrence" checkpoint having long since
-  passed. Every occurrence happened during active touch/redraw testing,
-  every one self-resolved (device came back reachable without
-  intervention or, at worst, a power cycle), none left the device in a
-  bad state once reconnected. Treated as known, recoverable flakiness of
-  this test setup rather than a blocker for now — genuinely worth a
-  focused investigation on its own terms at some point, since "still no
-  trigger found" after five occurrences is no longer a coincidence, just
-  not something to chase mid-feature-work.
+  two during #21's own session, one more during #22's), zero during idle
+  periods, still no confirmed causal mechanism despite this doc's own
+  "look for a common trigger on the third occurrence" checkpoint having
+  long since passed. Every occurrence happened during active
+  touch/redraw testing, every one self-resolved (device came back
+  reachable without intervention or, at worst, a power cycle), none left
+  the device in a bad state once reconnected. Treated as known,
+  recoverable flakiness of this test setup rather than a blocker for now
+  — genuinely worth a focused investigation on its own terms at some
+  point, since "still no trigger found" after six occurrences is no
+  longer a coincidence, just not something to chase mid-feature-work.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   recurred in live load test #17: mid-test, the user couldn't get back to
   the normal MPC UI on the device itself to route a MIDI track (the real

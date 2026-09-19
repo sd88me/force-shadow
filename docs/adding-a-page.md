@@ -1,15 +1,26 @@
 # Adding a new shadow-mode control page
 
-Practical reference for building another addon's shadow-mode page (DX7,
-JV-880, Maze Sequencer, Acid Sequencer, Euclidier, Riffmaker — the 6
-slots already reserved in `KNOBS+SCENE-1/2/4/5/6/7`, currently all safe
-no-ops), based on how Maze Voice's own 3-page UI was actually built.
-`DESIGN.md` is the chronological research log (read it for *why* things
-work the way they do, and for the incident history behind every
-non-obvious constant in this file); this doc is the distilled *how*.
+Practical reference for building another addon's shadow-mode page (JV-880,
+Maze Sequencer, Acid Sequencer, Euclidier, Riffmaker — the slots already
+reserved in `KNOBS+SCENE-N`, currently all safe no-ops; DX7 has a minimal
+proof-of-concept page, Maze Voice has its full real one). `DESIGN.md` is
+the chronological research log (read it for *why* things work the way
+they do, and for the incident history behind every non-obvious constant);
+this doc is the distilled *how*.
 
-**Read this whole doc before writing code.** The single biggest thing to
-understand up front is the next section.
+**A page is a plain text file the addon ships itself, not C code you add
+here.** `force-maze/maze-voice/addon/shadow_page.conf` (the full, real,
+live-tested example — 3 tabs, every widget kind) and
+`force-dx7/addon/shadow_page.conf` (a minimal 4-knob one) are the two
+real references — read one of those alongside this doc, not instead of
+it. See "The page file format" below for the full spec. A compile-time
+C function is still supported for a layout that genuinely needs real
+code (a loop over a params array, say) — see "The two-layer page model"
+and "The widget system" below — but it's the exception now, not the
+default.
+
+**Read this whole doc before writing anything.** The single biggest
+thing to understand up front is the next section.
 
 ## The two-layer page model
 
@@ -43,43 +54,94 @@ registry:
 #define ADDON_RIFFMAKER  7
 
 typedef struct {
-    const char *ctrl_sock;      /* this addon's own control-socket path */
-    const char *display_name;   /* shown in the top bar, e.g. "MAZE VOICE" */
+    char ctrl_sock[64];        /* this addon's own control-socket path */
+    char display_name[24];     /* shown in the top bar, e.g. "MAZE VOICE" */
     int num_tabs;
-    const char *tab_names[MAX_TABS];
+    char tab_names[MAX_TABS][24];
     void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
 
-    /* Engine on/off button, see its own section below. NULL
-     * engine_process_name = no button drawn for this addon. */
-    const char *engine_process_name;
-    const char *engine_nsmodule_path;
-    const char *engine_dirname;
-    const char *engine_arguments_json;
+    /* Engine on/off button, see its own section below.
+     * engine_process_name[0]==0 = no button drawn for this addon. */
+    char engine_process_name[32];
+    char engine_nsmodule_path[160];
+    char engine_dirname[32];
+    char engine_arguments_json[768];
 } addon_descriptor_t;
 
-static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
-    [ADDON_MAZE_VOICE] = {
-        .ctrl_sock = "/tmp/maze_ctrl.sock",
-        .display_name = "MAZE VOICE",
-        .num_tabs = 3,
-        .tab_names = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
-        .build_tab = build_maze_voice_tab,
-        .engine_process_name = "maze_host",
-        .engine_nsmodule_path = "/media/662522/AddOns/ForceMazeVoice/NSMODULE.json",
-        .engine_dirname = "ForceMazeVoice",
-        .engine_arguments_json = "[{...copy verbatim from that NSMODULE.json's ARGUMENTS...}]",
-    },
-    /* your new addon's entry goes here */
-};
+/* Empty at compile time (2026-09-19, live load test #22 -- Maze Voice,
+ * this table's only occupant until then, has since been ported to its
+ * own shadow_page.conf). discover_data_driven_addons() fills in any
+ * slot still at its zero-initialized default from a real file on disk
+ * -- see "The page file format" below. A hand-tuned compile-time entry
+ * here would still always win over a same-numbered file, for a layout
+ * that genuinely needs real code -- fixed-size char arrays, not
+ * `const char *`, since a data-driven entry's strings come from a
+ * parsed file, not a string literal with the whole process's lifetime. */
+static addon_descriptor_t addon_table[NUM_ADDON_SLOTS];
 ```
 
-**Adding a second real addon page is now purely additive** — one new
-`addon_table[]` entry plus a `build_<addon>_tab()` function. You do
-*not* need to touch `poll_toggle()`, `render_shadow_page()`, or the DSP
-send path (`send_ctrl_set()`) — all three already dispatch generically
-over `addon_table[active_addon]`. A slot with no entry (`NULL
-build_tab`, the default for a zeroed array element) stays a safe,
-silent no-op, exactly like every reserved-but-unbuilt slot today.
+**Adding a new addon page is purely additive** — ship its own
+`shadow_page.conf` (see below), or, for the rarer case a layout needs
+real code, one new `addon_table[]` initializer entry plus a
+`build_<addon>_tab()` function. Either way you do *not* need to touch
+`poll_toggle()`, `render_shadow_page()`, or the DSP send path
+(`send_ctrl_set()`) — all three already dispatch generically over
+`addon_table[active_addon]`. A slot with no entry (`NULL build_tab`, the
+default for a zeroed array element) stays a safe, silent no-op, exactly
+like every reserved-but-unbuilt slot today.
+
+## The page file format
+
+A `shadow_page.conf` file, dropped in that addon's own AddOns folder
+(next to its `NSMODULE.json`) and discovered automatically at startup
+(`discover_data_driven_addons()`, `src/force_shadow.c`) — no ForceShadow
+rebuild or redeploy needed for a new page, only for the rendering engine
+itself. Deliberately a small custom line-oriented format, not JSON: this
+project already hand-rolls everything it touches (the DRM structs, the
+bitmap font, the trig tables) rather than reach for a library, and a
+real JSON parser (nested objects/arrays, string escaping) is a lot of
+new surface area for a benefit — interop with other JSON tooling —
+nothing on this device actually needs.
+
+```
+# comments and blank lines ignored
+page=<1-7, must match a KNOBS+SCENE-N/SHIFT+SCENE-N slot>
+ctrl_sock=<path>
+display_name=<shown in the top bar; quote it if it has a space>
+engine_process_name=<PROCESSNAME -- omit the whole engine_* block for no button>
+engine_nsmodule_path=<absolute path to that addon's own NSMODULE.json>
+engine_dirname=<DIRNAME>
+engine_arguments_json=<that NSMODULE.json's ARGUMENTS array, verbatim, one line>
+
+[tab <name>]
+frame x=<n> y=<n> w=<n> h=<n> title="<text>"
+knob cx=<n> cy=<n> r=<n> label="<text>" key=<name> min=<f> max=<f> pct=<0-100>
+toggle cx=<n> cy=<n> label="<text>" key=<name> on=<0|1>
+button cx=<n> cy=<n> label="<text>" key=<name>
+enum_h cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
+enum_v cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
+```
+
+Repeat `[tab ...]` for each tab, in the order they should appear. Values
+with a space (labels, titles, options lists, a multi-word
+`display_name`) take double quotes; everything else is a bare token.
+`engine_arguments_json`'s own value is the one exception that must
+**not** be quoted the normal way — it's raw JSON, full of its own
+embedded quotes, and is parsed as a special-cased "rest of the line" —
+just paste the `NSMODULE.json` `ARGUMENTS` array in as one line, quotes
+and all.
+
+**Getting the numbers right**: hand-deriving pixel positions is
+error-prone once a layout has more than a couple of widgets. When
+porting an existing compile-time page (as Maze Voice's own conversion
+did), the reliable way is a temporary debug dump — call the real
+`build_<addon>_tab()` for each tab and log every `page_widgets[]`/
+`page_frames[]` entry's own fields in this file's own syntax, so the
+`.conf` file is transcribed from the layout code's actual computed
+output, not re-derived by hand (see `DESIGN.md`'s "Live load test #22"
+for exactly how that dump was done and removed again afterward). For a
+brand new page, `tools/render_preview.c` (see "Test offline first"
+below) serves the same "see the real numbers before trusting them" role.
 
 ## The hardware combo: SHIFT+SCENE-N opens the page (2026-09-19)
 
@@ -114,7 +176,7 @@ reclaimed — both combos open the same page.
 
 `render_shadow_page()` draws a real button in the top-right of the top
 bar (`ENGINE_BTN_X/Y/W/H`) whenever `addon_table[active_addon]
-.engine_process_name` is non-`NULL` — dim/grey (`PLATE_LINE` background,
+.engine_process_name[0]` is set — dim/grey (`PLATE_LINE` background,
 `UI_INK_FAINT` text) when the engine's off, lit (`UI_ACCENT` background,
 `UI_INK` text) when it's on. `update_touch_state()` hit-tests it
 alongside (not as part of) the tab bar and generic widget system, since
@@ -209,14 +271,17 @@ void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title);
   `"VCW>VCF"`/`"Parallel"`/`"VCF>VCW"`, read directly from
   `maze_host.cpp`, not paraphrased).
 
-A `build_tab()`-style function for a new addon looks like
-`build_maze_voice_tab()` (~line 739): reset the widget/frame arrays, lay
-out `add_frame()` sections, then call `add_knob`/`add_toggle`/etc. in
-reading order. See `src/force_shadow.c`'s own body (the `if (page ==
-0)`/`else if (page == 1)`/... branches) for three real, working examples
-(the Voice / WaveFolder-Filter / Mod-Random-Mix tabs) to copy the style
-from. Register the finished function in `addon_table[]` (see above) —
-that's what actually makes it reachable.
+These are exactly the fields a `.conf` file's own `knob`/`toggle`/
+`button`/`enum_h`/`enum_v` lines map onto (`parse_shadow_page_conf()`
+calls these same functions, one per widget line) — write your addon's
+page as a `.conf` file (see "The page file format" above) and you're
+using this same builder API already, just without touching C at all. A
+`build_tab()`-style C function calling these directly is only needed for
+the rarer case a layout genuinely can't be expressed as a flat list of
+widgets (a loop over a params array, computed per-row positions, etc.) —
+`generic_data_driven_build_tab()` (`src/force_shadow.c`) is the generic
+one every `.conf`-driven addon actually uses; write your own only if you
+need one.
 
 ## Finding the target addon's own parameters and control protocol
 
@@ -322,13 +387,17 @@ screen/pads/touch/audio normal at every step and after every revert.
    value convention per key — don't assume uniformity, and don't assume
    it matches Maze Voice's `mix.enabled` quirk or any other addon's.
 3. Write the layout in `tools/render_preview.c` first, verify visually.
-4. Port the verified layout into `force_shadow.c` as a new
-   `build_<addon>_tab()` function, and add its entry to `addon_table[]`
-   (`ctrl_sock`, `display_name`, `num_tabs`, `tab_names[]`, the function
-   pointer, plus the four `engine_*` fields copied verbatim from that
-   addon's own `NSMODULE.json` if it should get an on/off button). That's
-   the entire integration — `poll_toggle()`, `render_shadow_page()`, and
-   `send_ctrl_set()` all pick it up automatically.
+4. Write the verified layout as that addon's own `shadow_page.conf`
+   ("The page file format" above), deployed to its own AddOns folder —
+   `ctrl_sock`, `display_name`, tabs and widgets, plus the four
+   `engine_*` fields copied verbatim from that addon's own
+   `NSMODULE.json` if it should get an on/off button. That's the entire
+   integration — `discover_data_driven_addons()`, `poll_toggle()`,
+   `render_shadow_page()`, and `send_ctrl_set()` all pick it up
+   automatically, no `force_shadow.c` edit needed at all. (Only reach
+   for a real `build_<addon>_tab()` C function + `addon_table[]`
+   initializer if the layout genuinely needs code — a loop over a
+   params array, say.)
 5. If this addon currently uses `SHIFT+SCENE-N` to start/stop its engine
    directly, rebind that line in `midiloop.config` to point at the same
    `SCRIPT-N` its `KNOBS+SCENE-N` page-toggle already uses — see "The
