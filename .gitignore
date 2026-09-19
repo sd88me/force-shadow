@@ -10,3 +10,4 @@ tools/seq_dump_ioctl.so
 tools/render_preview
 tools/preview*.ppm
 tools/preview*.png
+tools/seq_watch
