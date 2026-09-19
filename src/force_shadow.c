@@ -591,6 +591,23 @@ static void draw_ring_land(uint32_t *map, uint32_t stride_px,
         }
 }
 
+typedef struct {
+    uint32_t plate_bg, plate_hi, plate_line, ink, ink_dim, ink_faint;
+    uint32_t accent, accent_hi, knob_face, knob_ring, bar_bg;
+    uint32_t seg_active, seg_inactive, seg_active_tx, btn_text;
+    uint32_t well, knob_off, tab_on_bg, lcd_bg;
+    int lcd;
+} ui_theme_t;
+
+static const ui_theme_t THEME_DEFAULT = {
+    0xFF131211u, 0xFF1C1A17u, 0xFF2A2823u, 0xFFEFE9D8u, 0xFF8F8878u, 0xFF5C584Cu,
+    0xFFC1552Fu, 0xFFE2793Fu, 0xFFEFE9D8u, 0xFF2A2823u, 0xFF0D0C0Au,
+    0xFFF2F1EEu, 0xFF050403u, 0xFF1C1A17u, 0xFFFDF3EAu,
+    0xFF050403u, 0xFF4C473Du, 0xFF1A120Du, 0xFF050403u,
+    0
+};
+static ui_theme_t th;  /* active theme; render_shadow_page() sets it per addon */
+
 /* ---- Text (font8x8.h) ----
  * Verified offline via tools/render_preview.c -- a host-side tool that
  * shares these exact drawing semantics (put_px vs put_px_land is the
@@ -718,22 +735,7 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
  * points at the addon being drawn -- so every existing draw call is
  * untouched. `lcd` switches the widget *style* (dotted-arc dark knobs,
  * LCD-well readouts, bracketed frames), not just the colours. */
-typedef struct {
-    uint32_t plate_bg, plate_hi, plate_line, ink, ink_dim, ink_faint;
-    uint32_t accent, accent_hi, knob_face, knob_ring, bar_bg;
-    uint32_t seg_active, seg_inactive, seg_active_tx, btn_text;
-    uint32_t well, knob_off, tab_on_bg, lcd_bg;
-    int lcd;
-} ui_theme_t;
 
-static const ui_theme_t THEME_DEFAULT = {
-    0xFF131211u, 0xFF1C1A17u, 0xFF2A2823u, 0xFFEFE9D8u, 0xFF8F8878u, 0xFF5C584Cu,
-    0xFFC1552Fu, 0xFFE2793Fu, 0xFFEFE9D8u, 0xFF2A2823u, 0xFF0D0C0Au,
-    0xFFF2F1EEu, 0xFF050403u, 0xFF1C1A17u, 0xFFFDF3EAu,
-    0xFF050403u, 0xFF4C473Du, 0xFF1A120Du, 0xFF050403u,
-    0
-};
-static ui_theme_t th;  /* active theme; render_shadow_page() sets it per addon */
 
 #define PLATE_BG      (th.plate_bg)
 #define PLATE_HI      (th.plate_hi)
