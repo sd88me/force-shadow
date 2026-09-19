@@ -51,6 +51,8 @@ unlock_preload() { rmdir "$PRELOAD_LOCK" 2>/dev/null; }
 
 STOP() {
     rm -f /tmp/force_shadow_on /tmp/force_shadow_page
+    kill $(cat /tmp/force_shadow_exitwatch.pid 2>/dev/null) 2>/dev/null
+    rm -f /tmp/force_shadow_exitwatch.pid
     lock_preload
     if [ -f "$mmLD_PRELOAD_VAR" ]; then
         cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v force_shadow.so | tr "\n" " " > /tmp/.p.$$

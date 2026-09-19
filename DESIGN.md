@@ -1596,15 +1596,33 @@ assumption:
    means and how little would be gained by confirming a mechanism this
    project has no intention of trying to bypass either way.
 
-**Where this leaves the feature**: not fixable from userspace on this
-device without linking `libasound` directly (the one approach not yet
-tried -- trading away the project's clean `libc`/`libpthread`/`libdl`-
-only dependency profile for a proven-working code path, since
-`arecordmidi`/`midiloop` both succeed via a properly-linked `libasound`
-rather than raw ioctls). Whether that tradeoff is worth it for this one
-feature is an open product decision, not a technical one -- deferred,
-not abandoned. The same-combo-toggle (`KNOBS+SCENE-N` again) already
-provides a full, working exit path in the meantime.
+**Resolved 2026-09-19 (option 4: separate helper process).** The "not
+fixable from userspace" conclusion above was too strong. Findings:
+
+- `aseqdump` is not installed on the device (only `aconnect`, `amidi`,
+  `aplaymidi`, `arecordmidi`), and `arecordmidi` can subscribe to the
+  Private port but writes its SMF only at exit, so it can't stream.
+- A client properly linked against the device's own `/lib/libasound.so.2`
+  creates its port and subscribes to "Akai Pro Force Private" with no
+  `EPERM` (`tools/seq_watch.c`). The raw-ioctl `EPERM` therefore was about
+  the hand-rolled client, not a blanket block on this process.
+- The Private port's client number is not stable (20:1 in the earlier
+  session, 24:1 now), so it is looked up by name.
+- Live-captured button notes on that port (ch 0, note-on vel 127 / off
+  vel 0): MENU=2, LOAD=35, SAVE=36, MATRIX=3, CLIP=9, MIXER=11,
+  NAVIGATE=0, KNOBS=1.
+
+`src/exit_watch.c` -> `addon/force_shadow_exitwatch` is a small separate
+armv7 process, started by `run_ForceShadow.sh` (pidfile
+`/tmp/force_shadow_exitwatch.pid`, stopped on `kill`/`STOP`). It removes
+`/tmp/force_shadow_on` and `/tmp/force_shadow_page` on those presses. It
+runs outside MPC on purpose, so `force_shadow.so` keeps its libc-only
+profile and a helper crash can't affect MPC. KNOBS is also the modifier of
+the KNOBS+SCENE-N combo, so it exits on release, and only if no other note
+arrived while held (otherwise the combo's SCENE-N press would reopen the
+page). Live-verified: MENU exits shadow mode. The other buttons and the
+KNOBS rule are untested live. Build: same armv7 Debian container as the
+`.so`, plus `libasound2-dev`, `-lasound`.
 
 ## The real Maze Voice control pages (2026-09-18, compiled offline, not yet loaded live)
 

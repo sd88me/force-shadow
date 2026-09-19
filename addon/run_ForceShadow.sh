@@ -47,6 +47,8 @@ unlock_preload() { rmdir "$PRELOAD_LOCK" 2>/dev/null; }
 # boot.sh calls addon scripts with "kill" on shutdown/restart - full teardown.
 if [ "$1" = "kill" ]; then
     rm -f /tmp/force_shadow_on /tmp/force_shadow_page
+    kill $(cat /tmp/force_shadow_exitwatch.pid 2>/dev/null) 2>/dev/null
+    rm -f /tmp/force_shadow_exitwatch.pid
     lock_preload
     if [ -f "$mmLD_PRELOAD_VAR" ]; then
         cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v force_shadow.so | tr "\n" " " > /tmp/.p.$$
@@ -65,3 +67,13 @@ else
     echo "$LIB" > "$mmLD_PRELOAD_VAR"
 fi
 unlock_preload
+
+# ── Exit-on-button helper (separate process, not inside MPC) ──
+# Leaves shadow mode when MENU/LOAD/SAVE/MATRIX/CLIP/MIXER/NAVIGATE/KNOBS
+# is pressed. Harmless while shadow mode is off (just removes absent files).
+EW="$APPDIR/force_shadow_exitwatch"
+if [ -x "$EW" ]; then
+    kill $(cat /tmp/force_shadow_exitwatch.pid 2>/dev/null) 2>/dev/null
+    nohup "$EW" >/dev/null 2>&1 &
+    echo $! > /tmp/force_shadow_exitwatch.pid
+fi

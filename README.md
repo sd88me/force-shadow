@@ -67,6 +67,10 @@ Writes `src/force_shadow.so` — copy it into `addon/force_shadow.so` before
 deploying (see below). Dependency profile stays exactly `libc`/`libpthread`/
 `libdl` — confirmed after every change that's touched this file.
 
+Exit helper (`src/exit_watch.c` -> `addon/force_shadow_exitwatch`), built the
+same way in an armv7 Debian bookworm container with `libasound2-dev`
+installed: `gcc -O2 -Wall -o addon/force_shadow_exitwatch src/exit_watch.c -lasound && strip addon/force_shadow_exitwatch`.
+
 ## Deploy / enable
 
 ```bash
