@@ -2,65 +2,78 @@
 
 Practical reference for building another addon's shadow-mode page (DX7,
 JV-880, Maze Sequencer, Acid Sequencer, Euclidier, Riffmaker — the 6
-slots already reserved in `KNOBS+SCENE-1/2/4/5/6/7` and `PAGE_NAMES`-style
-comments, currently all safe no-ops), based on how Maze Voice's own
-3-page UI was actually built. `DESIGN.md` is the chronological research
-log (read it for *why* things work the way they do, and for the incident
-history behind every non-obvious constant in this file); this doc is the
-distilled *how*.
+slots already reserved in `KNOBS+SCENE-1/2/4/5/6/7`, currently all safe
+no-ops), based on how Maze Voice's own 3-page UI was actually built.
+`DESIGN.md` is the chronological research log (read it for *why* things
+work the way they do, and for the incident history behind every
+non-obvious constant in this file); this doc is the distilled *how*.
 
 **Read this whole doc before writing code.** The single biggest thing to
-understand up front is the next section — get it wrong and you'll build
-something that silently never activates.
+understand up front is the next section.
 
-## The two-layer page model (important, easy to get wrong)
+## The two-layer page model
 
 There are **two independent numbering schemes** in play, and they are
 not the same thing:
 
-1. **Which addon's overlay to show** — the number MidiLoop's
-   `KNOBS+SCENE-N` combos write to `/tmp/force_shadow_page`
-   (`SHADOW_PAGE_FILE`). Today, exactly one value does anything:
-   `SHADOW_PAGE_MAZE_VOICE` (`3`) — see `poll_toggle()`
-   (`src/force_shadow.c`, ~line 1161). Every other value (`1`, `2`, `4`-
-   `7`) is written by the already-bound MidiLoop scripts but currently
-   turns shadow mode on for *nothing*, because `poll_toggle()` only
-   checks equality against that one hardcoded constant.
+1. **Which addon's overlay to show** — `active_addon`, resolved by
+   `poll_toggle()` (`src/force_shadow.c`, ~line 1214) from the number
+   MidiLoop's `KNOBS+SCENE-N` combos write to `/tmp/force_shadow_page`
+   (`SHADOW_PAGE_FILE`), validated against `addon_table[]` (see below).
 2. **Which internal tab is showing, within whichever addon is active** —
-   `current_page` (`0`/`1`/`2` for Maze Voice's own Voice/WaveFolder-
-   Filter/Mod-Random-Mix tabs), switched by tapping the on-screen tab bar
-   (`update_touch_state()`, ~line 1417) and rendered via `PAGE_NAMES[]`.
+   `current_page`, switched by tapping the on-screen tab bar
+   (`update_touch_state()`, ~line 1503) and rendered via
+   `addon_table[active_addon].tab_names[]`.
 
-**This means the current code is single-addon.** The MidiLoop bindings
-*reserve* 7 slots for 7 different addons, but the C side only knows how
-to render one of them. Adding a second real addon page is not just "add
-more widgets" — it needs a real (small) architecture change first:
+**Generalized (2026-09-19, live load test #20)** — this used to be
+single-addon (`poll_toggle()` only recognized one hardcoded page number,
+`current_page`/`PAGE_NAMES[]`/`send_maze_set()`/`MAZE_CTRL_SOCK` were all
+Maze-Voice-specific), which is what made this doc's original version of
+this section a warning rather than a description. Now there's a real
+registry:
 
-- Replace the single `shadow_on` boolean + `SHADOW_PAGE_MAZE_VOICE`
-  equality check in `poll_toggle()` with something that tracks *which*
-  addon is active (e.g. an `active_addon` enum/int, `0` = none/off).
-- Generalize `current_page`/`PAGE_NAMES[]`/`build_page()` to be
-  per-addon — the simplest approach is probably one `build_page()`-style
-  function per addon (`build_dx7_page(int tab)`, etc.) selected by
-  `active_addon`, each with its own tab count/names/widget layout,
-  rather than trying to cram every addon's tabs into one flat array.
-- Generalize `send_maze_set()`/`MAZE_CTRL_SOCK` the same way — each
-  addon has its own control socket (`/tmp/dx7_ctrl.sock`,
-  `/tmp/jv880_ctrl.sock`, confirmed running via each addon's own
-  `server.py` wrapper process) and its own key namespace. Don't hardcode
-  a second socket path alongside the first; parameterize it.
+```c
+#define ADDON_NONE       0
+#define ADDON_DX7        1
+#define ADDON_JV880      2
+#define ADDON_MAZE_VOICE 3
+#define ADDON_MAZE_SEQ   4
+#define ADDON_ACID_SEQ   5
+#define ADDON_EUCLIDIER  6
+#define ADDON_RIFFMAKER  7
 
-None of this is large, but it's real code, not just new page content —
-budget for it before diving into layout work for a new page.
+typedef struct {
+    const char *ctrl_sock;      /* this addon's own control-socket path */
+    const char *display_name;   /* shown in the top bar, e.g. "MAZE VOICE" */
+    int num_tabs;
+    const char *tab_names[MAX_TABS];
+    void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
+} addon_descriptor_t;
+
+static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
+    [ADDON_MAZE_VOICE] = { "/tmp/maze_ctrl.sock", "MAZE VOICE", 3,
+        { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
+        build_maze_voice_tab },
+    /* your new addon's entry goes here */
+};
+```
+
+**Adding a second real addon page is now purely additive** — one new
+`addon_table[]` entry plus a `build_<addon>_tab()` function. You do
+*not* need to touch `poll_toggle()`, `render_shadow_page()`, or the DSP
+send path (`send_ctrl_set()`) — all three already dispatch generically
+over `addon_table[active_addon]`. A slot with no entry (`NULL
+build_tab`, the default for a zeroed array element) stays a safe,
+silent no-op, exactly like every reserved-but-unbuilt slot today.
 
 ## The widget system
 
 Every visible, touchable thing is one `ui_widget_t` entry in a flat
 table (`page_widgets[]`, `src/force_shadow.c` ~line 585), built once per
-page/tab (not recomputed per redraw) via a `build_page()`-style
-function, and read by both the renderer and the touch hit-tester — so
-layout math exists in exactly one place and can never drift out of sync
-with what's actually tappable.
+page/tab (not recomputed per redraw) via a `build_tab()`-style function
+(one per addon, registered in `addon_table[]`), and read by both the
+renderer and the touch hit-tester — so layout math exists in exactly one
+place and can never drift out of sync with what's actually tappable.
 
 Five widget kinds, one builder function each (~line 628):
 
@@ -97,12 +110,14 @@ void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title);
   `"VCW>VCF"`/`"Parallel"`/`"VCF>VCW"`, read directly from
   `maze_host.cpp`, not paraphrased).
 
-A `build_page()`-style function for a new addon looks like Maze Voice's
-own (~line 695): reset the widget/frame arrays, lay out `add_frame()`
-sections, then call `add_knob`/`add_toggle`/etc. in reading order. See
-`src/force_shadow.c` lines 701-770ish for three real, working examples
-(the Voice / WaveFolder-Filter / Mod-Random-Mix pages) to copy the style
-from.
+A `build_tab()`-style function for a new addon looks like
+`build_maze_voice_tab()` (~line 739): reset the widget/frame arrays, lay
+out `add_frame()` sections, then call `add_knob`/`add_toggle`/etc. in
+reading order. See `src/force_shadow.c`'s own body (the `if (page ==
+0)`/`else if (page == 1)`/... branches) for three real, working examples
+(the Voice / WaveFolder-Filter / Mod-Random-Mix tabs) to copy the style
+from. Register the finished function in `addon_table[]` (see above) —
+that's what actually makes it reachable.
 
 ## Finding the target addon's own parameters and control protocol
 
@@ -128,14 +143,14 @@ two-piece convention:
 
 Each host's control socket path is passed via its own `--ctrl-sock` CLI
 arg (see that addon's own `NSMODULE.json` `ARGUMENTS`) — e.g. Maze
-Voice's is `/tmp/maze_ctrl.sock` (`MAZE_CTRL_SOCK`, ~line 1250), DX7's is
-`/tmp/dx7_ctrl.sock`, JV-880's is `/tmp/jv880_ctrl.sock`. The protocol
-itself (confirmed identical across at least Maze Voice and DX7 by
-reading both `handle_ctrl_line()` implementations) is a plain
+Voice's is `/tmp/maze_ctrl.sock`, DX7's is `/tmp/dx7_ctrl.sock`, JV-880's
+is `/tmp/jv880_ctrl.sock`. Put your addon's own path in its
+`addon_table[]` entry's `ctrl_sock` field — `send_ctrl_set()` (~line
+1354) already looks it up per active addon, no changes needed there. The
+protocol itself (confirmed identical across at least Maze Voice and DX7
+by reading both `handle_ctrl_line()` implementations) is a plain
 newline-terminated `SET <key> <value>\n` -> `OK\n`/`ERR\n` text line over
-`AF_UNIX`/`SOCK_STREAM` — `send_maze_set()` (~line 1273) is a working
-reference implementation; a generalized version just needs the socket
-path parameterized per active addon.
+`AF_UNIX`/`SOCK_STREAM`.
 
 ## Layout constants — already solved, don't relitigate
 
@@ -150,10 +165,10 @@ reuse them as-is for any new page:
   chrome. A new addon's tabs should render inside `CONTENT_Y..CONTENT_Y+
   CONTENT_H`, same as Maze Voice's pages.
 - The tab bar itself (rendering + hit-testing, `render_shadow_page()`
-  and `update_touch_state()`) is generic over `NUM_PAGES`/`PAGE_NAMES[]`
-  already — once you're past the single-addon limitation above, a new
-  addon's own tab set can reuse this same tab-bar code, it doesn't need
-  reimplementing.
+  and `update_touch_state()`) is already generic over
+  `addon_table[active_addon].num_tabs`/`tab_names[]` — a new addon's own
+  tab set just needs its `addon_table[]` entry filled in, no tab-bar code
+  to write.
 - Palette (`PLATE_BG`, `UI_ACCENT`, `KNOB_FACE`, etc., ~line 554) matches
   Maze Voice's own web GUI. Reuse it for visual consistency across
   addons unless a specific addon's own web GUI uses a genuinely
@@ -186,11 +201,11 @@ Image.open('preview0.ppm').save('preview0.png')
 
 This has caught real layout bugs (text clipping off-canvas, label/knob
 overlap) before ever touching the device — cheap, fast, zero live risk.
-Port your new addon's `build_page()`-equivalent layout logic into
+Port your new addon's `build_tab()`-equivalent layout logic into
 `render_preview.c` first (mirroring one of the existing
 `page_voice()`/`page_wavefolder_filter()`/`page_mod_random_mix()`
 functions), verify it visually, *then* port the verified layout into
-`force_shadow.c`.
+`force_shadow.c` and register it in `addon_table[]`.
 
 Once it looks right offline, follow this project's own established
 staged live-test sequence (every incident in `DESIGN.md` that skipped a
@@ -205,16 +220,17 @@ screen/pads/touch/audio normal at every step and after every revert.
 1. Read the target addon's own `module.json` (`ui_hierarchy`/
    `chain_params`) for every param's key/range/enum options.
 2. Read that addon's own `*_host.cpp` `handle_ctrl_line()` for the real
-   value convention per key — don't assume uniformity.
-3. Generalize `poll_toggle()`/`active_addon` and
-   `send_maze_set()`/`MAZE_CTRL_SOCK` to be per-addon (one-time
-   architecture work, not per-page).
-4. Write the layout in `tools/render_preview.c` first, verify visually.
-5. Port the verified layout into `force_shadow.c` as a new
-   `build_<addon>_page()`-equivalent, wired into the generalized
-   `active_addon` dispatch.
-6. Stage the live test: pass-through, static toggle-on, interactive —
+   value convention per key — don't assume uniformity, and don't assume
+   it matches Maze Voice's `mix.enabled` quirk or any other addon's.
+3. Write the layout in `tools/render_preview.c` first, verify visually.
+4. Port the verified layout into `force_shadow.c` as a new
+   `build_<addon>_tab()` function, and add its entry to `addon_table[]`
+   (`ctrl_sock`, `display_name`, `num_tabs`, `tab_names[]`, the function
+   pointer). That's the entire integration — `poll_toggle()`,
+   `render_shadow_page()`, and `send_ctrl_set()` all pick it up
+   automatically.
+5. Stage the live test: pass-through, static toggle-on, interactive —
    confirm physically at every step.
-7. Update `DESIGN.md` with what you built and what you found (this
+6. Update `DESIGN.md` with what you built and what you found (this
    project's own convention — every non-obvious constant here exists
    because a past mistake is documented next to it).

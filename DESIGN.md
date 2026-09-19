@@ -1981,6 +1981,86 @@ check `/proc/<mpc-pid>/environ` for `LD_PRELOAD` completeness before
 assuming a code bug, and `systemctl restart acvs` once to retry the race
 rather than reaching straight for a power cycle.
 
+## Live load test #20 (2026-09-19): the active-addon selector, generalizing beyond Maze Voice
+
+Implemented `docs/adding-a-page.md`'s own headline architecture gap
+(written the same session, before this): the code was single-addon —
+`poll_toggle()` only ever recognized `SHADOW_PAGE_MAZE_VOICE=3`, and
+`current_page`/`PAGE_NAMES[]`/`send_maze_set()`/`MAZE_CTRL_SOCK` were all
+Maze-Voice-specific constants, despite 7 `KNOBS+SCENE-N` slots already
+reserved for 7 different addons.
+
+**`addon_table[]`**: one `addon_descriptor_t` entry per `KNOBS+SCENE-N`
+slot (`ctrl_sock`, `display_name`, `num_tabs`, `tab_names[]`,
+`build_tab`) — a slot with no entry (`NULL build_tab`, the default for a
+zeroed array element) is a safe, silent no-op, same behavior as every
+unbuilt page already had. Today only `ADDON_MAZE_VOICE` has a real
+entry (`build_maze_voice_tab`, the renamed former `build_page()`).
+
+**`poll_toggle()` rewritten** to resolve a *requested addon id* (from
+`SHADOW_TOGGLE_FILE` — always `ADDON_MAZE_VOICE`, the manual override's
+documented behavior — or `SHADOW_PAGE_FILE`'s own page number, validated
+against `addon_table[]` before accepting it) and, whenever that decision
+*changes* from `active_addon`'s current value, rebuild the new addon's
+first tab and reset `current_page` to `0` — covers off->on, on->off, and
+(once a second real addon page exists) switching directly from one
+addon to another, all in one place. This is a real behavior
+improvement, not just a rename: the old code never rebuilt on toggle-on
+at all, silently relying on `create_shadow_buffer()`'s one-time eager
+`build_page(0)` call always being correct because only one addon could
+ever be active. That eager call is now gone entirely (removed from
+`create_shadow_buffer()`) — `poll_toggle()` builds the first real
+content whenever `active_addon` actually becomes non-`ADDON_NONE`.
+
+**`render_shadow_page()`** takes an added `addon` parameter, looks up
+`addon_table[addon]` for the top-bar title (now built dynamically via
+`snprintf`, not a hardcoded `"MAZE VOICE"` string) and the tab bar's own
+count/names (`ad->num_tabs`/`ad->tab_names[]`, replacing the removed
+`NUM_PAGES`/`PAGE_NAMES[]` globals). `maybe_redraw_shadow()` snapshots
+`active_addon` under `touch_mu` alongside the widgets/frames/tab it
+already snapshotted, so the addon-aware render call is still fed a
+fully lock-free-safe, consistent snapshot.
+
+**DSP dispatch generalized alongside it**: `send_maze_set()` ->
+`send_ctrl_set()`, now looks up `addon_table[active_addon].ctrl_sock`
+per call instead of a single hardcoded `MAZE_CTRL_SOCK` constant —
+confirmed by reading `force-dx7`'s and `force-jv880`'s own `*_host.cpp`
+that every addon in this family speaks the identical plain
+`"SET <key> <value>\n"` -> `"OK\n"`/`"ERR\n"` protocol over its own
+`AF_UNIX`/`SOCK_STREAM` control socket, so one send path still covers
+all of them. Log prefix renamed `maze_ctrl:` -> `addon_ctrl[<sock
+path>]:` (now names which socket a `SET` actually went to, useful once
+more than one addon is wired up). `send_widget_param()`'s
+`mix.enabled`-needs-`"1"`/`"0"` special case is explicitly flagged in
+its own updated comment as Maze-Voice-specific, not something a future
+addon should assume it inherits.
+
+**Compiles clean** (`-Wall -Wextra`, zero warnings), dependency profile
+confirmed unchanged (`libc`/`libpthread`/`libdl` only).
+
+**Live-tested the same session**: hit the exact same boot-time
+`LD_PRELOAD` race as live load test #19 on the first `acvs` restart
+(confirmed via `/proc/<pid>/environ` again showing `force_shadow.so`
+missing) — one retry succeeded, matching that incident's own established
+mitigation exactly. Once loaded: pass-through confirmed normal, shadow
+mode toggled on via the manual override (which now resolves to
+`ADDON_MAZE_VOICE` through the new `poll_toggle()` path), user confirmed
+the Maze Voice GUI, tab switching, and knob dragging **all still work
+correctly through the fully refactored dispatch** — and the log's new
+`addon_ctrl[/tmp/maze_ctrl.sock]:` lines confirmed `send_ctrl_set()` is
+correctly resolving the active addon's own socket path per send (the
+"connect failed" in each line is expected — `maze_host` wasn't attached
+this test, same fail-closed behavior as always). Toggled off cleanly,
+user confirmed screen/pads/audio normal afterward.
+
+**What this unlocks**: adding a second real addon page (DX7, JV-880, ...)
+is now purely additive — one new `addon_table[]` entry plus a
+`build_<addon>_tab()` function, no more touching `poll_toggle()`,
+`render_shadow_page()`, or the DSP send path per new addon. See
+`docs/adding-a-page.md`'s own checklist for the remaining per-addon work
+(reading that addon's own `module.json`/`*_host.cpp`, building its
+layout in `tools/render_preview.c` first).
+
 ## Not yet done
 
 - **Investigate why the platform's own documented boot-time `LD_PRELOAD`

@@ -200,14 +200,28 @@ static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
  * SHIFT+SCENE-N combos already use to start/stop each addon's engine --
  * see USER-SCRIPTS.sh's SCRIPT-19..25) write the page number they want
  * shown into this file; pressing the same one again removes it
- * (toggle off), a different one switches pages directly. Only page 3
- * (Maze Voice) has a real rendered page today -- any other page number
- * is a safe, silent no-op (shadow_on stays false) until that addon's own
- * page is built. SHADOW_TOGGLE_FILE above is kept working alongside this
- * (not replaced) purely as a manual SSH-driven override for testing --
- * either one being "on" is enough. */
+ * (toggle off), a different one switches directly to that addon's own
+ * page. SHADOW_TOGGLE_FILE above is kept working alongside this (not
+ * replaced) purely as a manual SSH-driven override for testing -- it
+ * always shows ADDON_MAZE_VOICE, the one real page built today.
+ *
+ * Generalized 2026-09-19 (docs/adding-a-page.md's "active addon
+ * selector"): these IDs match the page numbers already bound in
+ * USER-SCRIPTS.sh/midiloop.config, one per KNOBS+SCENE-N slot. Adding a
+ * new addon's page means adding a new entry to addon_table[] below
+ * (ctrl_sock/display_name/tabs/build_tab) -- a slot with no entry (NULL
+ * build_tab) is a safe, silent no-op, exactly like every reserved-but-
+ * unbuilt slot today. */
+#define ADDON_NONE       0
+#define ADDON_DX7        1
+#define ADDON_JV880      2
+#define ADDON_MAZE_VOICE 3
+#define ADDON_MAZE_SEQ   4
+#define ADDON_ACID_SEQ   5
+#define ADDON_EUCLIDIER  6
+#define ADDON_RIFFMAKER  7
+#define NUM_ADDON_SLOTS  8
 #define SHADOW_PAGE_FILE "/tmp/force_shadow_page"
-#define SHADOW_PAGE_MAZE_VOICE 3
 #define SHADOW_TOGGLE_CHECK_EVERY 30  /* ~2/sec at observed active commit rates */
 
 /* Virtual landscape canvas all rendering targets -- matches MPC's own
@@ -544,7 +558,8 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
  *
  * Every widget (knob, toggle, button, enum selector) is one entry in a
  * single table that both rendering and touch hit-testing read from --
- * built once per page (build_page(), on entry or tab switch), not
+ * built once per page (each addon's own build_tab(), on entry or tab
+ * switch), not
  * recomputed per redraw, so layout math only exists in one place and
  * visuals/hit-testing can never drift apart. Palette matches the Maze
  * Voice web GUI (force-maze/maze-voice/web/index.html's own CSS custom
@@ -580,7 +595,6 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
  * based on. */
 #define CONTENT_Y (TOPBAR_H + 16)
 #define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 32)
-#define NUM_PAGES 3
 
 typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V } widget_kind_t;
 #define MAX_OPTIONS 3
@@ -607,8 +621,39 @@ static ui_widget_t page_widgets[MAX_WIDGETS];
 static int n_page_widgets = 0;
 static ui_frame_t page_frames[MAX_FRAMES];
 static int n_page_frames = 0;
-static int current_page = 0;
-static const char *PAGE_NAMES[NUM_PAGES] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" };
+static int current_page = 0;  /* current TAB within active_addon, not the addon itself */
+
+/* Forward-declared: addon_table[] below needs its address, but its real
+ * definition (the layout logic) reads more naturally further down, next
+ * to where it used to be the file's only page builder. */
+static void build_maze_voice_tab(int tab);
+
+#define MAX_TABS 4
+typedef struct {
+    const char *ctrl_sock;      /* this addon's own control-socket path */
+    const char *display_name;   /* shown in the top bar, e.g. "MAZE VOICE" */
+    int num_tabs;
+    const char *tab_names[MAX_TABS];
+    void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
+} addon_descriptor_t;
+
+/* One entry per KNOBS+SCENE-N slot already reserved in USER-SCRIPTS.sh/
+ * midiloop.config. A slot with no entry here (NULL build_tab) is a safe,
+ * silent no-op -- poll_toggle() below refuses to activate it. To add a
+ * new addon's page: add its entry here (find its own ctrl_sock path from
+ * its NSMODULE.json ARGUMENTS, its params from its own module.json), and
+ * write a build_<addon>_tab() function -- see docs/adding-a-page.md. */
+static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
+    [ADDON_MAZE_VOICE] = {
+        .ctrl_sock = "/tmp/maze_ctrl.sock",
+        .display_name = "MAZE VOICE",
+        .num_tabs = 3,
+        .tab_names = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
+        .build_tab = build_maze_voice_tab,
+    },
+};
+
+static int active_addon = ADDON_NONE;
 
 /* Set whenever anything on the current page changes (a knob drag, a
  * toggle, a page switch); cleared once the commit thread has redrawn to
@@ -692,7 +737,7 @@ static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *ti
  * entries are maze_host's own host-level controls (see
  * handle_mix_set()/handle_mix_get() in that project's maze_host.cpp),
  * not chain_params, hence the separate "mix." key namespace. */
-static void build_page(int page) {
+static void build_maze_voice_tab(int page) {
     n_page_widgets = 0;
     n_page_frames = 0;
     int32_t margin = 36, gap = 20;
@@ -851,19 +896,26 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
 }
 
 /* Takes an explicit snapshot rather than reading page_widgets/
- * page_frames/current_page directly, so the caller can copy those out
- * under touch_mu and then call this lock-free -- keeps the actual
- * pixel-pushing work off any lock's critical section, same principle
- * the original single-page design already established. */
+ * page_frames/current_page/active_addon directly, so the caller can copy
+ * those out under touch_mu and then call this lock-free -- keeps the
+ * actual pixel-pushing work off any lock's critical section, same
+ * principle the original single-page design already established.
+ * `addon` selects which addon_table[] entry's chrome (top-bar title, tab
+ * names/count) to draw -- generic over any addon with a real build_tab,
+ * not just Maze Voice. */
 static void render_shadow_page(uint32_t *map, uint32_t stride_px,
                                 const ui_widget_t *widgets, int n_widgets,
                                 const ui_frame_t *frames, int n_frames,
-                                int page) {
+                                int page, int addon) {
+    const addon_descriptor_t *ad = &addon_table[addon];
+
     fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, PLATE_BG);
 
     fill_rect_land(map, stride_px, 0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     fill_rect_land(map, stride_px, 0, TOPBAR_H, LAND_W, 1, PLATE_LINE);
-    draw_text_land(map, stride_px, 40, 28, "FORCE SHADOW - MAZE VOICE", 2, UI_INK);
+    char title[40];
+    snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name ? ad->display_name : "");
+    draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
     fill_circle_land(map, stride_px, LAND_W - 150, 36, 5, UI_ACCENT_HI);
     draw_text_land(map, stride_px, LAND_W - 130, 28, "LIVE", 2, UI_INK_DIM);
 
@@ -879,14 +931,16 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     int32_t tabbar_y = LAND_H - TABBAR_H;
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
     fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, PLATE_LINE);
-    int32_t tw = LAND_W / NUM_PAGES;
-    for (int i = 0; i < NUM_PAGES; i++) {
-        if (i == page) {
-            fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, 3, UI_ACCENT);
-            fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, TABBAR_H, 0xFF1A120Du);
+    if (ad->num_tabs > 0) {
+        int32_t tw = LAND_W / ad->num_tabs;
+        for (int i = 0; i < ad->num_tabs; i++) {
+            if (i == page) {
+                fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, 3, UI_ACCENT);
+                fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, TABBAR_H, 0xFF1A120Du);
+            }
+            draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 6,
+                              ad->tab_names[i], 2, i == page ? UI_INK : UI_INK_FAINT);
         }
-        draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 6,
-                          PAGE_NAMES[i], 2, i == page ? UI_INK : UI_INK_FAINT);
     }
 }
 
@@ -935,15 +989,14 @@ static void create_shadow_buffer(int fd) {
     }
     /* Kept mapped (not munmap'd) so maybe_substitute_fb() can redraw on
      * demand as knob values change -- see shadow_map/shadow_redraw_needed
-     * above. The first redraw (shadow_redraw_needed starts true) happens
-     * there, not here, so all rendering goes through one code path.
-     * build_page(0) has to happen here, synchronously, rather than let
-     * that first redraw find an empty page_widgets[] -- this runs once,
-     * before shadow_ready is ever set true, so it's guaranteed to finish
-     * before maybe_substitute_fb() could possibly call maybe_redraw_shadow(). */
+     * above. No eager build_tab() call needed here (unlike the old
+     * single-addon version of this function): active_addon starts at
+     * ADDON_NONE, page_widgets starts empty, and maybe_redraw_shadow() is
+     * never reached while shadow_on is false -- poll_toggle() below is
+     * now the sole place that builds a page, whenever active_addon
+     * actually changes to something real. */
     shadow_map = (uint32_t *)map;
     shadow_stride_px = creq.pitch / 4;
-    build_page(0);
 
     shadow_fb_id = fbcmd.fb_id;
     logline("shadow buffer ready: handle=%u fb_id=%u pitch=%u size=%llu",
@@ -1097,18 +1150,19 @@ static void maybe_redraw_shadow(void) {
 
     static ui_widget_t widgets_snap[MAX_WIDGETS];
     static ui_frame_t frames_snap[MAX_FRAMES];
-    int n_widgets_snap, n_frames_snap, page_snap;
+    int n_widgets_snap, n_frames_snap, page_snap, addon_snap;
 
     pthread_mutex_lock(&touch_mu);
     n_widgets_snap = n_page_widgets;
     n_frames_snap = n_page_frames;
     page_snap = current_page;
+    addon_snap = active_addon;
     memcpy(widgets_snap, page_widgets, sizeof(ui_widget_t) * (size_t)n_widgets_snap);
     memcpy(frames_snap, page_frames, sizeof(ui_frame_t) * (size_t)n_frames_snap);
     pthread_mutex_unlock(&touch_mu);
 
     render_shadow_page(shadow_map, shadow_stride_px, widgets_snap, n_widgets_snap,
-                        frames_snap, n_frames_snap, page_snap);
+                        frames_snap, n_frames_snap, page_snap, addon_snap);
 }
 
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
@@ -1158,21 +1212,49 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
     }
 }
 
+/* Decides which addon (if any) should be showing, and rebuilds its first
+ * tab whenever that decision *changes* -- covers off->on, on->off, and
+ * (once a second addon's page actually exists) switching directly from
+ * one addon to another, all in one place. Runs on the DRM commit thread
+ * (piggybacked on real atomic commits, like everything else here), so it
+ * takes touch_mu itself around the rebuild rather than assuming a caller
+ * already holds it -- unlike update_touch_state()'s own tab-switch code,
+ * which already runs inside its own touch_mu section. */
 static void poll_toggle(void) {
     struct stat st;
-    int on = (stat(SHADOW_TOGGLE_FILE, &st) == 0);
+    int requested = ADDON_NONE;
 
-    if (!on) {
+    if (stat(SHADOW_TOGGLE_FILE, &st) == 0) {
+        /* Manual SSH override: always Maze Voice, the one real page
+         * built today -- matches this file's pre-multi-addon behavior. */
+        requested = ADDON_MAZE_VOICE;
+    } else {
         FILE *f = fopen(SHADOW_PAGE_FILE, "r");
         if (f) {
             int page = -1;
-            if (fscanf(f, "%d", &page) == 1 && page == SHADOW_PAGE_MAZE_VOICE) {
-                on = 1;
+            if (fscanf(f, "%d", &page) == 1 &&
+                page > ADDON_NONE && page < NUM_ADDON_SLOTS &&
+                addon_table[page].build_tab != NULL) {
+                requested = page;
             }
             fclose(f);
         }
     }
-    shadow_on = on;
+
+    if (requested != active_addon) {
+        pthread_mutex_lock(&touch_mu);
+        active_addon = requested;
+        current_page = 0;
+        if (requested != ADDON_NONE) {
+            addon_table[requested].build_tab(0);
+        } else {
+            n_page_widgets = 0;
+            n_page_frames = 0;
+        }
+        pthread_mutex_unlock(&touch_mu);
+        shadow_redraw_needed = 1;
+    }
+    shadow_on = (active_addon != ADDON_NONE);
 }
 
 /* ---- Touch takeover (step 3) ----
@@ -1247,8 +1329,7 @@ static int touch_x = -1, touch_y = -1, touch_down = 0;
  * maze_host isn't running -- shadow mode's own rendering/dragging still
  * works regardless, this is purely an added effect, never a dependency
  * of anything else here. */
-#define MAZE_CTRL_SOCK "/tmp/maze_ctrl.sock"
-#define MAZE_SEND_TIMEOUT_MS 50
+#define CTRL_SEND_TIMEOUT_MS 50
 
 /* Live-tested 2026-09-18 and found to kill maze_host: an earlier version
  * of this function closed the socket right after send(), never reading
@@ -1269,20 +1350,32 @@ static int touch_x = -1, touch_y = -1, touch_down = 0;
  * (route, rnd_*, mix.channel) take one of their own literal option
  * strings ("SET route Parallel", "SET rnd_voice on") per module.json's
  * own "options" arrays and maze_host's handle_mix_set() -- one send
- * path for both, the caller decides the formatting. */
-static void send_maze_set(const char *key, const char *value_str) {
+ * path for both, the caller decides the formatting.
+ *
+ * Generalized 2026-09-19: sends to whichever addon is currently active
+ * (addon_table[active_addon].ctrl_sock), not a single hardcoded socket
+ * path -- every addon in this family (confirmed by reading force-dx7's
+ * and force-jv880's own *_host.cpp alongside force-maze's) speaks the
+ * same plain "SET <key> <value>\n" -> "OK\n"/"ERR\n" protocol, so one
+ * send path still covers all of them; only the destination path and the
+ * per-key value convention (see send_widget_param()'s own mix.enabled
+ * special case) differ per addon. */
+static void send_ctrl_set(const char *key, const char *value_str) {
     if (!key[0]) return; /* widgets with no param_key are display-only */
+    const char *sock_path = addon_table[active_addon].ctrl_sock;
+    if (!sock_path) return; /* active addon has no control socket configured */
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return;
 
-    struct timeval tv = { 0, MAZE_SEND_TIMEOUT_MS * 1000 };
+    struct timeval tv = { 0, CTRL_SEND_TIMEOUT_MS * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, MAZE_CTRL_SOCK, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
         char line[128];
@@ -1292,14 +1385,14 @@ static void send_maze_set(const char *key, const char *value_str) {
             ssize_t rn = recv(fd, reply, sizeof(reply) - 1, 0); /* drains
                                                   * it so our close() can
                                                   * never race ahead of
-                                                  * maze_host's own reply
-                                                  * write. */
-            logline("maze_ctrl: SET %s %s -> reply='%s' (rn=%zd)",
-                     key, value_str, rn > 0 ? reply : "", rn);
+                                                  * the addon host's own
+                                                  * reply write. */
+            logline("addon_ctrl[%s]: SET %s %s -> reply='%s' (rn=%zd)",
+                     sock_path, key, value_str, rn > 0 ? reply : "", rn);
         }
     } else {
-        logline("maze_ctrl: connect(%s) failed: %s -- SET %s %s dropped",
-                 MAZE_CTRL_SOCK, strerror(errno), key, value_str);
+        logline("addon_ctrl[%s]: connect failed: %s -- SET %s %s dropped",
+                 sock_path, strerror(errno), key, value_str);
     }
     close(fd);
 }
@@ -1308,16 +1401,16 @@ static void send_maze_set(const char *key, const char *value_str) {
  * throttle state needs no locking of its own. Bounds worst-case socket
  * churn during a fast drag (the web panel's own server.py notes a drag
  * can fire 50-100 events/sec) without needing per-widget bookkeeping. */
-static struct timespec maze_send_last_ts;
-#define MAZE_SEND_MIN_INTERVAL_MS 15
+static struct timespec ctrl_send_last_ts;
+#define CTRL_SEND_MIN_INTERVAL_MS 15
 
-static int maze_send_throttle_ok(void) {
+static int ctrl_send_throttle_ok(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long ms_since = (now.tv_sec - maze_send_last_ts.tv_sec) * 1000 +
-                    (now.tv_nsec - maze_send_last_ts.tv_nsec) / 1000000;
-    if (ms_since < MAZE_SEND_MIN_INTERVAL_MS) return 0;
-    maze_send_last_ts = now;
+    long ms_since = (now.tv_sec - ctrl_send_last_ts.tv_sec) * 1000 +
+                    (now.tv_nsec - ctrl_send_last_ts.tv_nsec) / 1000000;
+    if (ms_since < CTRL_SEND_MIN_INTERVAL_MS) return 0;
+    ctrl_send_last_ts = now;
     return 1;
 }
 
@@ -1325,16 +1418,21 @@ static int maze_send_throttle_ok(void) {
  * value (throttled during a drag, forced on release -- same reasoning
  * as the original single-page build); toggle sends "on"/"off"; enum
  * sends the option's own literal string; button always fires (it's
- * momentary, there's nothing to throttle). */
+ * momentary, there's nothing to throttle). Every send goes to whichever
+ * addon is currently active (see send_ctrl_set()) -- this dispatch logic
+ * itself is already addon-agnostic; only the mix.enabled special case
+ * below is Maze-Voice-specific (a new addon with its own value-
+ * convention quirks would need its own such case, found by reading its
+ * host source, not by assuming this one generalizes). */
 static void send_widget_param(const ui_widget_t *w, int force) {
     if (!w->param_key[0]) return;
     switch (w->kind) {
     case W_KNOB: {
-        if (!force && !maze_send_throttle_ok()) return;
+        if (!force && !ctrl_send_throttle_ok()) return;
         float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
         char buf[24];
         snprintf(buf, sizeof(buf), "%.2f", real);
-        send_maze_set(w->param_key, buf);
+        send_ctrl_set(w->param_key, buf);
         break;
     }
     case W_TOGGLE:
@@ -1344,16 +1442,16 @@ static void send_widget_param(const ui_widget_t *w, int force) {
          * ["off","on"] enum options (rnd_voice etc). Not a case worth
          * generalizing for one exception. */
         if (strcmp(w->param_key, "mix.enabled") == 0)
-            send_maze_set(w->param_key, w->state ? "1" : "0");
+            send_ctrl_set(w->param_key, w->state ? "1" : "0");
         else
-            send_maze_set(w->param_key, w->state ? "on" : "off");
+            send_ctrl_set(w->param_key, w->state ? "on" : "off");
         break;
     case W_BUTTON:
-        send_maze_set(w->param_key, "go");
+        send_ctrl_set(w->param_key, "go");
         break;
     case W_ENUM_H:
     case W_ENUM_V:
-        send_maze_set(w->param_key, w->options[w->state]);
+        send_ctrl_set(w->param_key, w->options[w->state]);
         break;
     }
 }
@@ -1390,7 +1488,7 @@ static int hit_test_widget(int32_t lpx, int32_t lpy) {
 }
 
 static void update_touch_state(const struct input_event *ev) {
-    /* Set below while touch_mu is held, acted on (send_maze_set, a
+    /* Set below while touch_mu is held, acted on (send_ctrl_set, a
      * blocking-ish socket call) only after it's released -- never do
      * potentially-slow I/O while holding a lock the commit thread also
      * needs for its own (should stay fast) redraw snapshot. Only ever
@@ -1420,17 +1518,18 @@ static void update_touch_state(const struct input_event *ev) {
         active_widget = -1;
 
         int32_t tabbar_y = LAND_H - TABBAR_H;
-        if (lpy >= tabbar_y) {
-            int32_t tw = LAND_W / NUM_PAGES;
+        int num_tabs = addon_table[active_addon].num_tabs;
+        if (lpy >= tabbar_y && num_tabs > 0) {
+            int32_t tw = LAND_W / num_tabs;
             int new_page = lpx / tw;
             if (new_page < 0) new_page = 0;
-            if (new_page >= NUM_PAGES) new_page = NUM_PAGES - 1;
+            if (new_page >= num_tabs) new_page = num_tabs - 1;
             if (new_page != current_page) {
                 current_page = new_page;
-                build_page(current_page);
+                addon_table[active_addon].build_tab(current_page);
                 shadow_redraw_needed = 1;
             }
-        } else {
+        } else if (lpy < tabbar_y) {
             int i = hit_test_widget(lpx, lpy);
             if (i >= 0) {
                 ui_widget_t *w = &page_widgets[i];
