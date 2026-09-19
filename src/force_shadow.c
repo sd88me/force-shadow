@@ -784,7 +784,8 @@ typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V,
                W_READOUT,  /* display-only LCD text, value from GET <get_key> */
                W_STEPPER,  /* < text > : prev/next an integer index (bank, preset) */
                W_ENV,      /* display-only DX7 envelope graph, from sibling knobs */
-               W_LIST      /* paged grid of engine-provided names (banks, patches) */
+               W_LIST,     /* paged grid of engine-provided names (banks, patches) */
+               W_BITS      /* row of tappable step LEDs + play head (sequencer step bits) */
 } widget_kind_t;
 #define MAX_OPTIONS 6
 
@@ -1051,6 +1052,23 @@ static int add_list(int32_t x, int32_t y, int32_t bw, int32_t bh, const char *ke
     w->tscale = tscale > 0 ? tscale : 1.5f;
     w->list_id = n_list_stores++;
     list_stores[w->list_id].per_page = cols * rows;
+    return n_page_widgets++;
+}
+/* Row of tappable step LEDs. get_key is a "<length>|b,b,..|<play>" state
+ * key (maze_seq's s1_state); a tap on LED i SETs `key` to i (the host
+ * flips that step). Text holds the bit string, ival the play head, imax
+ * the sequence length; refreshed on a fast poll so the play head moves. */
+static int add_bits(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *label,
+                     const char *key, const char *get_key) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_BITS; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
+    w->hit_hw = bw/2; w->hit_hh = bh/2;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
+    strncpy(w->text, "00000000", sizeof(w->text)-1);
+    w->ival = -1; w->imax = 8;
     return n_page_widgets++;
 }
 /* Display-only DX7 envelope graph; param_key is the prefix shared by the
@@ -1379,7 +1397,8 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
         } else if (strcmp(type, "toggle") == 0) {
             add_toggle(cx, cy, label, key, atoi(shadow_page_kv_get(kv, nkv, "on")));
         } else if (strcmp(type, "button") == 0) {
-            add_button(cx, cy, label, key);
+            int bi = add_button(cx, cy, label, key);
+            strncpy(page_widgets[bi].text, shadow_page_kv_get(kv, nkv, "val"), sizeof(page_widgets[bi].text) - 1);
         } else if (strcmp(type, "readout") == 0) {
             int ri = add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label,
@@ -1399,6 +1418,10 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                         atoi(shadow_page_kv_get(kv, nkv, "min")),
                         atoi(shadow_page_kv_get(kv, nkv, "max")),
                         atoi(shadow_page_kv_get(kv, nkv, "numbered")));
+        } else if (strcmp(type, "bits") == 0) {
+            add_bits(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
+                     atoi(shadow_page_kv_get(kv, nkv, "h")), label, key,
+                     shadow_page_kv_get(kv, nkv, "get"));
         } else if (strcmp(type, "list") == 0) {
             int lw = add_list(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
                     atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
@@ -1695,6 +1718,20 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         draw_text_land_c(map, stride_px, bx + bw/2, w->cy - (int32_t)(4.5f * sc), tb, sc, UI_ACCENT);
         if (w->kind == W_READOUT && w->goto_tab >= 0)   /* tappable: hint arrow */
             draw_arrow_land(map, stride_px, bx + bw - 18, w->cy, 7, 1, UI_ACCENT_HI);
+        break;
+    }
+    case W_BITS: {
+        int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
+        if (w->label[0]) draw_text_land(map, stride_px, x0, y0 - 22, w->label, 1.5f, UI_INK_DIM);
+        int32_t gap = 8, cell = (w->w - 7 * gap) / 8;
+        for (int i = 0; i < 8; i++) {
+            int in_range = i < w->imax, on = in_range && w->text[i] == '1';
+            int32_t cx0 = x0 + i * (cell + gap);
+            if (i == w->ival && in_range)   /* play-head halo */
+                fill_rect_land(map, stride_px, cx0 - 3, y0 - 3, cell + 6, w->h + 6, UI_INK);
+            fill_rect_land(map, stride_px, cx0, y0, cell, w->h, on ? UI_ACCENT_HI : th.plate_line);
+            if (!on) fill_rect_land(map, stride_px, cx0 + 2, y0 + 2, cell - 4, w->h - 4, in_range ? th.well : PLATE_BG);
+        }
         break;
     }
     case W_ENV: {
@@ -2594,6 +2631,12 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         send_ctrl_set(w->param_key, buf);
         break;
     }
+    case W_BITS: {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", w->state);   /* tapped step index */
+        send_ctrl_set(w->param_key, buf);
+        break;
+    }
     case W_READOUT:
     case W_ENV:
         break;
@@ -2613,7 +2656,7 @@ static void send_widget_param(const ui_widget_t *w, int force) {
             send_ctrl_set(w->param_key, w->state ? "on" : "off");
         break;
     case W_BUTTON:
-        send_ctrl_set(w->param_key, "go");
+        send_ctrl_set(w->param_key, w->text[0] ? w->text : "go");   /* optional val= */
         break;
     case W_ENUM_H:
     case W_ENUM_V:
@@ -2702,6 +2745,11 @@ static void update_touch_state(const struct input_event *ev) {
             /* Optimistic flip for instant visual feedback -- poll_toggle()'s
              * own ~2/sec /proc check self-corrects afterward if the actual
              * spawn/kill didn't land the way this guessed. */
+            /* Re-read the real state first: engine_on is only refreshed on the
+             * slow commit cadence, so a stale OFF would make this tap start a
+             * second copy of an engine that is already running (duplicate
+             * virtual MIDI ports, ctrl socket stolen by the newcomer). */
+            engine_on = is_process_running(addon_table[active_addon].engine_process_name);
             engine_on = !engine_on;
             shadow_redraw_needed = 1;
             engine_toggle_addon = active_addon;
@@ -2746,6 +2794,15 @@ static void update_touch_state(const struct input_event *ev) {
                         send_idx = i; send_force = 1; send_snapshot = *w;
                         refresh_request = 1;
                     }
+                    break;
+                }
+                case W_BITS: {
+                    int32_t gap = 8, cell = (w->w - 7 * gap) / 8;
+                    int k = (lpx - (w->cx - w->w/2)) / (cell + gap);
+                    if (k < 0) k = 0; if (k > 7) k = 7;
+                    w->state = k;
+                    send_idx = i; send_force = 1; send_snapshot = *w;
+                    refresh_request = 1;
                     break;
                 }
                 case W_LIST: {
@@ -2962,6 +3019,21 @@ static void refresh_page_from_engine(int full) {
                 if (w->count_key[0] && ctrl_get(sock, w->count_key, buf, sizeof(buf)) == 0) res[i].count = atoi(buf);
             }
             break;
+        case W_BITS:
+            if (w->get_key[0] && ctrl_get(sock, w->get_key, buf, sizeof(buf)) == 0) {
+                /* "<length>|b,b,b,b,b,b,b,b|<play>" */
+                int len = atoi(buf), k = 0;
+                const char *p = strchr(buf, '|');
+                if (p) {
+                    for (p++; *p && *p != '|' && k < 8; p++)
+                        if (*p == '0' || *p == '1') res[i].text[k++] = *p;
+                    res[i].text[k] = 0;
+                    res[i].idx = (*p == '|') ? atoi(p + 1) : -1;
+                    res[i].count = len;
+                    res[i].valid = 1; any_ok = 1;
+                }
+            } else if (!any_ok) return;
+            break;
         default: break;
         }
     }
@@ -3018,6 +3090,11 @@ static void refresh_page_from_engine(int full) {
                 if (v >= 0 && v < w->n_options && v != w->state) { w->state = v; changed = 1; }
                 break;
             }
+            case W_BITS:
+                if (strcmp(w->text, res[i].text)) { strncpy(w->text, res[i].text, sizeof(w->text) - 1); changed = 1; }
+                if (res[i].idx != w->ival) { w->ival = res[i].idx; changed = 1; }
+                if (res[i].count > 0 && res[i].count != w->imax) { w->imax = res[i].count; changed = 1; }
+                break;
             case W_READOUT: case W_STEPPER:
                 if (strcmp(w->text, res[i].text)) { strncpy(w->text, res[i].text, sizeof(w->text) - 1); changed = 1; }
                 if (w->kind == W_STEPPER) {
@@ -3051,7 +3128,9 @@ static void *refresh_thread_fn(void *arg) {
         if (!shadow_on) { seen_epoch = (unsigned)-1; idle_ms = 0; continue; }
         idle_ms += 50;
         int req = __atomic_exchange_n(&refresh_request, 0, __ATOMIC_RELAXED);
-        if (page_epoch != seen_epoch || req || idle_ms >= 1500) {
+        int fast = 0;   /* a step-bits widget needs a live play head */
+        for (int i = 0; i < n_page_widgets; i++) if (page_widgets[i].kind == W_BITS) { fast = 1; break; }
+        if (page_epoch != seen_epoch || req || idle_ms >= (fast ? 200 : 1500)) {
             if (req) { struct timespec w = { 0, 150 * 1000 * 1000 }; nanosleep(&w, NULL); } /* let a bank load finish */
             static int pass = 0;
             /* List contents (bank names, patch names) are refetched on a
