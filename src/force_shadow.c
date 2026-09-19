@@ -688,8 +688,19 @@ static void draw_char_land(uint32_t *map, uint32_t stride_px,
         }
     }
 }
+/* Horizontal advance per character. Baked (hinted) scales use the tight
+ * advance their glyph tables were generated with (FONT_HI_*_W); any other
+ * scale falls back to the old wide 10*scale tracking. */
+static int32_t text_advance(float scale) {
+    if (scale == 1.0f) return FONT_HI_1_0_W;
+    if (scale == 1.5f) return FONT_HI_1_5_W;
+    if (scale == 2.0f) return FONT_HI_2_0_W;
+    if (scale == 2.5f) return FONT_HI_2_5_W;
+    if (scale == 3.0f) return FONT_HI_3_0_W;
+    return (int32_t)((GLYPH_CELL + 1) * scale);
+}
 static int32_t text_width_land(const char *s, float scale) {
-    return (int32_t)((float)strlen(s) * (GLYPH_CELL + 1) * scale - scale);
+    return (int32_t)strlen(s) * text_advance(scale);
 }
 static void draw_text_land(uint32_t *map, uint32_t stride_px,
                             int32_t x, int32_t y, const char *s, float scale,
@@ -697,7 +708,7 @@ static void draw_text_land(uint32_t *map, uint32_t stride_px,
     int32_t cx = x;
     for (const char *p = s; *p; p++) {
         draw_char_land(map, stride_px, cx, y, *p, scale, color);
-        cx += (int32_t)((GLYPH_CELL + 1) * scale);
+        cx += text_advance(scale);
     }
 }
 static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
@@ -1838,7 +1849,6 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         fill_rect_land(map, stride_px, 24, 12, tw_px, 1, UI_ACCENT);
         fill_rect_land(map, stride_px, 24, TOPBAR_H - 13, tw_px, 1, UI_ACCENT);
         draw_text_land(map, stride_px, 48, 24, title, 2.5f, UI_ACCENT_HI);
-        draw_text_land(map, stride_px, 24 + tw_px + 24, 30, "FM SYNTH", 1.5f, UI_INK_FAINT);
         fill_rect_land(map, stride_px, 0, TOPBAR_H - 2, LAND_W, 2, UI_ACCENT);
     } else {
         snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
