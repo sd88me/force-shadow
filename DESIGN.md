@@ -2061,6 +2061,101 @@ is now purely additive — one new `addon_table[]` entry plus a
 (reading that addon's own `module.json`/`*_host.cpp`, building its
 layout in `tools/render_preview.c` first).
 
+## Live load test #21 (2026-09-19): engine on/off moved from a combo into the GUI itself
+
+User's own UX critique of the two-combo workflow (`SHIFT+SCENE-N` for the
+engine, `KNOBS+SCENE-N` for the page): two combos to remember for one
+addon. Proposed fix, tried on Maze Voice first: `SHIFT+SCENE-N` opens the
+page (same thing `KNOBS+SCENE-N` already did), and the page itself gets
+a top-bar on/off button — matching this project's own web GUIs' status/
+control convention — that starts/stops the engine directly.
+
+**Researched before writing any spawn code, not assumed**: could
+`force_shadow.c` just `fork()`/`exec()` `maze_host` itself on a button
+tap? Checked the actual risk first (this file already runs *inside*
+MPC's own real-time, multi-threaded process via `LD_PRELOAD`) against
+this project's own established fragility list (`acvs`-restart-kills-
+pads, same-boot-restart fatigue, `SCHED_FIFO` starving unrelated
+threads) and decided against it — an unnecessary new risk for something
+a separate, already-running, already-proven process can do instead.
+Read nodeServer's own `app/api/endpoints/moduler/index.js` (the code
+behind the on-device Modules web page) and confirmed live
+(`curl 127.0.0.1:8080/moduler` -> `200`) that its `/moduler/UPDATE`
+endpoint is exactly this: a generic, already-working addon start/stop
+(`child_process.spawn`/`execSync("killall ...")`) driven by a plain HTTP
+POST carrying that addon's own `NSMODULE.json` fields. Reusing it means
+our side is just another bounded plain-socket call (the same risk class
+as `send_ctrl_set()`), zero fork/exec risk on our side at all.
+
+**`addon_table[]` extended** with four new fields (`engine_process_name`,
+`engine_nsmodule_path`, `engine_dirname`, `engine_arguments_json`) — the
+last one holds Maze Voice's own `NSMODULE.json` `ARGUMENTS` array
+copy-pasted as literal JSON text, since moduler's own `UPDATE` handler
+overwrites that file with whatever `ARGUMENTS` it's sent, so anything
+paraphrased or stale would corrupt it.
+
+**New functions**: `is_process_running()` (a plain `/proc` scan for a
+matching `comm`, refreshed at `poll_toggle()`'s existing ~2/sec cadence
+into a new `engine_on` global, not checked on every redraw since a knob
+drag can trigger 50-100 of those a second) and `send_engine_toggle()`
+(builds the JSON body, POSTs it to `127.0.0.1:8080/moduler/UPDATE`,
+doesn't wait for the reply since nodeServer's own handler already
+performed the actual spawn/kill synchronously before its own deliberate
+500ms-delayed response). The button itself lives outside the
+`page_widgets[]` system entirely (a fixed `ENGINE_BTN_X/Y/W/H` region,
+hit-tested and rendered separately) since it must stay tappable across
+every tab of the active addon, not get wiped on every tab switch the
+way `page_widgets[]` does.
+
+**Real bug found live, not offline**: first live attempt — combo opened
+the page correctly, the button visually flipped to "ON" on tap, but the
+engine never actually started, and reopening the page showed it back
+off. `grep`-ing the log for anything engine-related came back completely
+empty — not an error, *nothing at all*, which was the real clue.
+Traced to `send_engine_toggle()`'s own JSON body buffer being sized at
+512 bytes while the real payload (Maze Voice's six `{NAME,VALUE}`
+argument pairs alone run ~350 bytes) came to 529 -- `snprintf`'s
+overflow guard silently `return`ed with no log line at all. Two lessons,
+both now fixed: sized the buffers generously (1024/1536 bytes, real
+headroom for a longer `ARGUMENTS` list), and made every early-return in
+this function log why -- that silence is exactly what turned a one-line
+bug into something that needed a live test to even notice, and doesn't
+need to again.
+
+**MidiLoop rebind**: unlike `bind_midiloop.sh`'s own safety checks
+(which only ever touch a `"-"`/unbound slot), this edits an
+*already-bound* line -- `SHIFT+SCENE-3` moved from `SCRIPT-16` (the
+engine toggle) to `SCRIPT-21` (the same page-toggle `KNOBS+SCENE-3`
+already used). Done by hand with the same care as every other
+`midiloop.config` edit this project has made: timestamped backup first,
+one line changed, `diff` confirmed nothing else moved, validated with
+`midiloop test` (`Config File Seems Ok!!`) before reloading. `SCRIPT-16`
+itself wasn't deleted, just unbound -- still callable by ID if ever
+needed again. The now-redundant `KNOBS+SCENE-3` binding was left in
+place rather than reclaimed (harmless, still opens the same page).
+
+**Confirmed live, both directions, after the buffer fix**: `SHIFT+
+SCENE-3` opens the page; the button dims/lights correctly; pressing it
+sent `RUNNING=true` over HTTP, and `maze_host` appeared in `ps` moments
+later; pressing it again sent `RUNNING=false` and the process was
+actually gone; pressing once more respawned it under a **new PID**,
+confirming a real stop-then-restart rather than a stale process
+lingering. Knob dragging (the existing DSP path) retested afterward and
+confirmed unaffected. User's own words: "yes works as expected now" /
+"yes works off too" / "yes knobs work."
+
+Also hit, and resolved via the same established mitigation, another
+instance of live load test #19's boot-time `LD_PRELOAD` race during this
+test's own deploy cycle -- and a genuine network drop mid-session
+(device came back on its own once reachable again; see the WiFi/drop
+tally in "Not yet done" below, now due for an update).
+
+**Not yet extended to a second addon.** Every piece here (the button,
+`is_process_running()`, `send_engine_toggle()`) is already generic over
+`addon_table[active_addon]` -- a new addon's own entry needs its four
+`engine_*` fields and its own `SHIFT+SCENE-N` rebind, nothing else. See
+`docs/adding-a-page.md`'s own updated sections for the full how-to.
+
 ## Not yet done
 
 - **Investigate why the platform's own documented boot-time `LD_PRELOAD`
@@ -2078,20 +2173,19 @@ layout in `tools/render_preview.c` first).
   same-boot restarts, not a real reproducible defect. Buffer cache
   coherency is no longer suspected as a result; no separate investigation
   needed there.
-- **Investigate the WiFi/ethernet drop pattern** — now three occurrences
-  during active live testing across three different sessions (live load
-  test #5, live load test #8, and live load test #16's own retest), zero
-  during idle periods, still no confirmed causal mechanism found despite
-  this being the "look for a common trigger on the third occurrence"
-  checkpoint this doc itself set. All three happened during active
-  touch/redraw testing, all three self-resolved (device came back
-  reachable without intervention, in #16's case within the same short
-  session), none left the device in a bad state once reconnected. Given
-  three independent occurrences with no identified trigger and no lasting
-  harm, treat as a known, recoverable flakiness of this test setup rather
-  than a blocker — but if a fourth occurrence ever correlates with a
-  specific action (not just "testing was happening"), that's worth
-  chasing properly.
+- **Investigate the WiFi/ethernet drop pattern** — now at least five
+  occurrences across live testing (live load test #5, #8, #16's retest,
+  and two more during #21's own session), zero during idle periods,
+  still no confirmed causal mechanism despite this doc's own "look for a
+  common trigger on the third occurrence" checkpoint having long since
+  passed. Every occurrence happened during active touch/redraw testing,
+  every one self-resolved (device came back reachable without
+  intervention or, at worst, a power cycle), none left the device in a
+  bad state once reconnected. Treated as known, recoverable flakiness of
+  this test setup rather than a blocker for now — genuinely worth a
+  focused investigation on its own terms at some point, since "still no
+  trigger found" after five occurrences is no longer a coincidence, just
+  not something to chase mid-feature-work.
 - **Solve toggle-off reliability** (parked from live load test #6/#7) —
   recurred in live load test #17: mid-test, the user couldn't get back to
   the normal MPC UI on the device itself to route a MIDI track (the real

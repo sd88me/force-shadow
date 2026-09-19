@@ -48,12 +48,27 @@ typedef struct {
     int num_tabs;
     const char *tab_names[MAX_TABS];
     void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
+
+    /* Engine on/off button, see its own section below. NULL
+     * engine_process_name = no button drawn for this addon. */
+    const char *engine_process_name;
+    const char *engine_nsmodule_path;
+    const char *engine_dirname;
+    const char *engine_arguments_json;
 } addon_descriptor_t;
 
 static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
-    [ADDON_MAZE_VOICE] = { "/tmp/maze_ctrl.sock", "MAZE VOICE", 3,
-        { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
-        build_maze_voice_tab },
+    [ADDON_MAZE_VOICE] = {
+        .ctrl_sock = "/tmp/maze_ctrl.sock",
+        .display_name = "MAZE VOICE",
+        .num_tabs = 3,
+        .tab_names = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
+        .build_tab = build_maze_voice_tab,
+        .engine_process_name = "maze_host",
+        .engine_nsmodule_path = "/media/662522/AddOns/ForceMazeVoice/NSMODULE.json",
+        .engine_dirname = "ForceMazeVoice",
+        .engine_arguments_json = "[{...copy verbatim from that NSMODULE.json's ARGUMENTS...}]",
+    },
     /* your new addon's entry goes here */
 };
 ```
@@ -65,6 +80,90 @@ send path (`send_ctrl_set()`) — all three already dispatch generically
 over `addon_table[active_addon]`. A slot with no entry (`NULL
 build_tab`, the default for a zeroed array element) stays a safe,
 silent no-op, exactly like every reserved-but-unbuilt slot today.
+
+## The hardware combo: SHIFT+SCENE-N opens the page (2026-09-19)
+
+Changed from Maze Voice's own original convention (`SHIFT+SCENE-N`
+started/stopped the engine, `KNOBS+SCENE-N` showed the page — two combos
+to remember) to just **`SHIFT+SCENE-N` opens the page**, full stop. The
+page itself now carries the engine on/off control (see below), matching
+how this project's own web GUIs present a live status/control affordance
+rather than requiring a separate hardware combo.
+
+For a new addon, this means rebinding its own `SHIFT+SCENE-N` line in
+`midiloop.config` from whatever engine-toggle script it currently points
+to (e.g. Maze Voice's own `SCRIPT-16`), to the `SCRIPT-N` that
+`bind_midiloop.sh` already bound for its page (`SCRIPT-19`..`25` on this
+device, one per `KNOBS+SCENE-N` slot — see that script's own output for
+the exact numbers it picked). **This is editing an already-bound
+combo**, not an empty slot — `bind_midiloop.sh`'s own safety checks don't
+cover this case (it only ever touches `"-"` slots). Do it by hand,
+carefully: back up `midiloop.config` first (timestamped, matching the
+convention every other script here uses), change only that one line,
+`diff` against the backup to confirm nothing else moved, validate with
+`midiloop test`, then reload (`killall midiloop && <mmPath>/AddOns/
+run_midiloop.sh`). The old script (`SCRIPT-16` for Maze Voice) doesn't
+need deleting — it just becomes unbound, still callable by ID if ever
+needed again.
+
+The now-redundant `KNOBS+SCENE-N` binding (still pointing at the same
+page-toggle script) is harmless and was left in place rather than
+reclaimed — both combos open the same page.
+
+## Engine on/off: a top-bar button, not a combo (2026-09-19)
+
+`render_shadow_page()` draws a real button in the top-right of the top
+bar (`ENGINE_BTN_X/Y/W/H`) whenever `addon_table[active_addon]
+.engine_process_name` is non-`NULL` — dim/grey (`PLATE_LINE` background,
+`UI_INK_FAINT` text) when the engine's off, lit (`UI_ACCENT` background,
+`UI_INK` text) when it's on. `update_touch_state()` hit-tests it
+alongside (not as part of) the tab bar and generic widget system, since
+it must stay tappable across every tab, not just whichever one's
+`page_widgets[]` happens to be built right now.
+
+**How it actually starts/stops the process — read this before assuming
+you can just `fork()`/`exec()` your own addon's binary:** `force_shadow.c`
+runs *inside MPC's own process* (`LD_PRELOAD`'d in). Spawning a child
+process from inside a library injected into a real-time, multi-threaded
+audio host is a real, unnecessary risk on a platform this project has
+already found fragile in less exotic ways (`acvs`-restart-kills-pads,
+same-boot-restart fatigue, `SCHED_FIFO` starving unrelated threads — see
+`DESIGN.md`). Instead, `send_engine_toggle()` (`src/force_shadow.c`,
+~line 1543) fires a plain HTTP POST to **nodeServer's own
+`/moduler/UPDATE` endpoint** (`127.0.0.1:8080`, confirmed live and by
+reading nodeServer's own `app/api/endpoints/moduler/index.js`) — the
+exact same generic addon start/stop mechanism the on-device Modules web
+page itself uses (`child_process.spawn`/`execSync("killall ...")`,
+running in nodeServer's own already-separate, already-proven process).
+Our side is just another bounded plain-socket call, the same risk class
+as `send_ctrl_set()`.
+
+The POST body must echo back that addon's own `NSMODULE.json` fields
+**verbatim** — `CONFIGFILE`, `PROCESSNAME`, `DIRNAME`, and the full
+`ARGUMENTS` array as literal JSON (moduler's own handler overwrites the
+file with whatever `ARGUMENTS` you send, so anything paraphrased or
+stale corrupts it) — plus `RUNNING: true`/`false`. Live load test #21
+found this JSON payload is bigger than it looks: Maze Voice's own six
+`{NAME,VALUE}` argument pairs come to ~350 bytes alone, and an
+undersized buffer (originally 512 bytes) truncated it and **failed
+completely silently** — the button still flipped visually (that's a
+local optimistic update, not proof the request went anywhere), but
+nothing was ever sent and there was no error to find in the log, because
+the buffer-overflow guard didn't log either. Fixed by sizing generously
+(1024/1536 bytes) and by making every early-return in
+`send_engine_toggle()` log why — a new addon with a longer `ARGUMENTS`
+list should check this doesn't recur, not assume the current size is
+infinite headroom.
+
+`engine_on` (the button's rendered state) is refreshed at
+`poll_toggle()`'s own ~2/sec cadence via `is_process_running()` — a
+plain `/proc` scan for a process whose `comm` matches
+`engine_process_name` exactly, the same identity `killall`/`pidof`
+already match on. Not checked on every redraw (a knob drag can trigger
+50-100 redraws/sec; an unbounded directory scan has no business running
+that often) — a button tap optimistically flips `engine_on` immediately
+for instant visual feedback, and the next poll cycle self-corrects if
+the guess didn't match reality.
 
 ## The widget system
 
@@ -226,11 +325,19 @@ screen/pads/touch/audio normal at every step and after every revert.
 4. Port the verified layout into `force_shadow.c` as a new
    `build_<addon>_tab()` function, and add its entry to `addon_table[]`
    (`ctrl_sock`, `display_name`, `num_tabs`, `tab_names[]`, the function
-   pointer). That's the entire integration — `poll_toggle()`,
-   `render_shadow_page()`, and `send_ctrl_set()` all pick it up
-   automatically.
-5. Stage the live test: pass-through, static toggle-on, interactive —
-   confirm physically at every step.
-6. Update `DESIGN.md` with what you built and what you found (this
+   pointer, plus the four `engine_*` fields copied verbatim from that
+   addon's own `NSMODULE.json` if it should get an on/off button). That's
+   the entire integration — `poll_toggle()`, `render_shadow_page()`, and
+   `send_ctrl_set()` all pick it up automatically.
+5. If this addon currently uses `SHIFT+SCENE-N` to start/stop its engine
+   directly, rebind that line in `midiloop.config` to point at the same
+   `SCRIPT-N` its `KNOBS+SCENE-N` page-toggle already uses — see "The
+   hardware combo" section above for the careful, by-hand process (this
+   is editing an *already-bound* combo, not an empty slot).
+6. Stage the live test: pass-through, static toggle-on, interactive
+   (including the engine button, both directions — check the actual
+   process in `ps`, not just the button's own visual state), the combo
+   rebind — confirm physically at every step.
+7. Update `DESIGN.md` with what you built and what you found (this
    project's own convention — every non-obvious constant here exists
    because a past mistake is documented next to it).

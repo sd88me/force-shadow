@@ -76,6 +76,9 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <linux/input.h>
@@ -635,6 +638,21 @@ typedef struct {
     int num_tabs;
     const char *tab_names[MAX_TABS];
     void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
+
+    /* Engine on/off, driven from the top-bar button (2026-09-19) instead
+     * of a separate SHIFT+SCENE-N combo -- see send_engine_toggle()'s own
+     * comment for why this goes through nodeServer's /moduler HTTP API
+     * rather than fork/exec'ing from inside MPC's own process.
+     * engine_process_name NULL = this addon has no engine to toggle (or
+     * doesn't need one shown), and the button is simply not drawn. The
+     * other three fields must come from that addon's own NSMODULE.json
+     * verbatim -- moduler's UPDATE endpoint overwrites the file with
+     * whatever ARGUMENTS we send, so re-sending anything paraphrased or
+     * stale would corrupt it. */
+    const char *engine_process_name;   /* NSMODULE.json's PROCESSNAME */
+    const char *engine_nsmodule_path;  /* absolute path to that NSMODULE.json */
+    const char *engine_dirname;        /* NSMODULE.json's DIRNAME */
+    const char *engine_arguments_json; /* NSMODULE.json's ARGUMENTS array, as literal JSON text */
 } addon_descriptor_t;
 
 /* One entry per KNOBS+SCENE-N slot already reserved in USER-SCRIPTS.sh/
@@ -650,8 +668,26 @@ static const addon_descriptor_t addon_table[NUM_ADDON_SLOTS] = {
         .num_tabs = 3,
         .tab_names = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" },
         .build_tab = build_maze_voice_tab,
+        .engine_process_name = "maze_host",
+        .engine_nsmodule_path = "/media/662522/AddOns/ForceMazeVoice/NSMODULE.json",
+        .engine_dirname = "ForceMazeVoice",
+        .engine_arguments_json =
+            "[{\"NAME\":\"module-dir flag\",\"VALUE\":\"--module-dir\"},"
+            "{\"NAME\":\"module directory (chain_params/ui_hierarchy source)\","
+            "\"VALUE\":\"/media/662522/AddOns/ForceMazeVoice\"},"
+            "{\"NAME\":\"ctrl-sock flag\",\"VALUE\":\"--ctrl-sock\"},"
+            "{\"NAME\":\"control socket path\",\"VALUE\":\"/tmp/maze_ctrl.sock\"},"
+            "{\"NAME\":\"control-channel flag\",\"VALUE\":\"--control-channel\"},"
+            "{\"NAME\":\"Q-Link control channel (1-16)\",\"VALUE\":\"1\"}]",
     },
 };
+
+/* Cached "is the active addon's engine process actually running" state --
+ * refreshed at poll_toggle()'s own ~2/sec cadence (see there), read by
+ * the renderer for the top-bar button's dim/lit state. Not read directly
+ * from /proc on every redraw: a knob drag can trigger 50-100 redraws/sec,
+ * and an unbounded directory scan has no business running that often. */
+static volatile int engine_on = 0;
 
 static int active_addon = ADDON_NONE;
 
@@ -903,10 +939,20 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
  * `addon` selects which addon_table[] entry's chrome (top-bar title, tab
  * names/count) to draw -- generic over any addon with a real build_tab,
  * not just Maze Voice. */
+/* Top-bar engine on/off button geometry -- shared between rendering here
+ * and hit-testing in update_touch_state(), same "one place, can't drift"
+ * principle as every other widget's hit box. Not a page_widgets[] entry:
+ * it must stay visible/tappable across every tab of the active addon,
+ * while page_widgets[] gets wiped and rebuilt on every tab switch. */
+#define ENGINE_BTN_W 160
+#define ENGINE_BTN_H 40
+#define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
+#define ENGINE_BTN_Y 16
+
 static void render_shadow_page(uint32_t *map, uint32_t stride_px,
                                 const ui_widget_t *widgets, int n_widgets,
                                 const ui_frame_t *frames, int n_frames,
-                                int page, int addon) {
+                                int page, int addon, int engine_on_snap) {
     const addon_descriptor_t *ad = &addon_table[addon];
 
     fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, PLATE_BG);
@@ -916,8 +962,18 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     char title[40];
     snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name ? ad->display_name : "");
     draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
-    fill_circle_land(map, stride_px, LAND_W - 150, 36, 5, UI_ACCENT_HI);
-    draw_text_land(map, stride_px, LAND_W - 130, 28, "LIVE", 2, UI_INK_DIM);
+
+    /* Engine on/off (2026-09-19): replaces the old static "LIVE" text --
+     * dim/grey when the engine's off, lit accent when it's on, matching
+     * this project's own web GUIs' toggle convention. Only drawn for an
+     * addon that actually has an engine to control. */
+    if (ad->engine_process_name) {
+        uint32_t bg = engine_on_snap ? UI_ACCENT : PLATE_LINE;
+        uint32_t fg = engine_on_snap ? UI_INK : UI_INK_FAINT;
+        fill_rect_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bg);
+        draw_text_land_c(map, stride_px, ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
+                          engine_on_snap ? "ENGINE ON" : "ENGINE OFF", 2, fg);
+    }
 
     for (int i = 0; i < n_frames; i++) render_frame_box(map, stride_px, &frames[i]);
     for (int i = 0; i < n_widgets; i++) render_widget(map, stride_px, &widgets[i]);
@@ -1162,7 +1218,7 @@ static void maybe_redraw_shadow(void) {
     pthread_mutex_unlock(&touch_mu);
 
     render_shadow_page(shadow_map, shadow_stride_px, widgets_snap, n_widgets_snap,
-                        frames_snap, n_frames_snap, page_snap, addon_snap);
+                        frames_snap, n_frames_snap, page_snap, addon_snap, engine_on);
 }
 
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
@@ -1212,6 +1268,10 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
     }
 }
 
+/* Forward-declared: defined later, next to send_engine_toggle() which
+ * it's conceptually paired with. */
+static int is_process_running(const char *name);
+
 /* Decides which addon (if any) should be showing, and rebuilds its first
  * tab whenever that decision *changes* -- covers off->on, on->off, and
  * (once a second addon's page actually exists) switching directly from
@@ -1219,7 +1279,9 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
  * (piggybacked on real atomic commits, like everything else here), so it
  * takes touch_mu itself around the rebuild rather than assuming a caller
  * already holds it -- unlike update_touch_state()'s own tab-switch code,
- * which already runs inside its own touch_mu section. */
+ * which already runs inside its own touch_mu section. Also refreshes
+ * engine_on at this same ~2/sec cadence -- see is_process_running()'s
+ * own comment for why that check doesn't run on every redraw. */
 static void poll_toggle(void) {
     struct stat st;
     int requested = ADDON_NONE;
@@ -1255,6 +1317,9 @@ static void poll_toggle(void) {
         shadow_redraw_needed = 1;
     }
     shadow_on = (active_addon != ADDON_NONE);
+    engine_on = (active_addon != ADDON_NONE && addon_table[active_addon].engine_process_name)
+                    ? is_process_running(addon_table[active_addon].engine_process_name)
+                    : 0;
 }
 
 /* ---- Touch takeover (step 3) ----
@@ -1414,6 +1479,136 @@ static int ctrl_send_throttle_ok(void) {
     return 1;
 }
 
+/* ---- Engine on/off (2026-09-19): a top-bar button instead of a
+ * separate SHIFT+SCENE-N combo ----
+ *
+ * Was: SHIFT+SCENE-N started/stopped an addon's engine (a MidiLoop
+ * script directly forking/killing the host binary), KNOBS+SCENE-N
+ * showed/hid its shadow page -- two combos to remember. Now:
+ * SHIFT+SCENE-N shows the page (rebound to the same thing KNOBS+SCENE-N
+ * already did -- see midiloop.config), and the page itself carries an
+ * on/off button in its top bar, matching how this project's own web
+ * GUIs already present a live status/control affordance. */
+
+/* Scans /proc for a process whose comm (the kernel-truncated-to-15-char
+ * name, same identity killall/pidof match on) equals `name` exactly.
+ * Only ever called from poll_toggle()'s own ~2/sec cadence (see there),
+ * never from a hot path -- a full /proc walk has no business running on
+ * every redraw. */
+static int is_process_running(const char *name) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%s/comm", de->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char comm[32] = {0};
+        if (fgets(comm, sizeof(comm), f)) {
+            size_t len = strlen(comm);
+            if (len && comm[len - 1] == '\n') comm[len - 1] = 0;
+            if (strcmp(comm, name) == 0) found = 1;
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return found;
+}
+
+/* Fire-and-forget HTTP POST to nodeServer's own generic addon
+ * start/stop endpoint (/moduler/UPDATE -- the exact same one the
+ * on-device Modules web page itself uses, confirmed by reading
+ * nodeServer's own app/api/endpoints/moduler/index.js). Deliberately
+ * NOT fork()/exec()/system() from inside this file: that would mean
+ * spawning a child from a library injected into MPC's own real-time,
+ * multi-threaded process -- survivable if done carefully, but a new and
+ * unnecessary risk on a platform this project has already found
+ * fragile in less exotic ways (acvs-restart-kills-pads, same-boot-
+ * restart fatigue, SCHED_FIFO starving unrelated threads). nodeServer
+ * is already a separate, already-running, already-proven process doing
+ * exactly this job (child_process.spawn/execSync("killall ...")) --
+ * reusing it means our side is just another bounded socket call, the
+ * same risk class as send_ctrl_set() above.
+ *
+ * Doesn't wait for or parse the reply: nodeServer's own handler
+ * performs the actual spawn/kill synchronously, then deliberately
+ * delays its HTTP response by 500ms (its own setTimeout) before
+ * reporting status -- there's nothing useful to wait for, and blocking
+ * the touch thread half a second for a button tap would feel broken. */
+#define NODESERVER_HOST "127.0.0.1"
+#define NODESERVER_PORT 8080
+static void send_engine_toggle(int addon_id, int want_running) {
+    const addon_descriptor_t *ad = &addon_table[addon_id];
+    if (!ad->engine_process_name || !ad->engine_nsmodule_path) {
+        logline("engine_toggle: addon %d has no engine configured -- dropped", addon_id);
+        return;
+    }
+
+    /* Live load test #21 found this at 512: Maze Voice's own ARGUMENTS
+     * JSON alone is ~350 bytes (six {NAME,VALUE} pairs, one of them a
+     * full directory path) -- the full body came to 529 bytes, silently
+     * truncated by the old 512-byte buffer, tripping the overflow guard
+     * below with no visible symptom except the engine never actually
+     * toggling. Sized with real headroom for addons with more/longer
+     * arguments, and the guard now logs instead of failing silently --
+     * that silence is exactly what made this bug take a live test to
+     * find instead of a glance at the log. */
+    char body[1024];
+    int blen = snprintf(body, sizeof(body),
+        "{\"CONFIGFILE\":\"%s\",\"PROCESSNAME\":\"%s\",\"DIRNAME\":\"%s\","
+        "\"ARGUMENTS\":%s,\"RUNNING\":%s}",
+        ad->engine_nsmodule_path, ad->engine_process_name, ad->engine_dirname,
+        ad->engine_arguments_json, want_running ? "true" : "false");
+    if (blen < 0 || (size_t)blen >= sizeof(body)) {
+        logline("engine_toggle[%s]: JSON body build failed/truncated (blen=%d, cap=%zu) -- dropped",
+                 ad->engine_process_name, blen, sizeof(body));
+        return;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        logline("engine_toggle[%s]: socket() failed: %s -- dropped",
+                 ad->engine_process_name, strerror(errno));
+        return;
+    }
+    struct timeval tv = { 0, CTRL_SEND_TIMEOUT_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(NODESERVER_PORT);
+    inet_pton(AF_INET, NODESERVER_HOST, &addr.sin_addr);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        char req[1536];
+        int rlen = snprintf(req, sizeof(req),
+            "POST /moduler/UPDATE HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            blen, body);
+        if (rlen > 0 && (size_t)rlen < sizeof(req)) {
+            send(fd, req, (size_t)rlen, MSG_NOSIGNAL);
+            logline("engine_toggle[%s]: sent RUNNING=%s",
+                     ad->engine_process_name, want_running ? "true" : "false");
+        } else {
+            logline("engine_toggle[%s]: HTTP request build failed/truncated (rlen=%d, cap=%zu) -- dropped",
+                     ad->engine_process_name, rlen, sizeof(req));
+        }
+    } else {
+        logline("engine_toggle[%s]: connect to nodeServer failed: %s",
+                 ad->engine_process_name, strerror(errno));
+    }
+    close(fd);
+}
+
 /* Dispatches by widget kind: knob sends its scaled real-world numeric
  * value (throttled during a drag, forced on release -- same reasoning
  * as the original single-page build); toggle sends "on"/"off"; enum
@@ -1496,6 +1691,10 @@ static void update_touch_state(const struct input_event *ev) {
      * release), so one slot is enough. */
     int send_idx = -1, send_force = 0;
     ui_widget_t send_snapshot = {0};
+    /* Same deferred-dispatch principle for the top-bar engine button --
+     * separate from send_idx/send_snapshot above since it's not a
+     * page_widgets[] entry and goes to a different function entirely. */
+    int engine_toggle_addon = -1, engine_toggle_want = 0;
 
     pthread_mutex_lock(&touch_mu);
     if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
@@ -1517,9 +1716,20 @@ static void update_touch_state(const struct input_event *ev) {
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
         active_widget = -1;
 
+        const addon_descriptor_t *ad_active = &addon_table[active_addon];
         int32_t tabbar_y = LAND_H - TABBAR_H;
-        int num_tabs = addon_table[active_addon].num_tabs;
-        if (lpy >= tabbar_y && num_tabs > 0) {
+        int num_tabs = ad_active->num_tabs;
+        if (ad_active->engine_process_name &&
+            lpx >= ENGINE_BTN_X && lpx <= ENGINE_BTN_X + ENGINE_BTN_W &&
+            lpy >= ENGINE_BTN_Y && lpy <= ENGINE_BTN_Y + ENGINE_BTN_H) {
+            /* Optimistic flip for instant visual feedback -- poll_toggle()'s
+             * own ~2/sec /proc check self-corrects afterward if the actual
+             * spawn/kill didn't land the way this guessed. */
+            engine_on = !engine_on;
+            shadow_redraw_needed = 1;
+            engine_toggle_addon = active_addon;
+            engine_toggle_want = engine_on;
+        } else if (lpy >= tabbar_y && num_tabs > 0) {
             int32_t tw = LAND_W / num_tabs;
             int new_page = lpx / tw;
             if (new_page < 0) new_page = 0;
@@ -1592,6 +1802,9 @@ static void update_touch_state(const struct input_event *ev) {
 
     if (send_idx >= 0) {
         send_widget_param(&send_snapshot, send_force);
+    }
+    if (engine_toggle_addon >= 0) {
+        send_engine_toggle(engine_toggle_addon, engine_toggle_want);
     }
 }
 

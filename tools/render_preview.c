@@ -165,13 +165,26 @@ static void frame_box(int x, int y, int w, int h, const char *title) {
  * LAND_H again. Kept in sync with force_shadow.c so this preview stays a
  * faithful reference for future pages. */
 static const char *TABS[] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" };
-static void draw_chrome(int active_tab) {
+
+/* Top-bar engine on/off button (2026-09-19) -- replaces the old static
+ * "LIVE" text. Geometry kept in sync with force_shadow.c's own
+ * ENGINE_BTN_X/Y/W/H. */
+#define ENGINE_BTN_W 160
+#define ENGINE_BTN_H 40
+#define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
+#define ENGINE_BTN_Y 16
+
+static void draw_chrome(int active_tab, int engine_on) {
     fill_rect(0, 0, LAND_W, LAND_H, PLATE);
     fill_rect(0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     draw_hline(0, TOPBAR_H, LAND_W, PLATE_LINE);
     draw_text(40, 28, "FORCE SHADOW - MAZE VOICE", 2, INK);
-    fill_circle(LAND_W - 150, 36, 5, ACCENT_HI);
-    draw_text(LAND_W - 130, 28, "LIVE", 2, INK_DIM);
+
+    uint32_t bbg = engine_on ? ACCENT : PLATE_LINE;
+    uint32_t bfg = engine_on ? INK : INK_FAINT;
+    fill_rect(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bbg);
+    draw_text_c(ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
+                engine_on ? "ENGINE ON" : "ENGINE OFF", 2, bfg);
 
     int tabbar_y = LAND_H - TABBAR_H;
     fill_rect(0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
@@ -322,7 +335,8 @@ static void write_ppm(const char *path) {
 int main(int argc, char **argv) {
     int page = argc > 1 ? atoi(argv[1]) : 0;
     const char *out = argc > 2 ? argv[2] : "preview.ppm";
-    draw_chrome(page);
+    int engine_on = argc > 3 ? atoi(argv[3]) : 1;
+    draw_chrome(page, engine_on);
     if (page == 0) page_voice();
     else if (page == 1) page_wavefolder_filter();
     else page_mod_random_mix();
