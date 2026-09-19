@@ -2158,6 +2158,50 @@ tally in "Not yet done" below, now due for an update).
 
 ## Not yet done
 
+- **Per-addon data-driven GUI** — user-raised (2026-09-19): today
+  `addon_table[]` and every `build_<addon>_tab()` live inside
+  `force_shadow.c` itself, so adding a page for a new addon means
+  editing, rebuilding, and redeploying ForceShadow, not something the
+  addon's own repo/install can carry on its own. Scope: define a small
+  per-addon page-definition file (its `ctrl_sock`/engine fields plus a
+  list of tabs, each a list of widgets with kind/position/key/range/
+  options) shipped in that addon's own folder (e.g.
+  `AddOns/<Addon>/shadow_page.<ext>`); `force_shadow.so` scans for these
+  at setup and builds `addon_table[]` from them at runtime instead of
+  compile time. The rendering engine and touch hit-testing can't move
+  out (they own the DRM buffer and touch device directly) -- only the
+  "what to draw" data moves per-addon. A nice side effect: `tools/
+  render_preview.c` could consume the exact same file, closing the "two
+  copies of every layout, kept in sync by hand" gap that exists today
+  between it and `force_shadow.c`'s own `build_<addon>_tab()` functions.
+  Open question, deliberately not settled yet: JSON (more "standard,"
+  needs either vendoring a tiny parser like `jsmn` or hand-rolling one)
+  vs. a simpler custom line-oriented format (zero parsing risk, no
+  escaping, trivially hand-editable, no new dependency -- more in
+  keeping with this project's own hand-rolled-everything ethos, e.g.
+  the DRM structs and the bitmap font). Effort: medium, comparable in
+  size to live load test #20's active-addon-selector work. Risk of
+  locking in a schema before it's proven against real, varied needs --
+  worth building one or two more pages the current (hardcoded) way
+  first if that hasn't already happened by the time this is picked up.
+- **Anti-aliased rendering** — user-raised (2026-09-19), same
+  conversation: the current renderer is deliberately minimal (flat-
+  filled shapes, an 8x8 1-bit bitmap font, zero anti-aliasing) -- that's
+  the actual source of it looking less sharp/polished than MPC's own
+  native UI, not a resolution problem. Cheapest path: regenerate the
+  bitmap font at higher resolution with real alpha/anti-aliasing baked
+  in (same offline Pillow-based generation process already used for the
+  current font -- see "The real Maze Voice control pages" section above
+  -- just keeping coverage values instead of a 1-bit threshold), and add
+  edge-coverage blending to the knob circles/rings (cheap: only boundary
+  pixels need the extra math). Zero new dependencies. A bigger, more
+  flexible option is vendoring `stb_truetype.h` (single-header, public
+  domain, no runtime dependency) for real scalable vector fonts -- more
+  capable, more surface area, more risk; only worth it if the cheaper
+  path doesn't close the gap enough. Effort: low-medium for the cheap
+  path. Same offline-preview-first discipline applies as everything
+  else in this file.
+
 - **Investigate why the platform's own documented boot-time `LD_PRELOAD`
   race (`gotchas.md`'s case study, supposedly already fixed at the
   source) reproduced on this device's first real cold boot with
