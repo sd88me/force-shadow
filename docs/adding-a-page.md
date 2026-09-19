@@ -138,6 +138,16 @@ env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>   # DX7 EG graph from si
 ```
 
 ```
+bits    cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<state key>
+```
+
+`bits` is a row of 8 tappable step LEDs (Maze Sequencer). `get` is a
+`<length>|b,b,...|<play>` reply (e.g. maze_seq's `s1_state`); a tap SETs `key`
+to the step index; the play head is polled every 200ms. `button` also takes an
+optional `val=<text>`: the value SET on press instead of the default `go`
+(e.g. an advance button with `val=1`).
+
+```
 list    x=<n> y=<n> w=<n> h=<n> key=<SET key> items=<GET key -> JSON [{label|name}]> sel=<GET key for current index>
         cols=<n> rows=<n> th=<tile px> gap=<n> jump=<0|1 A-Z row> colmajor=<0|1> numbered=<0|1> scale=<text scale>
 ```
