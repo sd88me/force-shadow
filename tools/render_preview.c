@@ -55,17 +55,47 @@ static void fill_rect(int x0, int y0, int w, int h, uint32_t color) {
         for (int x = x0; x < x0 + w; x++)
             put_px(x, y, color);
 }
+/* Mirrors force_shadow.c's own put_px_blend_land/circle_edge_coverage
+ * (see that file's own comments for why: no sqrt, an integer
+ * approximation of (r-dist) good enough for a ~1px AA band) so this
+ * preview stays a faithful reference for the real anti-aliased edges. */
+static void put_px_blend(int x, int y, uint32_t color, int alpha) {
+    if (alpha <= 0) return;
+    if (alpha >= 255) { put_px(x, y, color); return; }
+    if (x < 0 || x >= LAND_W || y < 0 || y >= LAND_H) return;
+    rgb_t bg_c = { canvas[y][x][0], canvas[y][x][1], canvas[y][x][2] };
+    rgb_t fg_c = rgb(color);
+    canvas[y][x][0] = (uint8_t)((fg_c.r * alpha + bg_c.r * (255 - alpha)) / 255);
+    canvas[y][x][1] = (uint8_t)((fg_c.g * alpha + bg_c.g * (255 - alpha)) / 255);
+    canvas[y][x][2] = (uint8_t)((fg_c.b * alpha + bg_c.b * (255 - alpha)) / 255);
+}
+static int circle_edge_coverage(int d2, int r) {
+    if (r <= 0) return 0;
+    int cov = 128 + ((r * r - d2) * 128) / (2 * r);
+    if (cov < 0) cov = 0;
+    if (cov > 255) cov = 255;
+    return cov;
+}
 static void fill_circle(int cx, int cy, int r, uint32_t color) {
-    for (int y = -r; y <= r; y++)
-        for (int x = -r; x <= r; x++)
-            if (x*x + y*y <= r*r) put_px(cx + x, cy + y, color);
+    for (int y = -r - 1; y <= r + 1; y++)
+        for (int x = -r - 1; x <= r + 1; x++) {
+            int cov = circle_edge_coverage(x*x + y*y, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px(cx + x, cy + y, color);
+            else put_px_blend(cx + x, cy + y, color, cov);
+        }
 }
 static void draw_ring(int cx, int cy, int r, int thick, uint32_t color) {
     int r_in = r - thick;
-    for (int y = -r; y <= r; y++)
-        for (int x = -r; x <= r; x++) {
+    for (int y = -r - 1; y <= r + 1; y++)
+        for (int x = -r - 1; x <= r + 1; x++) {
             int d2 = x*x + y*y;
-            if (d2 <= r*r && d2 >= r_in*r_in) put_px(cx + x, cy + y, color);
+            int outer_cov = circle_edge_coverage(d2, r);
+            int inner_cov = 255 - circle_edge_coverage(d2, r_in);
+            int cov = outer_cov < inner_cov ? outer_cov : inner_cov;
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px(cx + x, cy + y, color);
+            else put_px_blend(cx + x, cy + y, color, cov);
         }
 }
 static void draw_hline(int x0, int y, int w, uint32_t color) { fill_rect(x0, y, w, 1, color); }

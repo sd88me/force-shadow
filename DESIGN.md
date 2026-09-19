@@ -2256,6 +2256,64 @@ own mitigation — retry with `systemctl restart acvs` — worked both
 times) and a WiFi/ethernet drop mid-deploy (self-resolved once
 reachable again, no lasting harm).
 
+## Live load test #23 (2026-09-19): anti-aliased circle/ring rendering, no `libm`
+
+Tackled the first half of the "Anti-aliased rendering" idea above (the
+"cheap path"'s knob-circle piece; the bitmap-font piece is still not
+started) — user's own words earlier this session: "the rendered pages
+arnt very high quality visually, they are not as sharp or polished as
+say the standard mpc ui," and the explicit instruction to do this next
+once the Maze Voice conversion (live load test #22) was confirmed.
+
+Constraint carried over from the rest of this project: zero new library
+dependencies. A "real" circle antialias wants `sqrt` (distance from
+center), which would pull in `libm` — a dependency this project has
+deliberately avoided throughout (`readelf -d` on every build has only
+ever shown `libdl.so.2`, `libpthread.so.0`, `libc.so.6`). Used an
+integer-only approximation instead: for a point at squared-distance `d2`
+from the center of a circle of radius `r`, coverage is
+
+```
+cov = clamp(128 + ((r*r - d2) * 128) / (2*r), 0, 255)
+```
+
+This exploits `d(d2)/d(dist) ≈ 2r` right at the boundary, so
+`(r*r - d2) / (2*r) ≈ (r - dist)` -- a ~1px-wide smoothing band computed
+entirely in integer arithmetic, no `sqrt` anywhere. Implemented as
+`circle_edge_coverage()`, consumed by a new `put_px_blend_land()` (reads
+the destination pixel, does a per-channel linear blend by the coverage
+alpha -- draw-order dependent, background must already be painted) and
+used to rewrite `fill_circle_land()`/`draw_ring_land()`, replacing the
+old flat/hard-edged versions. Same primitives mirrored into
+`tools/render_preview.c` (`put_px_blend()`, `circle_edge_coverage()`,
+rewritten `fill_circle()`/`draw_ring()`) for offline verification.
+
+**Verified offline first**, per the project's standing discipline:
+rendered `preview_aa.ppm`, converted to PNG, cropped and zoomed into a
+single knob -- both the knob face's outer edge and its accent pointer
+dot showed visibly smooth edges where the old renderer had hard jagged
+steps.
+
+**Cross-compiled and dependency-checked before deploying**: `readelf -d
+force_shadow.so | grep NEEDED` confirmed the dependency list is
+unchanged (`libdl.so.2`, `libpthread.so.0`, `libc.so.6` only) -- the
+no-`sqrt` design choice held.
+
+**Deployed and confirmed live, end to end**: checksum-verified copy to
+`/media/662522/AddOns/ForceShadow/force_shadow.so`
+(`911bdc47a5472c62aea798e02df746fe`), toggle state cleared, `acvs`
+restarted -- clean load on the first attempt this time (both Maze Voice
+and DX7's `.conf` pages discovered correctly, no boot-time `LD_PRELOAD`
+race). Pass-through/screen/pads/touch confirmed normal first, then the
+user opened a page and confirmed: "yes the knobs and knob text look
+clearer."
+
+Also noted, unprompted, by the user during this same check: "still
+tearing" -- this is the pre-existing, already-catalogued cosmetic
+tearing from the lack of double-buffering (see the "Interactive
+dragging" note above), unrelated to this anti-aliasing change and not
+addressed here.
+
 ## Not yet done
 
 - ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real
@@ -2271,19 +2329,18 @@ reachable again, no lasting harm).
   conversation: the current renderer is deliberately minimal (flat-
   filled shapes, an 8x8 1-bit bitmap font, zero anti-aliasing) -- that's
   the actual source of it looking less sharp/polished than MPC's own
-  native UI, not a resolution problem. Cheapest path: regenerate the
-  bitmap font at higher resolution with real alpha/anti-aliasing baked
-  in (same offline Pillow-based generation process already used for the
-  current font -- see "The real Maze Voice control pages" section above
-  -- just keeping coverage values instead of a 1-bit threshold), and add
-  edge-coverage blending to the knob circles/rings (cheap: only boundary
-  pixels need the extra math). Zero new dependencies. A bigger, more
-  flexible option is vendoring `stb_truetype.h` (single-header, public
-  domain, no runtime dependency) for real scalable vector fonts -- more
-  capable, more surface area, more risk; only worth it if the cheaper
-  path doesn't close the gap enough. Effort: low-medium for the cheap
-  path. Same offline-preview-first discipline applies as everything
-  else in this file.
+  native UI, not a resolution problem. Cheapest path has two pieces:
+  ~~add edge-coverage blending to the knob circles/rings~~ -- **done,
+  live load test #23** -- and regenerate the bitmap font at higher
+  resolution with real alpha/anti-aliasing baked in (same offline
+  Pillow-based generation process already used for the current font --
+  see "The real Maze Voice control pages" section above -- just keeping
+  coverage values instead of a 1-bit threshold), still not started. A
+  bigger, more flexible option is vendoring `stb_truetype.h` (single-
+  header, public domain, no runtime dependency) for real scalable vector
+  fonts -- more capable, more surface area, more risk; only worth it if
+  the cheaper path doesn't close the gap enough. Same offline-preview-
+  first discipline applies as everything else in this file.
 
 - **Investigate why the platform's own documented boot-time `LD_PRELOAD`
   race (`gotchas.md`'s case study, supposedly already fixed at the

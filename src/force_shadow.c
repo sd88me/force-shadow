@@ -486,24 +486,70 @@ static void fill_rect_land(uint32_t *map, uint32_t stride_px,
             put_px_land(map, stride_px, x, y, color);
 }
 
+/* Blends `color` into the existing pixel at (lx,ly) by `alpha` (0-255)
+ * instead of put_px_land's hard overwrite -- used for anti-aliased
+ * edges below. Reads the destination pixel first, so (unlike every
+ * other draw call here) it depends on drawing order: callers must fill
+ * whatever sits *behind* an edge before blending the edge itself, same
+ * as the existing frame->widget->chrome draw order already does. */
+static inline void put_px_blend_land(uint32_t *map, uint32_t stride_px,
+                                      int32_t lx, int32_t ly, uint32_t color, int32_t alpha) {
+    if (alpha <= 0) return;
+    if (alpha >= 255) { put_px_land(map, stride_px, lx, ly, color); return; }
+    if (lx < 0 || lx >= LAND_W || ly < 0 || ly >= LAND_H) return;
+    int32_t bx = ly;
+    int32_t by = (int32_t)SHADOW_H - 1 - lx;
+    if (bx < 0 || bx >= (int32_t)SHADOW_W || by < 0 || by >= (int32_t)SHADOW_H) return;
+    uint32_t *px = &map[(size_t)by * stride_px + (size_t)bx];
+    uint32_t bg = *px;
+    int32_t br = (int32_t)((bg >> 16) & 0xFF), bgc = (int32_t)((bg >> 8) & 0xFF), bb = (int32_t)(bg & 0xFF);
+    int32_t fr = (int32_t)((color >> 16) & 0xFF), fg = (int32_t)((color >> 8) & 0xFF), fb = (int32_t)(color & 0xFF);
+    int32_t r = (fr * alpha + br * (255 - alpha)) / 255;
+    int32_t g = (fg * alpha + bgc * (255 - alpha)) / 255;
+    int32_t b = (fb * alpha + bb * (255 - alpha)) / 255;
+    *px = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+/* Approximates a circle's edge-antialiasing coverage (0-255) for a point
+ * at squared-distance `d2` from center against target radius `r`,
+ * without sqrt -- this project's own no-libm dependency discipline
+ * (confirmed unchanged after every past change to this file). Exact
+ * distance isn't needed, only a smooth ~1px ramp at the boundary:
+ * d(d2)/d(dist) = 2*dist ~= 2*r near dist=r, so (r2-d2)/(2r) approximates
+ * (r-dist) well enough for that. */
+static inline int32_t circle_edge_coverage(int32_t d2, int32_t r) {
+    if (r <= 0) return 0;
+    int32_t cov = 128 + ((r * r - d2) * 128) / (2 * r);
+    if (cov < 0) cov = 0;
+    if (cov > 255) cov = 255;
+    return cov;
+}
+
 static void fill_circle_land(uint32_t *map, uint32_t stride_px,
                               int32_t cx, int32_t cy, int32_t r,
                               uint32_t color) {
-    for (int32_t y = -r; y <= r; y++)
-        for (int32_t x = -r; x <= r; x++)
-            if (x * x + y * y <= r * r)
-                put_px_land(map, stride_px, cx + x, cy + y, color);
+    for (int32_t y = -r - 1; y <= r + 1; y++)
+        for (int32_t x = -r - 1; x <= r + 1; x++) {
+            int32_t cov = circle_edge_coverage(x * x + y * y, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px_land(map, stride_px, cx + x, cy + y, color);
+            else put_px_blend_land(map, stride_px, cx + x, cy + y, color, cov);
+        }
 }
 
 static void draw_ring_land(uint32_t *map, uint32_t stride_px,
                             int32_t cx, int32_t cy, int32_t r, int32_t thick,
                             uint32_t color) {
     int32_t r_in = r - thick;
-    for (int32_t y = -r; y <= r; y++)
-        for (int32_t x = -r; x <= r; x++) {
+    for (int32_t y = -r - 1; y <= r + 1; y++)
+        for (int32_t x = -r - 1; x <= r + 1; x++) {
             int32_t d2 = x * x + y * y;
-            if (d2 <= r * r && d2 >= r_in * r_in)
-                put_px_land(map, stride_px, cx + x, cy + y, color);
+            int32_t outer_cov = circle_edge_coverage(d2, r);
+            int32_t inner_cov = 255 - circle_edge_coverage(d2, r_in);
+            int32_t cov = outer_cov < inner_cov ? outer_cov : inner_cov;
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px_land(map, stride_px, cx + x, cy + y, color);
+            else put_px_blend_land(map, stride_px, cx + x, cy + y, color, cov);
         }
 }
 
