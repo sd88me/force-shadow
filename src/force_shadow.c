@@ -481,9 +481,18 @@ static inline void put_px_land(uint32_t *map, uint32_t stride_px,
 static void fill_rect_land(uint32_t *map, uint32_t stride_px,
                             int32_t x0, int32_t y0, int32_t w, int32_t h,
                             uint32_t color) {
-    for (int32_t y = y0; y < y0 + h; y++)
-        for (int32_t x = x0; x < x0 + w; x++)
-            put_px_land(map, stride_px, x, y, color);
+    /* Clip once, then write row-wise in *buffer* order: landscape y is
+     * the buffer's contiguous axis (bx = ly), landscape x is the strided
+     * one (by = H-1-lx). The old y-outer/x-inner loop hopped a whole
+     * buffer row per pixel, which is brutal on the panel's small cache --
+     * this makes every fill (backgrounds, panels, bars) sequential. */
+    int32_t xa = x0 < 0 ? 0 : x0, xb = x0 + w > LAND_W ? LAND_W : x0 + w;
+    int32_t ya = y0 < 0 ? 0 : y0, yb = y0 + h > LAND_H ? LAND_H : y0 + h;
+    if (xa >= xb || ya >= yb) return;
+    for (int32_t x = xa; x < xb; x++) {
+        uint32_t *row = &map[(size_t)((int32_t)SHADOW_H - 1 - x) * stride_px + (size_t)ya];
+        for (int32_t n = yb - ya; n > 0; n--) *row++ = color;
+    }
 }
 
 /* Blends `color` into the existing pixel at (lx,ly) by `alpha` (0-255)
@@ -1401,15 +1410,36 @@ static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t
     fill_rect_land(map, stride_px, f->x + 18, f->y + 36, f->w - 36, 1, PLATE_LINE);
 }
 
-/* Thick line by stamping small squares along it (no libm; the panel is
- * scanned continuously so this stays cheap and crisp). */
+/* Anti-aliased line of thickness `t` px (no libm). Steps along the major
+ * axis and blends the pixels straddling the line on the minor axis by
+ * their distance from its centre, corrected for slope -- soft edges
+ * instead of the stair-stepped stamped squares this used to draw. Blends
+ * over whatever is already behind it, so draw it after its backdrop. */
 static void draw_line_land(uint32_t *map, uint32_t stride_px, int32_t x0, int32_t y0,
                             int32_t x1, int32_t y1, int32_t t, uint32_t color) {
+    int32_t adx = x1 > x0 ? x1 - x0 : x0 - x1, ady = y1 > y0 ? y1 - y0 : y0 - y1;
+    int steep = ady > adx;
+    if (steep) { int32_t a = x0; x0 = y0; y0 = a; a = x1; x1 = y1; y1 = a; }
+    if (x0 > x1) { int32_t a = x0; x0 = x1; x1 = a; a = y0; y0 = y1; y1 = a; }
     int32_t dx = x1 - x0, dy = y1 - y0;
-    int32_t n = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
-    if (n == 0) n = 1;
-    for (int32_t i = 0; i <= n; i++)
-        fill_rect_land(map, stride_px, x0 + dx * i / n - t/2, y0 + dy * i / n - t/2, t, t, color);
+    /* slope correction: perpendicular width = t * sqrt(1+m^2); cheap
+     * 2-term approximation, exact enough for m in [-1,1]. */
+    float m = dx ? (float)dy / (float)dx : 0.0f;
+    float am = m < 0 ? -m : m;
+    float hw = 0.5f * (float)t * (1.0f + 0.414f * am);
+    for (int32_t x = x0; x <= x1; x++) {
+        float yc = dx ? (float)y0 + m * (float)(x - x0) : (float)y0;
+        int32_t yi = (int32_t)(yc + 0.5f);
+        int32_t span = (int32_t)hw + 2;
+        for (int32_t k = -span; k <= span; k++) {
+            float d = (float)(yi + k) - yc; if (d < 0) d = -d;
+            float cov = hw + 0.5f - d;
+            if (cov <= 0) continue;
+            int32_t a = cov >= 1.0f ? 255 : (int32_t)(cov * 255.0f);
+            if (steep) put_px_blend_land(map, stride_px, yi + k, x, color, a);
+            else put_px_blend_land(map, stride_px, x, yi + k, color, a);
+        }
+    }
 }
 
 /* Solid triangle pointing left (dir<0) or right (dir>0), centred on (cx,cy). */
@@ -1500,7 +1530,7 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
             py[i] = y0 + 12 + ph - (int32_t)(ph * lv[i] / 99.0f);
         }
         for (int i = 0; i < 5; i++) draw_line_land(map, stride_px, px[i], py[i], px[i+1], py[i+1], 3, UI_ACCENT);
-        for (int i = 0; i < 6; i++) fill_rect_land(map, stride_px, px[i] - 4, py[i] - 4, 9, 9, UI_ACCENT_HI);
+        for (int i = 0; i < 6; i++) fill_circle_land(map, stride_px, px[i], py[i], 5, UI_ACCENT_HI);
         break;
     }
     case W_KNOB: {
