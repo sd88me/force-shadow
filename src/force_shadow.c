@@ -680,21 +680,47 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
  * properties) rather than this project's earlier arbitrary rainbow test
  * colors. */
 
-#define PLATE_BG      0xFF131211u
-#define PLATE_HI      0xFF1C1A17u
-#define PLATE_LINE    0xFF2A2823u
-#define UI_INK        0xFFEFE9D8u
-#define UI_INK_DIM    0xFF8F8878u
-#define UI_INK_FAINT  0xFF5C584Cu
-#define UI_ACCENT     0xFFC1552Fu
-#define UI_ACCENT_HI  0xFFE2793Fu
-#define KNOB_FACE     0xFFEFE9D8u
-#define KNOB_RING     0xFF2A2823u
-#define BAR_BG        0xFF0D0C0Au
-#define SEG_ACTIVE    0xFFF2F1EEu
-#define SEG_INACTIVE  0xFF050403u
-#define SEG_ACTIVE_TX 0xFF1C1A17u
-#define BTN_TEXT      0xFFFDF3EAu
+/* Per-addon theme (DX7 work): every colour below used to be a fixed
+ * #define matching the Maze Voice web GUI. They're now fields of ui_theme_t,
+ * selected per addon (addon_descriptor_t.theme, set from `theme_*=RRGGBB`
+ * keys in that addon's shadow_page.conf; unset keys keep THEME_DEFAULT,
+ * which is exactly the old Maze palette so Maze Voice is unchanged). The
+ * old names stay as macros over the active theme `th`, which the renderer
+ * points at the addon being drawn -- so every existing draw call is
+ * untouched. `lcd` switches the widget *style* (dotted-arc dark knobs,
+ * LCD-well readouts, bracketed frames), not just the colours. */
+typedef struct {
+    uint32_t plate_bg, plate_hi, plate_line, ink, ink_dim, ink_faint;
+    uint32_t accent, accent_hi, knob_face, knob_ring, bar_bg;
+    uint32_t seg_active, seg_inactive, seg_active_tx, btn_text;
+    uint32_t well, knob_off, tab_on_bg, lcd_bg;
+    int lcd;
+} ui_theme_t;
+
+static const ui_theme_t THEME_DEFAULT = {
+    0xFF131211u, 0xFF1C1A17u, 0xFF2A2823u, 0xFFEFE9D8u, 0xFF8F8878u, 0xFF5C584Cu,
+    0xFFC1552Fu, 0xFFE2793Fu, 0xFFEFE9D8u, 0xFF2A2823u, 0xFF0D0C0Au,
+    0xFFF2F1EEu, 0xFF050403u, 0xFF1C1A17u, 0xFFFDF3EAu,
+    0xFF050403u, 0xFF4C473Du, 0xFF1A120Du, 0xFF050403u,
+    0
+};
+static ui_theme_t th;  /* active theme; render_shadow_page() sets it per addon */
+
+#define PLATE_BG      (th.plate_bg)
+#define PLATE_HI      (th.plate_hi)
+#define PLATE_LINE    (th.plate_line)
+#define UI_INK        (th.ink)
+#define UI_INK_DIM    (th.ink_dim)
+#define UI_INK_FAINT  (th.ink_faint)
+#define UI_ACCENT     (th.accent)
+#define UI_ACCENT_HI  (th.accent_hi)
+#define KNOB_FACE     (th.knob_face)
+#define KNOB_RING     (th.knob_ring)
+#define BAR_BG        (th.bar_bg)
+#define SEG_ACTIVE    (th.seg_active)
+#define SEG_INACTIVE  (th.seg_inactive)
+#define SEG_ACTIVE_TX (th.seg_active_tx)
+#define BTN_TEXT      (th.btn_text)
 
 #define TOPBAR_H 72
 #define TABBAR_H 72
@@ -710,8 +736,12 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
 #define CONTENT_Y (TOPBAR_H + 16)
 #define CONTENT_H (LAND_H - TOPBAR_H - TABBAR_H - 32)
 
-typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V } widget_kind_t;
-#define MAX_OPTIONS 3
+typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V,
+               W_READOUT,  /* display-only LCD text, value from GET <get_key> */
+               W_STEPPER,  /* < text > : prev/next an integer index (bank, preset) */
+               W_ENV       /* display-only DX7 envelope graph, from sibling knobs */
+} widget_kind_t;
+#define MAX_OPTIONS 6
 
 typedef struct {
     widget_kind_t kind;
@@ -725,19 +755,27 @@ typedef struct {
     const char *options[MAX_OPTIONS];
     int n_options;
     int32_t seg_x[MAX_OPTIONS], seg_y[MAX_OPTIONS], seg_w, seg_h; /* enum only */
+    /* readout/stepper/env only */
+    int32_t w, h;             /* box size */
+    char get_key[20];         /* GET key for the displayed text */
+    char idx_key[20];         /* stepper: GET key for the current index */
+    char count_key[20];       /* stepper: GET key for the item count (max = count-1) */
+    char text[32];            /* last text read from the engine (upper-cased) */
+    int ival, imin, imax;     /* stepper index + bounds */
+    int numbered;             /* stepper: prefix text with the 1-based index */
 } ui_widget_t;
 
 typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
 
-#define MAX_WIDGETS 40
-#define MAX_FRAMES 3
+#define MAX_WIDGETS 64
+#define MAX_FRAMES 6
 static ui_widget_t page_widgets[MAX_WIDGETS];
 static int n_page_widgets = 0;
 static ui_frame_t page_frames[MAX_FRAMES];
 static int n_page_frames = 0;
 static int current_page = 0;  /* current TAB within active_addon, not the addon itself */
 
-#define MAX_TABS 4
+#define MAX_TABS 8
 /* Fixed-size char arrays, not `const char *`, for every string field here
  * (2026-09-19, the "per-addon data-driven GUI" work) -- unifies the two
  * ways an entry gets populated: a compile-time initializer (string
@@ -768,6 +806,12 @@ typedef struct {
     char engine_nsmodule_path[160];  /* absolute path to that NSMODULE.json */
     char engine_dirname[32];         /* NSMODULE.json's DIRNAME */
     char engine_arguments_json[768]; /* NSMODULE.json's ARGUMENTS array, as literal JSON text */
+
+    ui_theme_t theme;    /* colours/style; THEME_DEFAULT unless the conf overrides */
+    /* int_values=1 in the conf: this host parses every value with atoi()
+     * (DX7), so knobs send a rounded "%d", toggles 1/0 and enums their
+     * option index -- instead of "%.2f" / "on"/"off" / option text. */
+    int int_values;
 } addon_descriptor_t;
 
 /* One entry per KNOBS+SCENE-N slot already reserved in USER-SCRIPTS.sh/
@@ -804,6 +848,15 @@ static int active_addon = ADDON_NONE;
  * nothing changed, rather than repainting every single frame regardless
  * of whether the screen's contents are still correct. */
 static volatile int shadow_redraw_needed = 1; /* starts true: first draw */
+
+/* Readback (DX7 work): the page's widgets mirror the engine's live state
+ * (preset/bank names, knob values changed by a preset load). A worker
+ * thread re-GETs them; page_epoch bumps on any addon/tab switch and
+ * refresh_request is set by anything that changes engine state (a
+ * stepper tap), both to make it refresh promptly rather than waiting for
+ * its slow periodic pass. */
+static volatile unsigned page_epoch = 0;
+static volatile int refresh_request = 0;
 
 /* Guards page_widgets[]/current_page (written by the touch thread while
  * dragging/tapping, read by the DRM commit thread while redrawing) --
@@ -844,7 +897,8 @@ static int add_button(int32_t cx, int32_t cy, const char *label, const char *key
     return n_page_widgets++;
 }
 static int add_enum(int32_t cx, int32_t cy, widget_kind_t kind, const char *label,
-                     const char *key, const char **opts, int n, int active) {
+                     const char *key, const char **opts, int n, int active,
+                     int32_t seg_w_override) {
     ui_widget_t *w = &page_widgets[n_page_widgets];
     memset(w, 0, sizeof(*w));
     w->kind = kind; w->cx = cx; w->cy = cy;
@@ -853,7 +907,7 @@ static int add_enum(int32_t cx, int32_t cy, widget_kind_t kind, const char *labe
     w->n_options = n; w->state = active;
     for (int i = 0; i < n; i++) w->options[i] = opts[i];
     if (kind == W_ENUM_H) {
-        w->seg_w = 117; w->seg_h = 33;
+        w->seg_w = seg_w_override > 0 ? seg_w_override : 117; w->seg_h = 33;
         int32_t total = n*w->seg_w + (n-1)*2;
         int32_t x0 = cx - total/2;
         for (int i = 0; i < n; i++) { w->seg_x[i] = x0 + i*(w->seg_w+2); w->seg_y[i] = cy - w->seg_h/2; }
@@ -866,7 +920,49 @@ static int add_enum(int32_t cx, int32_t cy, widget_kind_t kind, const char *labe
     }
     return n_page_widgets++;
 }
+/* Display-only: never hit-tested (hit box is empty). */
+static int add_readout(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *label,
+                        const char *get_key) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_READOUT; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
+    w->hit_hw = w->hit_hh = -1;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
+    strncpy(w->text, "-", sizeof(w->text)-1);
+    return n_page_widgets++;
+}
+/* "<  text  >": tapping the left/right third steps ival within
+ * [imin, imax] (wrapping) and SETs `key` to it; text/index/count are all
+ * read back from the engine by the refresh worker. */
+static int add_stepper(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *label,
+                        const char *key, const char *get_key, const char *idx_key,
+                        const char *count_key, int imin, int imax, int numbered) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_STEPPER; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
+    w->hit_hw = bw/2; w->hit_hh = bh/2;
+    strncpy(w->label, label, sizeof(w->label)-1);
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
+    strncpy(w->idx_key, idx_key, sizeof(w->idx_key)-1);
+    strncpy(w->count_key, count_key, sizeof(w->count_key)-1);
+    strncpy(w->text, "-", sizeof(w->text)-1);
+    w->imin = imin; w->imax = imax; w->numbered = numbered;
+    return n_page_widgets++;
+}
+/* Display-only DX7 envelope graph; param_key is the prefix shared by the
+ * eight sibling knobs (e.g. "op1_eg_" -> op1_eg_r1..r4, op1_eg_l1..l4). */
+static int add_env(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *prefix) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_ENV; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
+    w->hit_hw = w->hit_hh = -1;
+    strncpy(w->param_key, prefix, sizeof(w->param_key)-1);
+    return n_page_widgets++;
+}
 static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title) {
+    if (n_page_frames >= MAX_FRAMES) return;
     ui_frame_t *f = &page_frames[n_page_frames++];
     f->x = x; f->y = y; f->w = w; f->h = h;
     strncpy(f->title, title, sizeof(f->title)-1);
@@ -925,7 +1021,7 @@ static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *ti
  * (23 bytes) plus up to sizeof(addon_descriptor_t.engine_arguments_json)
  * (768) of value, plus margin. */
 #define SHADOW_PAGE_MAX_LINE 900
-#define SHADOW_PAGE_MAX_TOKENS 16
+#define SHADOW_PAGE_MAX_TOKENS 20
 
 /* One addon's worth of pre-built tabs, captured once at parse time by
  * actually calling the real add_knob()/add_toggle()/etc builder
@@ -1060,6 +1156,7 @@ static const char *shadow_page_kv_get(shadow_page_kv_t kv[], int n, const char *
 static void parse_shadow_page_conf(FILE *f, const char *path) {
     addon_descriptor_t parsed;
     memset(&parsed, 0, sizeof(parsed));
+    parsed.theme = THEME_DEFAULT;
     int slot = -1;
     int in_tab = -1; /* -1 = still in the top-level key=value section */
     char line[SHADOW_PAGE_MAX_LINE];
@@ -1120,6 +1217,35 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             else if (strcmp(k, "engine_process_name") == 0) strncpy(parsed.engine_process_name, v, sizeof(parsed.engine_process_name) - 1);
             else if (strcmp(k, "engine_nsmodule_path") == 0) strncpy(parsed.engine_nsmodule_path, v, sizeof(parsed.engine_nsmodule_path) - 1);
             else if (strcmp(k, "engine_dirname") == 0) strncpy(parsed.engine_dirname, v, sizeof(parsed.engine_dirname) - 1);
+            else if (strcmp(k, "style") == 0) parsed.theme.lcd = (strcmp(v, "lcd") == 0);
+            else if (strcmp(k, "int_values") == 0) parsed.int_values = atoi(v);
+            else if (strncmp(k, "theme_", 6) == 0) {
+                /* theme_<name>=RRGGBB (no '#': the tokenizer treats a
+                 * leading '#' as a comment). */
+                uint32_t c = 0xFF000000u | (uint32_t)strtoul(v, NULL, 16);
+                ui_theme_t *t = &parsed.theme;
+                const char *n = k + 6;
+                if      (!strcmp(n, "bg"))          t->plate_bg = c;
+                else if (!strcmp(n, "panel"))       t->plate_hi = c;
+                else if (!strcmp(n, "line"))        t->plate_line = c;
+                else if (!strcmp(n, "ink"))         t->ink = c;
+                else if (!strcmp(n, "ink_dim"))     t->ink_dim = c;
+                else if (!strcmp(n, "ink_faint"))   t->ink_faint = c;
+                else if (!strcmp(n, "accent"))      t->accent = c;
+                else if (!strcmp(n, "accent_hi"))   t->accent_hi = c;
+                else if (!strcmp(n, "knob_face"))   t->knob_face = c;
+                else if (!strcmp(n, "knob_ring"))   t->knob_ring = c;
+                else if (!strcmp(n, "bar"))         t->bar_bg = c;
+                else if (!strcmp(n, "seg_active"))  t->seg_active = c;
+                else if (!strcmp(n, "seg_inactive")) t->seg_inactive = c;
+                else if (!strcmp(n, "seg_active_tx")) t->seg_active_tx = c;
+                else if (!strcmp(n, "btn_text"))    t->btn_text = c;
+                else if (!strcmp(n, "well"))        t->well = c;
+                else if (!strcmp(n, "knob_off"))    t->knob_off = c;
+                else if (!strcmp(n, "tab_on"))      t->tab_on_bg = c;
+                else if (!strcmp(n, "lcd"))         t->lcd_bg = c;
+                else logline("shadow_page[%s]: unknown theme key '%s' -- ignored", path, k);
+            }
             /* engine_arguments_json is handled earlier, as a raw
              * whole-line special case -- see above. */
             continue;
@@ -1134,6 +1260,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
         const char *label = shadow_page_kv_get(kv, nkv, "label");
         const char *key = shadow_page_kv_get(kv, nkv, "key");
 
+        if (strcmp(type, "frame") != 0 && n_page_widgets >= MAX_WIDGETS) {
+            logline("shadow_page[%s]: tab '%s' has more than %d widgets -- extra '%s' ignored",
+                     path, parsed.tab_names[in_tab], MAX_WIDGETS, type);
+            continue;
+        }
         if (strcmp(type, "frame") == 0) {
             add_frame(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
                       atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
@@ -1147,6 +1278,21 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             add_toggle(cx, cy, label, key, atoi(shadow_page_kv_get(kv, nkv, "on")));
         } else if (strcmp(type, "button") == 0) {
             add_button(cx, cy, label, key);
+        } else if (strcmp(type, "readout") == 0) {
+            add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
+                        atoi(shadow_page_kv_get(kv, nkv, "h")), label,
+                        shadow_page_kv_get(kv, nkv, "get"));
+        } else if (strcmp(type, "stepper") == 0) {
+            add_stepper(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
+                        atoi(shadow_page_kv_get(kv, nkv, "h")), label, key,
+                        shadow_page_kv_get(kv, nkv, "get"), shadow_page_kv_get(kv, nkv, "idx"),
+                        shadow_page_kv_get(kv, nkv, "count"),
+                        atoi(shadow_page_kv_get(kv, nkv, "min")),
+                        atoi(shadow_page_kv_get(kv, nkv, "max")),
+                        atoi(shadow_page_kv_get(kv, nkv, "numbered")));
+        } else if (strcmp(type, "env") == 0) {
+            add_env(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
+                    atoi(shadow_page_kv_get(kv, nkv, "h")), shadow_page_kv_get(kv, nkv, "prefix"));
         } else if (strcmp(type, "enum_h") == 0 || strcmp(type, "enum_v") == 0) {
             char optbuf[128];
             strncpy(optbuf, shadow_page_kv_get(kv, nkv, "options"), sizeof(optbuf) - 1);
@@ -1157,7 +1303,8 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 opts[n_opts++] = shadow_page_pool_store(tok);
             }
             add_enum(cx, cy, strcmp(type, "enum_h") == 0 ? W_ENUM_H : W_ENUM_V, label, key,
-                     opts, n_opts, atoi(shadow_page_kv_get(kv, nkv, "active")));
+                     opts, n_opts, atoi(shadow_page_kv_get(kv, nkv, "active")),
+                     atoi(shadow_page_kv_get(kv, nkv, "sw")));
         } else {
             logline("shadow_page[%s]: unknown widget type '%s' -- ignored", path, type);
             continue;
@@ -1224,6 +1371,24 @@ static void discover_data_driven_addons(void) {
 }
 
 static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t *f) {
+    if (th.lcd) {
+        /* Panel with an inset fill and accent corner brackets + a square
+         * bullet before the title -- the DX7-editor "engraved panel" look. */
+        fill_rect_land(map, stride_px, f->x, f->y, f->w, f->h, PLATE_HI);
+        fill_rect_land(map, stride_px, f->x, f->y, f->w, 1, PLATE_LINE);
+        fill_rect_land(map, stride_px, f->x, f->y + f->h - 1, f->w, 1, PLATE_LINE);
+        fill_rect_land(map, stride_px, f->x, f->y, 1, f->h, PLATE_LINE);
+        fill_rect_land(map, stride_px, f->x + f->w - 1, f->y, 1, f->h, PLATE_LINE);
+        int32_t bl = 16;
+        fill_rect_land(map, stride_px, f->x, f->y, bl, 2, UI_ACCENT);
+        fill_rect_land(map, stride_px, f->x, f->y, 2, bl, UI_ACCENT);
+        fill_rect_land(map, stride_px, f->x + f->w - bl, f->y + f->h - 2, bl, 2, UI_ACCENT);
+        fill_rect_land(map, stride_px, f->x + f->w - 2, f->y + f->h - bl, 2, bl, UI_ACCENT);
+        fill_rect_land(map, stride_px, f->x + 16, f->y + 16, 9, 9, UI_ACCENT);
+        draw_text_land(map, stride_px, f->x + 34, f->y + 14, f->title, 1.5f, UI_ACCENT_HI);
+        fill_rect_land(map, stride_px, f->x + 16, f->y + 36, f->w - 32, 1, PLATE_LINE);
+        return;
+    }
     fill_rect_land(map, stride_px, f->x, f->y, f->w, 1, PLATE_LINE);
     fill_rect_land(map, stride_px, f->x, f->y, 1, f->h, PLATE_LINE);
     fill_rect_land(map, stride_px, f->x + f->w - 1, f->y, 1, f->h, PLATE_LINE);
@@ -1236,10 +1401,131 @@ static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t
     fill_rect_land(map, stride_px, f->x + 18, f->y + 36, f->w - 36, 1, PLATE_LINE);
 }
 
+/* Thick line by stamping small squares along it (no libm; the panel is
+ * scanned continuously so this stays cheap and crisp). */
+static void draw_line_land(uint32_t *map, uint32_t stride_px, int32_t x0, int32_t y0,
+                            int32_t x1, int32_t y1, int32_t t, uint32_t color) {
+    int32_t dx = x1 - x0, dy = y1 - y0;
+    int32_t n = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+    if (n == 0) n = 1;
+    for (int32_t i = 0; i <= n; i++)
+        fill_rect_land(map, stride_px, x0 + dx * i / n - t/2, y0 + dy * i / n - t/2, t, t, color);
+}
+
+/* Solid triangle pointing left (dir<0) or right (dir>0), centred on (cx,cy). */
+static void draw_arrow_land(uint32_t *map, uint32_t stride_px, int32_t cx, int32_t cy,
+                             int32_t half, int dir, uint32_t color) {
+    for (int32_t i = 0; i <= half; i++) {
+        int32_t x = dir > 0 ? cx - half/2 + i : cx + half/2 - i;
+        int32_t ext = half - i;
+        fill_rect_land(map, stride_px, x, cy - ext, 1, ext * 2 + 1, color);
+    }
+}
+
+/* Uppercase copy: the bitmap font only has A-Z, digits and a few
+ * punctuation marks; anything else falls back to a space. */
+static void upcase_copy(char *dst, size_t n, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < n; i++) dst[i] = (src[i] >= 'a' && src[i] <= 'z') ? (char)(src[i] - 32) : src[i];
+    dst[i] = 0;
+}
+
+static const ui_widget_t *render_ctx_widgets;
+static int render_ctx_n;
+static float widget_real(const ui_widget_t *w) { return w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f); }
+static float sibling_value(const char *prefix, const char *suffix) {
+    char k[24];
+    snprintf(k, sizeof(k), "%s%s", prefix, suffix);
+    for (int i = 0; i < render_ctx_n; i++)
+        if (render_ctx_widgets[i].kind == W_KNOB && !strcmp(render_ctx_widgets[i].param_key, k))
+            return widget_real(&render_ctx_widgets[i]);
+    return 0.0f;
+}
+
 static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *w) {
     char valbuf[24];
     switch (w->kind) {
+    case W_READOUT:
+    case W_STEPPER: {
+        int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
+        int32_t bx = x0, bw = w->w;
+        if (w->label[0])
+            draw_text_land(map, stride_px, x0, y0 - 22, w->label, 1.5f, UI_INK_DIM);
+        if (w->kind == W_STEPPER) {
+            /* end buttons are square, box-height wide */
+            fill_rect_land(map, stride_px, x0, y0, w->h, w->h, th.plate_line);
+            fill_rect_land(map, stride_px, x0 + w->w - w->h, y0, w->h, w->h, th.plate_line);
+            draw_arrow_land(map, stride_px, x0 + w->h/2, w->cy, w->h/4, -1, UI_ACCENT_HI);
+            draw_arrow_land(map, stride_px, x0 + w->w - w->h/2, w->cy, w->h/4, 1, UI_ACCENT_HI);
+            bx = x0 + w->h + 3; bw = w->w - 2*w->h - 6;
+        }
+        fill_rect_land(map, stride_px, bx, y0, bw, w->h, th.lcd_bg);
+        fill_rect_land(map, stride_px, bx, y0, bw, 1, PLATE_LINE);
+        fill_rect_land(map, stride_px, bx, y0 + w->h - 1, bw, 1, PLATE_LINE);
+        char tb[48];
+        if (w->kind == W_STEPPER && w->numbered) snprintf(tb, sizeof(tb), "%02d  %s", w->ival + 1, w->text);
+        else snprintf(tb, sizeof(tb), "%s", w->text);
+        float sc = 2.0f;
+        if (text_width_land(tb, sc) > bw - 16) sc = 1.5f;
+        while (strlen(tb) > 1 && text_width_land(tb, sc) > bw - 16) tb[strlen(tb) - 1] = 0;
+        draw_text_land_c(map, stride_px, bx + bw/2, w->cy - (int32_t)(4.5f * sc), tb, sc, UI_ACCENT);
+        break;
+    }
+    case W_ENV: {
+        int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
+        fill_rect_land(map, stride_px, x0, y0, w->w, w->h, th.lcd_bg);
+        fill_rect_land(map, stride_px, x0, y0, w->w, 1, PLATE_LINE);
+        fill_rect_land(map, stride_px, x0, y0 + w->h - 1, w->w, 1, PLATE_LINE);
+        fill_rect_land(map, stride_px, x0, y0, 1, w->h, PLATE_LINE);
+        fill_rect_land(map, stride_px, x0 + w->w - 1, y0, 1, w->h, PLATE_LINE);
+        for (int g = 1; g < 4; g++)
+            fill_rect_land(map, stride_px, x0 + 6, y0 + g * w->h / 4, w->w - 12, 1, PLATE_LINE);
+        float r[4], l[4];
+        static const char *rs[4] = {"r1","r2","r3","r4"}, *ls[4] = {"l1","l2","l3","l4"};
+        for (int i = 0; i < 4; i++) { r[i] = sibling_value(w->param_key, rs[i]); l[i] = sibling_value(w->param_key, ls[i]); }
+        /* DX7 EG: starts at L4, rises to L1, L2, L3 (rates R1..R3), holds
+         * while the key is down, then falls to L4 at R4. Segment time is
+         * inversely related to rate. */
+        float t[5] = {0, 8 + (99 - r[0]), 8 + (99 - r[1]), 8 + (99 - r[2]), 0};
+        float sustain = 60, rel = 8 + (99 - r[3]);
+        float total = t[1] + t[2] + t[3] + sustain + rel;
+        int32_t pw = w->w - 24, ph = w->h - 24;
+        int32_t px[6], py[6];
+        float acc = 0;
+        float lv[6] = { l[3], l[0], l[1], l[2], l[2], l[3] };
+        float dt[6] = { 0, t[1], t[2], t[3], sustain, rel };
+        for (int i = 0; i < 6; i++) {
+            acc += dt[i];
+            px[i] = x0 + 12 + (int32_t)(pw * acc / total);
+            py[i] = y0 + 12 + ph - (int32_t)(ph * lv[i] / 99.0f);
+        }
+        for (int i = 0; i < 5; i++) draw_line_land(map, stride_px, px[i], py[i], px[i+1], py[i+1], 3, UI_ACCENT);
+        for (int i = 0; i < 6; i++) fill_rect_land(map, stride_px, px[i] - 4, py[i] - 4, 9, 9, UI_ACCENT_HI);
+        break;
+    }
     case W_KNOB: {
+        if (th.lcd) {
+            /* Dark disc, dotted value arc, pointer line: the numeric
+             * synth-editor look, distinct from the flat cream knob. */
+            int angle_deg = -135 + (270 * w->state) / 100;
+            fill_circle_land(map, stride_px, w->cx, w->cy, w->radius, KNOB_FACE);
+            draw_ring_land(map, stride_px, w->cx, w->cy, w->radius + 2, 2, KNOB_RING);
+            for (int a = -135; a <= 135; a += 9) {
+                int lit = a <= angle_deg;
+                int32_t ar = w->radius + 11;
+                fill_circle_land(map, stride_px, w->cx + (int32_t)(ar * sin_deg(a)),
+                                 w->cy - (int32_t)(ar * cos_deg(a)), lit ? 3 : 2,
+                                 lit ? UI_ACCENT : KNOB_RING);
+            }
+            draw_line_land(map, stride_px, w->cx + (int32_t)(w->radius * 0.25f * sin_deg(angle_deg)),
+                           w->cy - (int32_t)(w->radius * 0.25f * cos_deg(angle_deg)),
+                           w->cx + (int32_t)(w->radius * 0.85f * sin_deg(angle_deg)),
+                           w->cy - (int32_t)(w->radius * 0.85f * cos_deg(angle_deg)), 3, UI_ACCENT_HI);
+            snprintf(valbuf, sizeof(valbuf), "%.0f", widget_real(w));
+            draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 20, w->label, 1.5f, UI_INK_DIM);
+            draw_text_land_c(map, stride_px, w->cx, w->cy + w->radius + 37, valbuf, 1.5f, UI_ACCENT);
+            break;
+        }
         draw_ring_land(map, stride_px, w->cx, w->cy, w->radius + 3, 3, KNOB_RING);
         fill_circle_land(map, stride_px, w->cx, w->cy, w->radius, KNOB_FACE);
         int angle_deg = -135 + (270 * w->state) / 100;
@@ -1263,9 +1549,9 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
     }
     case W_TOGGLE: {
         int32_t pw = 51, ph = 27;
-        fill_rect_land(map, stride_px, w->cx - pw/2, w->cy - ph/2, pw, ph, 0xFF050403u);
+        fill_rect_land(map, stride_px, w->cx - pw/2, w->cy - ph/2, pw, ph, th.well);
         int32_t lx = w->state ? (w->cx + pw/2 - ph/2) : (w->cx - pw/2 + ph/2);
-        fill_circle_land(map, stride_px, lx, w->cy, ph/2 - 4, w->state ? UI_ACCENT_HI : 0xFF4C473Du);
+        fill_circle_land(map, stride_px, lx, w->cy, ph/2 - 4, w->state ? UI_ACCENT_HI : th.knob_off);
         draw_text_land_c(map, stride_px, w->cx, w->cy + ph/2 + 10, w->label, 1.5f, UI_INK);
         break;
     }
@@ -1320,14 +1606,29 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
                                 const ui_frame_t *frames, int n_frames,
                                 int page, int addon, int engine_on_snap) {
     const addon_descriptor_t *ad = &addon_table[addon];
+    th = ad->theme;
+    render_ctx_widgets = widgets;
+    render_ctx_n = n_widgets;
 
     fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, PLATE_BG);
 
     fill_rect_land(map, stride_px, 0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     fill_rect_land(map, stride_px, 0, TOPBAR_H, LAND_W, 1, PLATE_LINE);
     char title[40];
-    snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
-    draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
+    if (th.lcd) {
+        /* LCD nameplate instead of the plain title. */
+        snprintf(title, sizeof(title), "%s", ad->display_name);
+        int32_t tw_px = text_width_land(title, 2.5f) + 48;
+        fill_rect_land(map, stride_px, 24, 12, tw_px, TOPBAR_H - 24, th.lcd_bg);
+        fill_rect_land(map, stride_px, 24, 12, tw_px, 1, UI_ACCENT);
+        fill_rect_land(map, stride_px, 24, TOPBAR_H - 13, tw_px, 1, UI_ACCENT);
+        draw_text_land(map, stride_px, 48, 24, title, 2.5f, UI_ACCENT_HI);
+        draw_text_land(map, stride_px, 24 + tw_px + 24, 30, "FM SYNTH", 1.5f, UI_INK_FAINT);
+        fill_rect_land(map, stride_px, 0, TOPBAR_H - 2, LAND_W, 2, UI_ACCENT);
+    } else {
+        snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
+        draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
+    }
 
     /* Engine on/off (2026-09-19): replaces the old static "LIVE" text --
      * dim/grey when the engine's off, lit accent when it's on, matching
@@ -1335,7 +1636,7 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
      * addon that actually has an engine to control. */
     if (ad->engine_process_name[0]) {
         uint32_t bg = engine_on_snap ? UI_ACCENT : PLATE_LINE;
-        uint32_t fg = engine_on_snap ? UI_INK : UI_INK_FAINT;
+        uint32_t fg = engine_on_snap ? BTN_TEXT : UI_INK_FAINT;
         fill_rect_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bg);
         draw_text_land_c(map, stride_px, ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
                           engine_on_snap ? "ENGINE ON" : "ENGINE OFF", 2, fg);
@@ -1358,10 +1659,12 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         for (int i = 0; i < ad->num_tabs; i++) {
             if (i == page) {
                 fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, 3, UI_ACCENT);
-                fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, TABBAR_H, 0xFF1A120Du);
+                fill_rect_land(map, stride_px, i*tw, tabbar_y, tw, TABBAR_H, th.tab_on_bg);
             }
             draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 6,
-                              ad->tab_names[i], 2, i == page ? UI_INK : UI_INK_FAINT);
+                              ad->tab_names[i], 2,
+                              i == page ? (th.lcd ? UI_ACCENT_HI : UI_INK) : UI_INK_FAINT);
+            if (th.lcd && i > 0) fill_rect_land(map, stride_px, i*tw, tabbar_y + 10, 1, TABBAR_H - 20, PLATE_LINE);
         }
     }
 }
@@ -1464,6 +1767,7 @@ static void create_damage_blob(int fd) {
 }
 
 static void *touch_thread_fn(void *arg); /* defined below, started here */
+static void *refresh_thread_fn(void *arg);
 
 __attribute__((constructor))
 static void force_shadow_ctor(void) {
@@ -1475,6 +1779,9 @@ static void force_shadow_ctor(void) {
     /* Deliberately does NOT touch /dev/dri/card0 here -- see file header
      * comment on live load test #3. Setup happens lazily, on MPC's own
      * fd, the first time we see a real atomic commit (below). */
+
+    pthread_t rtid;
+    if (pthread_create(&rtid, NULL, refresh_thread_fn, NULL) == 0) pthread_detach(rtid);
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, touch_thread_fn, NULL) == 0) {
@@ -1714,6 +2021,7 @@ static void poll_toggle(void) {
         pthread_mutex_lock(&touch_mu);
         active_addon = requested;
         current_page = 0;
+        page_epoch++;
         if (requested != ADDON_NONE) {
             addon_table[requested].build_tab(0);
         } else {
@@ -2033,11 +2341,27 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         if (!force && !ctrl_send_throttle_ok()) return;
         float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
         char buf[24];
-        snprintf(buf, sizeof(buf), "%.2f", real);
+        if (addon_table[active_addon].int_values)
+            snprintf(buf, sizeof(buf), "%d", (int)(real + (real >= 0 ? 0.5f : -0.5f)));
+        else
+            snprintf(buf, sizeof(buf), "%.2f", real);
         send_ctrl_set(w->param_key, buf);
         break;
     }
+    case W_STEPPER: {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", w->ival);
+        send_ctrl_set(w->param_key, buf);
+        break;
+    }
+    case W_READOUT:
+    case W_ENV:
+        break;
     case W_TOGGLE:
+        if (addon_table[active_addon].int_values) {
+            send_ctrl_set(w->param_key, w->state ? "1" : "0");
+            break;
+        }
         /* mix.enabled is maze_host's own host-level toggle
          * (handle_mix_set()), which checks for "1"/"true" -- a
          * different convention from the real chain_params' own
@@ -2053,7 +2377,13 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         break;
     case W_ENUM_H:
     case W_ENUM_V:
-        send_ctrl_set(w->param_key, w->options[w->state]);
+        if (addon_table[active_addon].int_values) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", w->state);
+            send_ctrl_set(w->param_key, buf);
+        } else {
+            send_ctrl_set(w->param_key, w->options[w->state]);
+        }
         break;
     }
 }
@@ -2145,6 +2475,7 @@ static void update_touch_state(const struct input_event *ev) {
                 current_page = new_page;
                 addon_table[active_addon].build_tab(current_page);
                 shadow_redraw_needed = 1;
+                page_epoch++;
             }
         } else if (lpy < tabbar_y) {
             int i = hit_test_widget(lpx, lpy);
@@ -2163,6 +2494,22 @@ static void update_touch_state(const struct input_event *ev) {
                     break;
                 case W_BUTTON:
                     send_idx = i; send_force = 1; send_snapshot = *w;
+                    break;
+                case W_STEPPER: {
+                    /* left third = previous, right third = next, middle = nothing */
+                    int dir = lpx < w->cx - w->w/6 ? -1 : (lpx > w->cx + w->w/6 ? 1 : 0);
+                    if (dir) {
+                        int span = w->imax - w->imin + 1;
+                        if (span < 1) span = 1;
+                        w->ival = w->imin + ((w->ival - w->imin + dir) % span + span) % span;
+                        shadow_redraw_needed = 1;
+                        send_idx = i; send_force = 1; send_snapshot = *w;
+                        refresh_request = 1;
+                    }
+                    break;
+                }
+                case W_READOUT:
+                case W_ENV:
                     break;
                 case W_ENUM_H:
                 case W_ENUM_V:
@@ -2213,6 +2560,155 @@ static void update_touch_state(const struct input_event *ev) {
     if (engine_toggle_addon >= 0) {
         send_engine_toggle(engine_toggle_addon, engine_toggle_want);
     }
+}
+
+/* ---- Engine readback (DX7 work) ----
+ *
+ * "GET <key>\n" -> "<value>\n" over the same control socket. Returns the
+ * value's first line in `out`, or -1 if the engine isn't reachable/erred.
+ * Only ever called from the refresh worker below, never the touch or DRM
+ * commit threads, since a hung host would otherwise stall them. */
+static int ctrl_get(const char *sock_path, const char *key, char *out, size_t n) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = { 0, 100 * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    int rc = -1;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        char line[64];
+        int ln = snprintf(line, sizeof(line), "GET %s\n", key);
+        if (ln > 0 && send(fd, line, (size_t)ln, MSG_NOSIGNAL) > 0) {
+            size_t got = 0;
+            for (;;) {
+                ssize_t r = recv(fd, out + got, n - 1 - got, 0);
+                if (r <= 0) break;
+                got += (size_t)r;
+                if (got >= n - 1 || memchr(out, '\n', got)) break;
+            }
+            out[got] = 0;
+            char *nl = strchr(out, '\n');
+            if (nl) *nl = 0;
+            if (got > 0 && strcmp(out, "ERR") != 0) rc = 0;
+        }
+    }
+    close(fd);
+    return rc;
+}
+
+/* Re-reads every bound widget on the current page from the engine. The
+ * GETs run without touch_mu held; results are applied under it only if
+ * the page hasn't changed meanwhile and the widget isn't being dragged. */
+static void refresh_page_from_engine(void) {
+    static ui_widget_t snap[MAX_WIDGETS];
+    int n, addon;
+    unsigned epoch;
+    pthread_mutex_lock(&touch_mu);
+    addon = active_addon; epoch = page_epoch; n = n_page_widgets;
+    memcpy(snap, page_widgets, sizeof(ui_widget_t) * (size_t)n);
+    pthread_mutex_unlock(&touch_mu);
+    if (addon == ADDON_NONE) return;
+    const char *sock = addon_table[addon].ctrl_sock;
+    if (!sock[0]) return;
+
+    struct { int valid; float fv; char text[32]; int idx, count; } res[MAX_WIDGETS];
+    memset(res, 0, sizeof(res));
+    char buf[64];
+    int any_ok = 0; /* engine down: give up after the first failed GET */
+    for (int i = 0; i < n; i++) {
+        const ui_widget_t *w = &snap[i];
+        switch (w->kind) {
+        case W_KNOB: case W_TOGGLE: case W_ENUM_H: case W_ENUM_V:
+            if (!w->param_key[0]) break;
+            if (ctrl_get(sock, w->param_key, buf, sizeof(buf)) != 0) {
+                if (!any_ok) return;
+                break;
+            }
+            any_ok = 1;
+            res[i].fv = (float)atof(buf);
+            if (!strcmp(buf, "on")) res[i].fv = 1;
+            res[i].valid = 1;
+            break;
+        case W_READOUT: case W_STEPPER:
+            if (w->get_key[0] && ctrl_get(sock, w->get_key, buf, sizeof(buf)) == 0) {
+                upcase_copy(res[i].text, sizeof(res[i].text), buf);
+                res[i].valid = 1;
+                any_ok = 1;
+            } else if (!any_ok) return;
+            if (w->kind == W_STEPPER) {
+                res[i].idx = -1; res[i].count = -1;
+                if (w->idx_key[0] && ctrl_get(sock, w->idx_key, buf, sizeof(buf)) == 0) res[i].idx = atoi(buf);
+                if (w->count_key[0] && ctrl_get(sock, w->count_key, buf, sizeof(buf)) == 0) res[i].count = atoi(buf);
+            }
+            break;
+        default: break;
+        }
+    }
+
+    int changed = 0;
+    pthread_mutex_lock(&touch_mu);
+    if (active_addon == addon && page_epoch == epoch && n_page_widgets == n) {
+        for (int i = 0; i < n; i++) {
+            ui_widget_t *w = &page_widgets[i];
+            if (!res[i].valid || i == active_widget) continue;
+            switch (w->kind) {
+            case W_KNOB: {
+                float span = w->pmax - w->pmin;
+                int pct = span > 0 ? (int)((res[i].fv - w->pmin) * 100.0f / span + 0.5f) : 0;
+                if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+                if (pct != w->state) { w->state = pct; changed = 1; }
+                break;
+            }
+            case W_TOGGLE: {
+                int v = res[i].fv != 0;
+                if (v != w->state) { w->state = v; changed = 1; }
+                break;
+            }
+            case W_ENUM_H: case W_ENUM_V: {
+                int v = (int)res[i].fv;
+                if (v >= 0 && v < w->n_options && v != w->state) { w->state = v; changed = 1; }
+                break;
+            }
+            case W_READOUT: case W_STEPPER:
+                if (strcmp(w->text, res[i].text)) { strncpy(w->text, res[i].text, sizeof(w->text) - 1); changed = 1; }
+                if (w->kind == W_STEPPER) {
+                    if (res[i].idx >= 0 && res[i].idx != w->ival) { w->ival = res[i].idx; changed = 1; }
+                    if (res[i].count > 0 && res[i].count - 1 != w->imax) { w->imax = res[i].count - 1; changed = 1; }
+                }
+                break;
+            default: break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&touch_mu);
+    if (changed) shadow_redraw_needed = 1;
+}
+
+/* Runs for the whole process lifetime; idle while shadow mode is off.
+ * Refreshes on a page/addon change, on request (after a stepper tap), or
+ * every ~1.5s so preset changes made elsewhere (Q-Link, web GUI) show up. */
+static void *refresh_thread_fn(void *arg) {
+    (void)arg;
+    unsigned seen_epoch = (unsigned)-1;
+    int idle_ms = 0;
+    for (;;) {
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        if (!shadow_on) { seen_epoch = (unsigned)-1; idle_ms = 0; continue; }
+        idle_ms += 50;
+        int req = __atomic_exchange_n(&refresh_request, 0, __ATOMIC_RELAXED);
+        if (page_epoch != seen_epoch || req || idle_ms >= 1500) {
+            if (req) { struct timespec w = { 0, 150 * 1000 * 1000 }; nanosleep(&w, NULL); } /* let a bank load finish */
+            seen_epoch = page_epoch;
+            idle_ms = 0;
+            refresh_page_from_engine();
+        }
+    }
+    return NULL;
 }
 
 /* Runs for the whole process lifetime: sleeps while shadow mode is off,

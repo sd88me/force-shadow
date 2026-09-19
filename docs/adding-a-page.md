@@ -122,6 +122,25 @@ enum_h cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<ind
 enum_v cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
 ```
 
+Optional top-level keys (added with the DX7 page): `style=lcd` (dotted-arc
+dark knobs, bracketed frames, LCD nameplate), `int_values=1` (host uses
+`atoi()`: knobs send a rounded integer, toggles `1`/`0`, enums their
+option *index*), and `theme_<name>=RRGGBB` (no `#`) for `bg panel line ink
+ink_dim ink_faint accent accent_hi knob_face knob_ring bar seg_active
+seg_inactive seg_active_tx btn_text well knob_off tab_on lcd`; unset keys
+keep Maze Voice's palette. More widgets (up to 8 tabs, 64 widgets each;
+enums up to 6 options, optional `sw=<segment px>`):
+
+```
+readout cx=<n> cy=<n> w=<n> h=<n> label="<text>" get=<key>
+stepper cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<text key> idx=<index key> count=<count key> min=<n> max=<n> numbered=<0|1>
+env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>   # DX7 EG graph from sibling knobs <prefix>r1..r4,l1..l4
+```
+
+`readout`/`stepper` text, stepper index/count, and every knob/toggle/enum
+value are read back from the engine (`GET <key>`) by a worker thread on
+tab entry, after a stepper tap, and every ~1.5s.
+
 Repeat `[tab ...]` for each tab, in the order they should appear. Values
 with a space (labels, titles, options lists, a multi-word
 `display_name`) take double quotes; everything else is a bare token.
