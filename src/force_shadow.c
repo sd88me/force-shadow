@@ -772,7 +772,8 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
 typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V,
                W_READOUT,  /* display-only LCD text, value from GET <get_key> */
                W_STEPPER,  /* < text > : prev/next an integer index (bank, preset) */
-               W_ENV       /* display-only DX7 envelope graph, from sibling knobs */
+               W_ENV,      /* display-only DX7 envelope graph, from sibling knobs */
+               W_LIST      /* paged grid of engine-provided names (banks, patches) */
 } widget_kind_t;
 #define MAX_OPTIONS 6
 
@@ -795,10 +796,46 @@ typedef struct {
     char count_key[20];       /* stepper: GET key for the item count (max = count-1) */
     char text[32];            /* last text read from the engine (upper-cased) */
     int ival, imin, imax;     /* stepper index + bounds */
-    int numbered;             /* stepper: prefix text with the 1-based index */
+    int numbered;             /* stepper/list: prefix text with the 1-based index */
+    int goto_tab;             /* readout: tapping it switches to this tab (-1 = not tappable) */
+    int clean;                /* readout: strip ".syx", _/- -> space */
+    /* list only: geometry + which list_stores[] slot holds its data */
+    int list_id, cols, rows, tile_h, gap, jump, colmajor;
+    float tscale;             /* list tile text scale */
 } ui_widget_t;
 
 typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
+
+/* ---- Lists (banks / patches) ----
+ * A list's names live outside ui_widget_t (which is copied around per
+ * tab switch and per redraw); the widget just holds its slot id. Filled
+ * by the refresh worker from a JSON "[{label|name:...},...]" GET reply.
+ * The page count is derived from n at draw time, so it follows however
+ * many items the engine reports. */
+#define MAX_LISTS 8
+#define MAX_LIST_ITEMS 256
+#define LIST_NAME_LEN 28
+typedef struct {
+    int n, sel, page, per_page;
+    char names[MAX_LIST_ITEMS][LIST_NAME_LEN];
+} list_store_t;
+static list_store_t list_stores[MAX_LISTS];
+static int n_list_stores = 0;
+
+/* Display cleanup: upper-case (the font has no lowercase), drop a
+ * trailing ".syx", turn _ and - into spaces. */
+static void clean_name(char *dst, size_t n, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < n; i++) {
+        char c = src[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        else if (c == '_' || c == '-') c = ' ';
+        dst[i] = c;
+    }
+    dst[i] = 0;
+    if (i >= 4 && !strcmp(dst + i - 4, ".SYX")) dst[i - 4] = 0;
+}
+
 
 #define MAX_WIDGETS 64
 #define MAX_FRAMES 6
@@ -960,6 +997,7 @@ static int add_readout(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const cha
     memset(w, 0, sizeof(*w));
     w->kind = W_READOUT; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
     w->hit_hw = w->hit_hh = -1;
+    w->goto_tab = -1;
     strncpy(w->label, label, sizeof(w->label)-1);
     strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
     strncpy(w->text, "-", sizeof(w->text)-1);
@@ -982,6 +1020,26 @@ static int add_stepper(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const cha
     strncpy(w->count_key, count_key, sizeof(w->count_key)-1);
     strncpy(w->text, "-", sizeof(w->text)-1);
     w->imin = imin; w->imax = imax; w->numbered = numbered;
+    return n_page_widgets++;
+}
+/* Paged grid of names. (x,y,w,h) is the whole box: tile grid on top, then
+ * an optional A-Z jump row, then (only when >1 page) a pager bar. */
+static int add_list(int32_t x, int32_t y, int32_t bw, int32_t bh, const char *key,
+                     const char *items_key, const char *sel_key, int cols, int rows,
+                     int tile_h, int gap, int jump, int colmajor, int numbered, float tscale) {
+    if (n_list_stores >= MAX_LISTS) return -1;
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_LIST; w->cx = x + bw/2; w->cy = y + bh/2; w->w = bw; w->h = bh;
+    w->hit_hw = bw/2; w->hit_hh = bh/2;
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    strncpy(w->get_key, items_key, sizeof(w->get_key)-1);
+    strncpy(w->idx_key, sel_key, sizeof(w->idx_key)-1);
+    w->cols = cols; w->rows = rows; w->tile_h = tile_h; w->gap = gap;
+    w->jump = jump; w->colmajor = colmajor; w->numbered = numbered;
+    w->tscale = tscale > 0 ? tscale : 1.5f;
+    w->list_id = n_list_stores++;
+    list_stores[w->list_id].per_page = cols * rows;
     return n_page_widgets++;
 }
 /* Display-only DX7 envelope graph; param_key is the prefix shared by the
@@ -1312,9 +1370,16 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
         } else if (strcmp(type, "button") == 0) {
             add_button(cx, cy, label, key);
         } else if (strcmp(type, "readout") == 0) {
-            add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
+            int ri = add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label,
                         shadow_page_kv_get(kv, nkv, "get"));
+            const char *gt = shadow_page_kv_get(kv, nkv, "goto");
+            if (gt[0]) {
+                page_widgets[ri].goto_tab = atoi(gt);
+                page_widgets[ri].hit_hw = page_widgets[ri].w / 2;
+                page_widgets[ri].hit_hh = page_widgets[ri].h / 2;
+            }
+            page_widgets[ri].clean = atoi(shadow_page_kv_get(kv, nkv, "clean"));
         } else if (strcmp(type, "stepper") == 0) {
             add_stepper(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label, key,
@@ -1323,6 +1388,16 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                         atoi(shadow_page_kv_get(kv, nkv, "min")),
                         atoi(shadow_page_kv_get(kv, nkv, "max")),
                         atoi(shadow_page_kv_get(kv, nkv, "numbered")));
+        } else if (strcmp(type, "list") == 0) {
+            int lw = add_list(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
+                    atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
+                    key, shadow_page_kv_get(kv, nkv, "items"), shadow_page_kv_get(kv, nkv, "sel"),
+                    atoi(shadow_page_kv_get(kv, nkv, "cols")), atoi(shadow_page_kv_get(kv, nkv, "rows")),
+                    atoi(shadow_page_kv_get(kv, nkv, "th")), atoi(shadow_page_kv_get(kv, nkv, "gap")),
+                    atoi(shadow_page_kv_get(kv, nkv, "jump")), atoi(shadow_page_kv_get(kv, nkv, "colmajor")),
+                    atoi(shadow_page_kv_get(kv, nkv, "numbered")),
+                    (float)atof(shadow_page_kv_get(kv, nkv, "scale")));
+            if (lw < 0) { logline("shadow_page[%s]: more than %d lists -- extra ignored", path, MAX_LISTS); continue; }
         } else if (strcmp(type, "env") == 0) {
             add_env(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                     atoi(shadow_page_kv_get(kv, nkv, "h")), shadow_page_kv_get(kv, nkv, "prefix"));
@@ -1476,6 +1551,44 @@ static void draw_arrow_land(uint32_t *map, uint32_t stride_px, int32_t cx, int32
     }
 }
 
+/* ---- List geometry (shared by drawing and touch) ---- */
+#define LIST_PAGER_H 56
+#define LIST_LETTER_H 44
+static int list_pages(const ui_widget_t *w) {
+    const list_store_t *st = &list_stores[w->list_id];
+    int pp = w->cols * w->rows;
+    return st->n > 0 ? (st->n + pp - 1) / pp : 1;
+}
+static int32_t list_tile_w(const ui_widget_t *w) { return (w->w - (w->cols - 1) * w->gap) / w->cols; }
+/* Top-left of the tile drawn for on-page position p. */
+static void list_tile_xy(const ui_widget_t *w, int p, int32_t *tx, int32_t *ty) {
+    int col = w->colmajor ? p / w->rows : p % w->cols;
+    int row = w->colmajor ? p % w->rows : p / w->cols;
+    *tx = w->cx - w->w/2 + col * (list_tile_w(w) + w->gap);
+    *ty = w->cy - w->h/2 + row * (w->tile_h + w->gap);
+}
+static int32_t list_grid_h(const ui_widget_t *w) { return w->rows * w->tile_h + (w->rows - 1) * w->gap; }
+static int32_t list_letter_y(const ui_widget_t *w) { return w->cy - w->h/2 + list_grid_h(w) + 22; }
+static int32_t list_pager_y(const ui_widget_t *w) { return w->cy + w->h/2 - LIST_PAGER_H; }
+static int list_letter_of(const char *name) {
+    char c = name[0];
+    return (c >= 'A' && c <= 'Z') ? c - 'A' : 26;
+}
+/* Letters that have at least one item, in order, into out[]; returns count. */
+static int list_letters(const ui_widget_t *w, int out[27]) {
+    const list_store_t *st = &list_stores[w->list_id];
+    int seen[27] = {0}, n = 0;
+    for (int i = 0; i < st->n; i++) seen[list_letter_of(st->names[i])] = 1;
+    for (int l = 0; l < 27; l++) if (seen[l]) out[n++] = l;
+    return n;
+}
+static void list_letter_box(const ui_widget_t *w, int nl, int i, int32_t *bx, int32_t *bw) {
+    int32_t w0 = 52, g = 8;
+    if (nl * w0 + (nl - 1) * g > w->w) w0 = (w->w - (nl - 1) * g) / (nl ? nl : 1);
+    *bw = w0;
+    *bx = w->cx - w->w/2 + i * (w0 + g);
+}
+
 /* Uppercase copy: the bitmap font only has A-Z, digits and a few
  * punctuation marks; anything else falls back to a space. */
 static void upcase_copy(char *dst, size_t n, const char *src) {
@@ -1499,6 +1612,52 @@ static float sibling_value(const char *prefix, const char *suffix) {
 static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *w) {
     char valbuf[24];
     switch (w->kind) {
+    case W_LIST: {
+        list_store_t *st = &list_stores[w->list_id];
+        int pp = w->cols * w->rows, pages = list_pages(w);
+        int page = st->page; if (page >= pages) page = pages - 1; if (page < 0) page = 0;
+        int32_t tw = list_tile_w(w);
+        for (int p = 0; p < pp; p++) {
+            int idx = page * pp + p;
+            if (idx >= st->n) break;
+            int32_t tx, ty; list_tile_xy(w, p, &tx, &ty);
+            int sel = (idx == st->sel);
+            fill_rect_land(map, stride_px, tx, ty, tw, w->tile_h, sel ? UI_ACCENT : th.lcd_bg);
+            if (!sel) {
+                fill_rect_land(map, stride_px, tx, ty, tw, 1, PLATE_LINE);
+                fill_rect_land(map, stride_px, tx, ty + w->tile_h - 1, tw, 1, PLATE_LINE);
+            }
+            char tb[48];
+            if (w->numbered) snprintf(tb, sizeof(tb), "%02d %s", idx + 1, st->names[idx]);
+            else snprintf(tb, sizeof(tb), "%s", st->names[idx]);
+            while (strlen(tb) > 1 && text_width_land(tb, w->tscale) > tw - 20) tb[strlen(tb) - 1] = 0;
+            draw_text_land(map, stride_px, tx + 10, ty + w->tile_h/2 - (int32_t)(4.5f * w->tscale), tb,
+                           w->tscale, sel ? BTN_TEXT : UI_ACCENT);
+        }
+        if (w->jump) {
+            int lets[27]; int nl = list_letters(w, lets);
+            int cur = (st->sel >= 0 && st->sel < st->n) ? list_letter_of(st->names[st->sel]) : -1;
+            int32_t ly = list_letter_y(w);
+            for (int i = 0; i < nl; i++) {
+                int32_t bx, bw; list_letter_box(w, nl, i, &bx, &bw);
+                int on = (lets[i] == cur);
+                fill_rect_land(map, stride_px, bx, ly, bw, LIST_LETTER_H, on ? UI_ACCENT : th.lcd_bg);
+                char l[2] = { lets[i] == 26 ? '#' : (char)('A' + lets[i]), 0 };
+                draw_text_land_c(map, stride_px, bx + bw/2, ly + LIST_LETTER_H/2 - 7, l, 1.5f, on ? BTN_TEXT : UI_ACCENT);
+            }
+        }
+        if (pages > 1) {
+            int32_t py = list_pager_y(w), x0 = w->cx - w->w/2;
+            fill_rect_land(map, stride_px, x0, py, LIST_PAGER_H, LIST_PAGER_H, th.plate_line);
+            fill_rect_land(map, stride_px, x0 + w->w - LIST_PAGER_H, py, LIST_PAGER_H, LIST_PAGER_H, th.plate_line);
+            draw_arrow_land(map, stride_px, x0 + LIST_PAGER_H/2, py + LIST_PAGER_H/2, LIST_PAGER_H/4, -1, UI_ACCENT_HI);
+            draw_arrow_land(map, stride_px, x0 + w->w - LIST_PAGER_H/2, py + LIST_PAGER_H/2, LIST_PAGER_H/4, 1, UI_ACCENT_HI);
+            fill_rect_land(map, stride_px, x0 + LIST_PAGER_H + 3, py, w->w - 2*LIST_PAGER_H - 6, LIST_PAGER_H, th.lcd_bg);
+            char pb[24]; snprintf(pb, sizeof(pb), "PAGE %d / %d", page + 1, pages);
+            draw_text_land_c(map, stride_px, w->cx, py + LIST_PAGER_H/2 - 9, pb, 2.0f, UI_ACCENT);
+        }
+        break;
+    }
     case W_READOUT:
     case W_STEPPER: {
         int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
@@ -1523,6 +1682,8 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         if (text_width_land(tb, sc) > bw - 16) sc = 1.5f;
         while (strlen(tb) > 1 && text_width_land(tb, sc) > bw - 16) tb[strlen(tb) - 1] = 0;
         draw_text_land_c(map, stride_px, bx + bw/2, w->cy - (int32_t)(4.5f * sc), tb, sc, UI_ACCENT);
+        if (w->kind == W_READOUT && w->goto_tab >= 0)   /* tappable: hint arrow */
+            draw_arrow_land(map, stride_px, bx + bw - 18, w->cy, 7, 1, UI_ACCENT_HI);
         break;
     }
     case W_ENV: {
@@ -2417,6 +2578,12 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         send_ctrl_set(w->param_key, buf);
         break;
     }
+    case W_LIST: {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", w->ival);
+        send_ctrl_set(w->param_key, buf);
+        break;
+    }
     case W_READOUT:
     case W_ENV:
         break;
@@ -2571,7 +2738,52 @@ static void update_touch_state(const struct input_event *ev) {
                     }
                     break;
                 }
+                case W_LIST: {
+                    list_store_t *st = &list_stores[w->list_id];
+                    int pp = w->cols * w->rows, pages = list_pages(w);
+                    int page = st->page; if (page >= pages) page = pages - 1; if (page < 0) page = 0;
+                    int32_t tw = list_tile_w(w);
+                    int handled = 0;
+                    for (int p = 0; p < pp && !handled; p++) {
+                        int idx = page * pp + p;
+                        if (idx >= st->n) break;
+                        int32_t tx, ty; list_tile_xy(w, p, &tx, &ty);
+                        if (lpx >= tx && lpx < tx + tw && lpy >= ty && lpy < ty + w->tile_h) {
+                            st->sel = idx; w->ival = idx; handled = 1;
+                            send_idx = i; send_force = 1; send_snapshot = *w;
+                            refresh_request = 1;
+                        }
+                    }
+                    if (!handled && w->jump) {
+                        int lets[27]; int nl = list_letters(w, lets);
+                        int32_t ly = list_letter_y(w);
+                        for (int k = 0; k < nl && !handled; k++) {
+                            int32_t bx, bw; list_letter_box(w, nl, k, &bx, &bw);
+                            if (lpx >= bx && lpx < bx + bw && lpy >= ly && lpy < ly + LIST_LETTER_H) {
+                                for (int q = 0; q < st->n; q++)
+                                    if (list_letter_of(st->names[q]) == lets[k]) { st->page = q / pp; break; }
+                                handled = 1;
+                            }
+                        }
+                    }
+                    if (!handled && pages > 1) {
+                        int32_t py = list_pager_y(w), x0 = w->cx - w->w/2;
+                        if (lpy >= py && lpy < py + LIST_PAGER_H) {
+                            if (lpx < x0 + LIST_PAGER_H) st->page = (page + pages - 1) % pages;
+                            else if (lpx >= x0 + w->w - LIST_PAGER_H) st->page = (page + 1) % pages;
+                        }
+                    }
+                    shadow_redraw_needed = 1;
+                    break;
+                }
                 case W_READOUT:
+                    if (w->goto_tab >= 0 && w->goto_tab < num_tabs && w->goto_tab != current_page) {
+                        current_page = w->goto_tab;
+                        addon_table[active_addon].build_tab(current_page);
+                        page_epoch++;
+                        shadow_redraw_needed = 1;
+                    }
+                    break;
                 case W_ENV:
                     break;
                 case W_ENUM_H:
@@ -2666,7 +2878,36 @@ static int ctrl_get(const char *sock_path, const char *key, char *out, size_t n)
 /* Re-reads every bound widget on the current page from the engine. The
  * GETs run without touch_mu held; results are applied under it only if
  * the page hasn't changed meanwhile and the widget isn't being dragged. */
-static void refresh_page_from_engine(void) {
+/* Parses "[{...\"label\"|\"name\":\"X\"...},...]" (syx_bank_list / patch_list)
+ * into names[], cleaned for display. Returns the item count. */
+static int parse_name_list(const char *json, char names[][LIST_NAME_LEN]) {
+    int n = 0;
+    const char *p = json;
+    while (n < MAX_LIST_ITEMS && (p = strchr(p, '{')) != NULL) {
+        const char *end = strchr(p, '}');
+        if (!end) break;
+        const char *v = NULL;
+        for (const char *k = p; k < end && !v; k++) {
+            if (!strncmp(k, "\"label\":\"", 9)) v = k + 9;
+            else if (!strncmp(k, "\"name\":\"", 8)) v = k + 8;
+        }
+        char raw[LIST_NAME_LEN] = "";
+        if (v) {
+            size_t i = 0;
+            while (v < end && *v && *v != '"' && i + 1 < sizeof(raw)) {
+                if (*v == '\\' && v + 1 < end) v++;
+                raw[i++] = *v++;
+            }
+            raw[i] = 0;
+        }
+        clean_name(names[n], LIST_NAME_LEN, raw);
+        n++;
+        p = end + 1;
+    }
+    return n;
+}
+
+static void refresh_page_from_engine(int full) {
     static ui_widget_t snap[MAX_WIDGETS];
     int n, addon;
     unsigned epoch;
@@ -2681,6 +2922,8 @@ static void refresh_page_from_engine(void) {
     struct { int valid; float fv; char text[32]; int idx, count; } res[MAX_WIDGETS];
     memset(res, 0, sizeof(res));
     char buf[64];
+    static char big[16384];
+    static char list_names[MAX_LIST_ITEMS][LIST_NAME_LEN];
     int any_ok = 0; /* engine down: give up after the first failed GET */
     for (int i = 0; i < n; i++) {
         const ui_widget_t *w = &snap[i];
@@ -2698,7 +2941,8 @@ static void refresh_page_from_engine(void) {
             break;
         case W_READOUT: case W_STEPPER:
             if (w->get_key[0] && ctrl_get(sock, w->get_key, buf, sizeof(buf)) == 0) {
-                upcase_copy(res[i].text, sizeof(res[i].text), buf);
+                if (w->clean) clean_name(res[i].text, sizeof(res[i].text), buf);
+                else upcase_copy(res[i].text, sizeof(res[i].text), buf);
                 res[i].valid = 1;
                 any_ok = 1;
             } else if (!any_ok) return;
@@ -2713,6 +2957,34 @@ static void refresh_page_from_engine(void) {
     }
 
     int changed = 0;
+    /* Lists: fetch outside the lock, apply under it, one at a time. */
+    for (int i = 0; i < n; i++) {
+        const ui_widget_t *w = &snap[i];
+        if (w->kind != W_LIST) continue;
+        int have = 0, cnt = 0, sel = -1;
+        if (full && w->get_key[0] && ctrl_get(sock, w->get_key, big, sizeof(big)) == 0) {
+            cnt = parse_name_list(big, list_names);
+            have = 1;
+        }
+        if (w->idx_key[0] && ctrl_get(sock, w->idx_key, buf, sizeof(buf)) == 0) sel = atoi(buf);
+        pthread_mutex_lock(&touch_mu);
+        if (active_addon == addon && page_epoch == epoch) {
+            list_store_t *st = &list_stores[w->list_id];
+            if (have && (st->n != cnt || memcmp(st->names, list_names, sizeof(char) * LIST_NAME_LEN * (size_t)cnt))) {
+                memcpy(st->names, list_names, sizeof(char) * LIST_NAME_LEN * (size_t)cnt);
+                st->n = cnt; changed = 1;
+            }
+            if (sel >= 0 && sel != st->sel) {
+                st->sel = sel;
+                if (st->per_page > 0) st->page = sel / st->per_page;
+                changed = 1;
+            }
+            if (st->per_page > 0 && st->n > 0 && st->page * st->per_page >= st->n) {
+                st->page = (st->n - 1) / st->per_page; changed = 1;
+            }
+        }
+        pthread_mutex_unlock(&touch_mu);
+    }
     pthread_mutex_lock(&touch_mu);
     if (active_addon == addon && page_epoch == epoch && n_page_widgets == n) {
         for (int i = 0; i < n; i++) {
@@ -2771,9 +3043,14 @@ static void *refresh_thread_fn(void *arg) {
         int req = __atomic_exchange_n(&refresh_request, 0, __ATOMIC_RELAXED);
         if (page_epoch != seen_epoch || req || idle_ms >= 1500) {
             if (req) { struct timespec w = { 0, 150 * 1000 * 1000 }; nanosleep(&w, NULL); } /* let a bank load finish */
+            static int pass = 0;
+            /* List contents (bank names, patch names) are refetched on a
+             * page change, after a tap, and every ~6th pass (~9s); the
+             * cheap selection index every pass. */
+            int full = (page_epoch != seen_epoch) || req || (++pass % 6 == 0);
             seen_epoch = page_epoch;
             idle_ms = 0;
-            refresh_page_from_engine();
+            refresh_page_from_engine(full);
         }
     }
     return NULL;

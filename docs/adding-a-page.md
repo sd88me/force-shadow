@@ -137,6 +137,19 @@ stepper cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<text key> id
 env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>   # DX7 EG graph from sibling knobs <prefix>r1..r4,l1..l4
 ```
 
+```
+list    x=<n> y=<n> w=<n> h=<n> key=<SET key> items=<GET key -> JSON [{label|name}]> sel=<GET key for current index>
+        cols=<n> rows=<n> th=<tile px> gap=<n> jump=<0|1 A-Z row> colmajor=<0|1> numbered=<0|1> scale=<text scale>
+```
+
+`list` is a paged grid of engine-provided names (banks, patches): tap a tile
+to SET `key` to its index, A-Z row jumps pages, pager bar appears only when
+there's more than one page (page count follows the item count). Also
+`readout ... goto=<tab index> clean=1`: tapping the readout opens that tab;
+`clean=1` strips `.syx` and turns `_`/`-` into spaces. Text is drawn from
+hinted glyph tables baked by `tools/gen_font_hi.py` at scales 1, 1.5, 2, 2.5
+and 3 -- add a scale there before using a new one.
+
 `readout`/`stepper` text, stepper index/count, and every knob/toggle/enum
 value are read back from the engine (`GET <key>`) by a worker thread on
 tab entry, after a stepper tap, and every ~1.5s.
