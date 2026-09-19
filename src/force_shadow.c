@@ -1584,8 +1584,22 @@ static void maybe_redraw_shadow(void) {
     memcpy(frames_snap, page_frames, sizeof(ui_frame_t) * (size_t)n_frames_snap);
     pthread_mutex_unlock(&touch_mu);
 
-    render_shadow_page(shadow_map, shadow_stride_px, widgets_snap, n_widgets_snap,
+    /* Tearing fix: the panel scans shadow_map continuously, so rendering
+     * (slow, per-pixel AA) straight into it shows half-painted frames.
+     * Render into a private back buffer instead, then blit to the live
+     * buffer in one memcpy -- the tear window shrinks from the whole
+     * render time to a ~4MB copy. paint_mu also serializes the commit
+     * and touch threads, which could previously paint concurrently. */
+    static uint32_t *back = NULL;
+    static pthread_mutex_t paint_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&paint_mu);
+    size_t fb_bytes = (size_t)shadow_stride_px * SHADOW_H * 4;
+    if (!back) back = malloc(fb_bytes);
+    uint32_t *target = back ? back : shadow_map;
+    render_shadow_page(target, shadow_stride_px, widgets_snap, n_widgets_snap,
                         frames_snap, n_frames_snap, page_snap, addon_snap, engine_on);
+    if (back) memcpy(shadow_map, back, fb_bytes);
+    pthread_mutex_unlock(&paint_mu);
 
     /* Screen-capture diagnostic (2026-09-19): there's no way to see this
      * device's real screen remotely otherwise, which made a live-only bug

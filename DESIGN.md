@@ -2427,6 +2427,21 @@ buffering) was reconfirmed still present and is still not addressed --
 unrelated to anything in this pass, tracked separately in "Not yet
 done."
 
+## Live load test #25 (2026-09-19): back-buffer + blit reduces tearing
+
+Rendering the anti-aliased page straight into the scanned-out dumb buffer
+showed half-painted frames (the tearing noted in #11/#23/#24). Fix in
+`maybe_redraw_shadow()`: render into a private malloc'd back buffer, then
+one `memcpy` into `shadow_map`, under a `paint_mu` mutex (the commit and
+touch threads could previously paint concurrently). Not a true flip -- the
+copy is still unsynchronized with panel scan-out -- so a residual tear is
+possible, but the window shrank from full render time to a ~4MB copy.
+
+**Live result**: deployed to 192.168.1.44, user confirmed "that's better".
+Loaded clean, no log errors. Not fully eliminated as far as tested; true
+double-buffering (second dumb buffer + our own FB_ID commit) remains an
+option only if the residual is objectionable.
+
 ## Not yet done
 
 - ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real
@@ -2456,7 +2471,7 @@ done."
   (single-header, public domain, no runtime dependency) for real
   scalable vector fonts -- more capable, more surface area, more risk;
   not needed now that the coverage-based bitmap font closes the gap.
-- **Screen tearing** (a few faint, shifting-angle lines from the lack of
+- **Screen tearing** (**largely fixed, live load test #25** via back-buffer + blit; residual possible. Original note: a few faint, shifting-angle lines from the lack of
   double-buffering, most visible on knobs' own color contrast) --
   reconfirmed still present after live load test #24's font/sizing pass
   (unrelated to that work). User asked about it directly (2026-09-19)
