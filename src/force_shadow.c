@@ -83,6 +83,7 @@
 #include <poll.h>
 #include <linux/input.h>
 #include "font8x8.h"
+#include "font_hi.h"
 
 /* ---- Raw DRM UAPI structs (no libdrm/kernel headers available offline;
  * see file header comment). ---- */
@@ -630,6 +631,25 @@ static int font_glyph_index(char ch) {
 static void draw_char_land(uint32_t *map, uint32_t stride_px,
                             int32_t x, int32_t y, char ch, float scale,
                             uint32_t color) {
+    /* LCD-style pages use natively-sized, hinted glyphs (font_hi.h) at the
+     * three scales they draw with -- 1:1 pixels instead of upscaling the
+     * 9x9 bitmap, which is what made text look soft. Cell size matches
+     * the scaled path exactly, so layout doesn't move. */
+    if (th.lcd) {
+        const uint8_t *hg = NULL; int32_t hw = 0, hh = 0;
+        int gi = font_glyph_index(ch);
+        if (scale == 1.5f)      { hg = font_hi_1_5[gi]; hw = FONT_HI_1_5_W; hh = FONT_HI_1_5_H; }
+        else if (scale == 2.0f) { hg = font_hi_2_0[gi]; hw = FONT_HI_2_0_W; hh = FONT_HI_2_0_H; }
+        else if (scale == 2.5f) { hg = font_hi_2_5[gi]; hw = FONT_HI_2_5_W; hh = FONT_HI_2_5_H; }
+        if (hg) {
+            for (int32_t dy = 0; dy < hh; dy++)
+                for (int32_t dx = 0; dx < hw; dx++) {
+                    int32_t cov = hg[dy * hw + dx];
+                    if (cov > 0) put_px_blend_land(map, stride_px, x + dx, y + dy, color, cov);
+                }
+            return;
+        }
+    }
     const uint8_t *g = font8x8[font_glyph_index(ch)];
     int32_t out_cell = (int32_t)(GLYPH_CELL * scale + 0.5f);
     if (out_cell > GLYPH_MAX_OUT_CELL) out_cell = GLYPH_MAX_OUT_CELL;
@@ -2026,9 +2046,16 @@ static int is_process_running(const char *name);
  * which already runs inside its own touch_mu section. Also refreshes
  * engine_on at this same ~2/sec cadence -- see is_process_running()'s
  * own comment for why that check doesn't run on every redraw. */
-static void poll_toggle(void) {
+static pthread_mutex_t poll_mu = PTHREAD_MUTEX_INITIALIZER;
+/* full=1: also refresh engine_on (a /proc scan -- only on the slow commit
+ * cadence). full=0: just the cheap toggle-file check, called every ~50ms
+ * from refresh_thread_fn so a button-press exit (force_shadow_exitwatch
+ * removes the page file) shows up promptly even while MPC's own DRM
+ * commits are sparse (~5Hz idle, i.e. up to ~6s between full polls). */
+static void poll_toggle(int full) {
     struct stat st;
     int requested = ADDON_NONE;
+    pthread_mutex_lock(&poll_mu);
 
     if (stat(SHADOW_TOGGLE_FILE, &st) == 0) {
         /* Manual SSH override: always Maze Voice, the one real page
@@ -2062,9 +2089,11 @@ static void poll_toggle(void) {
         shadow_redraw_needed = 1;
     }
     shadow_on = (active_addon != ADDON_NONE);
-    engine_on = (active_addon != ADDON_NONE && addon_table[active_addon].engine_process_name[0])
-                    ? is_process_running(addon_table[active_addon].engine_process_name)
-                    : 0;
+    if (full)
+        engine_on = (active_addon != ADDON_NONE && addon_table[active_addon].engine_process_name[0])
+                        ? is_process_running(addon_table[active_addon].engine_process_name)
+                        : 0;
+    pthread_mutex_unlock(&poll_mu);
 }
 
 /* ---- Touch takeover (step 3) ----
@@ -2728,6 +2757,11 @@ static void *refresh_thread_fn(void *arg) {
     for (;;) {
         struct timespec ts = { 0, 50 * 1000 * 1000 };
         nanosleep(&ts, NULL);
+        if (shadow_ready) {
+            int was_on = shadow_on;
+            poll_toggle(0);
+            if (shadow_on != was_on) logline("shadow mode toggled %s (fast poll)", shadow_on ? "ON" : "off");
+        }
         if (!shadow_on) { seen_epoch = (unsigned)-1; idle_ms = 0; continue; }
         idle_ms += 50;
         int req = __atomic_exchange_n(&refresh_request, 0, __ATOMIC_RELAXED);
@@ -2856,7 +2890,7 @@ int ioctl(int fd, unsigned long request, ...) {
         }
         if (shadow_ready && (c % SHADOW_TOGGLE_CHECK_EVERY == 1)) {
             int was_on = shadow_on;
-            poll_toggle();
+            poll_toggle(1);
             if (shadow_on != was_on) {
                 logline("shadow mode toggled %s", shadow_on ? "ON" : "off");
             }
