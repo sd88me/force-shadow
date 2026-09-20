@@ -874,7 +874,8 @@ typedef enum { W_KNOB, W_TOGGLE, W_BUTTON, W_ENUM_H, W_ENUM_V,
                W_STEPPER,  /* < text > : prev/next an integer index (bank, preset) */
                W_ENV,      /* display-only DX7 envelope graph, from sibling knobs */
                W_LIST,     /* paged grid of engine-provided names (banks, patches) */
-               W_BITS      /* row of tappable step LEDs + play head (sequencer step bits) */
+               W_BITS,     /* row of tappable step LEDs + play head (sequencer step bits) */
+               W_EUCLID    /* Euclidean pattern view, up to 64 steps: strip rows or a ring (Euclidier) */
 } widget_kind_t;
 #define MAX_OPTIONS 6
 
@@ -905,6 +906,9 @@ typedef struct {
     float tscale;             /* list tile text scale */
     int hidden;               /* knob: not drawn/hit-tested, still read back (env graph siblings) */
     int env_mode;             /* env: 0 = none, 1 = JV (tkey/lkey patterns), 2 = DX7 (prefix + r1..4/l1..4) */
+    /* euclid only: get_key reply "steps|b,b,..|play|loop|enabled|selected"; env_mode 1=strip 2=ring */
+    char eu_bits[72];         /* '0'/'1' per step */
+    int eu_loop, eu_en, eu_sel;
 } ui_widget_t;
 
 typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
@@ -1160,6 +1164,22 @@ static int add_bits(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *
     strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
     strncpy(w->text, "00000000", sizeof(w->text)-1);
     w->ival = -1; w->imax = 8;
+    return n_page_widgets++;
+}
+/* Euclidean pattern view (Euclidier). mode: 1 = strip (rows of cells, two rows
+ * above 32 steps), 2 = ring. get_key state: "steps|b,b,..|play|loop|enabled|selected".
+ * A non-empty key makes it tappable: a tap SETs key to `val` (e.g. select a lane). */
+static int add_euclid(int32_t cx, int32_t cy, int32_t bw, int32_t bh, int mode,
+                      const char *key, const char *val, const char *get_key) {
+    ui_widget_t *w = &page_widgets[n_page_widgets];
+    memset(w, 0, sizeof(*w));
+    w->kind = W_EUCLID; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
+    w->env_mode = mode;
+    if (key[0]) { w->hit_hw = bw/2; w->hit_hh = bh/2; } else { w->hit_hw = w->hit_hh = -1; }
+    strncpy(w->param_key, key, sizeof(w->param_key)-1);
+    strncpy(w->text, val, sizeof(w->text)-1);
+    strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
+    w->ival = -1; w->imax = 16; w->eu_en = 1;
     return n_page_widgets++;
 }
 /* Display-only DX7 envelope graph; param_key is the prefix shared by the
@@ -1546,6 +1566,10 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             add_bits(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                      atoi(shadow_page_kv_get(kv, nkv, "h")), label, key,
                      shadow_page_kv_get(kv, nkv, "get"));
+        } else if (strcmp(type, "euclid") == 0) {
+            add_euclid(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
+                       strcmp(shadow_page_kv_get(kv, nkv, "mode"), "ring") == 0 ? 2 : 1, key,
+                       shadow_page_kv_get(kv, nkv, "val"), shadow_page_kv_get(kv, nkv, "get"));
         } else if (strcmp(type, "list") == 0) {
             int lw = add_list(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
                     atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
@@ -1957,6 +1981,67 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
                 fill_rect_land(map, stride_px, cx0 - 3, y0 - 3, cell + 6, w->h + 6, UI_INK);
             fill_rect_land(map, stride_px, cx0, y0, cell, w->h, on ? UI_ACCENT_HI : th.plate_line);
             if (!on) fill_rect_land(map, stride_px, cx0 + 2, y0 + 2, cell - 4, w->h - 4, in_range ? th.well : PLATE_BG);
+        }
+        break;
+    }
+    case W_EUCLID: {
+        int n = w->imax; if (n < 1) n = 1; if (n > 64) n = 64;
+        int lp = (w->eu_loop > 0 && w->eu_loop < n) ? w->eu_loop : 0;
+        uint32_t c_on = w->eu_en ? UI_ACCENT_HI : UI_INK_FAINT;
+        int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
+        if (w->env_mode == 2) {                      /* ring */
+            int32_t R = (w->w < w->h ? w->w : w->h) / 2 - 24;
+            float rf = (float)R * 3.14159f / (float)n * 0.62f;
+            int32_t pr = rf < 3 ? 3 : (rf > 22 ? 22 : (int32_t)rf);
+            draw_ring_land(map, stride_px, w->cx, w->cy, R + 1, 2, th.plate_line);
+            int32_t px[64], py[64];
+            for (int i = 0; i < n; i++) {
+                int deg = (i * 360) / n;
+                px[i] = w->cx + (int32_t)((float)R * sin_deg(deg));
+                py[i] = w->cy - (int32_t)((float)R * cos_deg(deg));
+            }
+            int last = -1, first = -1;
+            for (int i = 0; i < n; i++) if (w->eu_bits[i] == '1') {
+                if (first < 0) first = i;
+                if (last >= 0) draw_line_land(map, stride_px, px[last], py[last], px[i], py[i], 2, UI_INK_FAINT);
+                last = i;
+            }
+            if (first >= 0 && last > first) draw_line_land(map, stride_px, px[last], py[last], px[first], py[first], 2, UI_INK_FAINT);
+            for (int i = 0; i < n; i++) {
+                int on = w->eu_bits[i] == '1', beyond = lp && i >= lp;
+                if (i == w->ival) fill_circle_land(map, stride_px, px[i], py[i], pr + 4, UI_INK);
+                fill_circle_land(map, stride_px, px[i], py[i], pr, on ? c_on : th.plate_line);
+                if (!on) fill_circle_land(map, stride_px, px[i], py[i], pr - 2 > 0 ? pr - 2 : 1, beyond ? PLATE_BG : th.well);
+            }
+            if (lp) {                                /* loop point: tick between step lp-1 and lp */
+                int deg = (lp * 360) / n - 180 / n;
+                int32_t ax = w->cx + (int32_t)((float)(R - pr - 10) * sin_deg(deg)), ay = w->cy - (int32_t)((float)(R - pr - 10) * cos_deg(deg));
+                int32_t bx2 = w->cx + (int32_t)((float)(R + pr + 10) * sin_deg(deg)), by2 = w->cy - (int32_t)((float)(R + pr + 10) * cos_deg(deg));
+                draw_line_land(map, stride_px, ax, ay, bx2, by2, 3, UI_INK);
+            }
+            break;
+        }
+        /* strip */
+        if (w->eu_sel) {                             /* selected lane: outline */
+            fill_rect_land(map, stride_px, x0 - 6, y0 - 6, w->w + 12, w->h + 12, UI_INK);
+            fill_rect_land(map, stride_px, x0 - 3, y0 - 3, w->w + 6, w->h + 6, PLATE_BG);
+        }
+        int rows = n > 32 ? 2 : 1, per = (n + rows - 1) / rows;
+        int32_t gap = n > 32 ? 2 : 4, rgap = 6;
+        int32_t cw = (w->w - gap * (per - 1)) / per; if (cw < 2) cw = 2;
+        int32_t ch = (w->h - rgap * (rows - 1)) / rows;
+        for (int i = 0; i < n; i++) {
+            int on = w->eu_bits[i] == '1', beyond = lp && i >= lp;
+            int32_t cx0 = x0 + (i % per) * (cw + gap), cy0 = y0 + (i / per) * (ch + rgap);
+            if (i == w->ival) fill_rect_land(map, stride_px, cx0 - 2, cy0 - 2, cw + 4, ch + 4, UI_INK);
+            fill_rect_land(map, stride_px, cx0, cy0, cw, ch, on ? c_on : th.plate_line);
+            if (!on && cw > 4) fill_rect_land(map, stride_px, cx0 + 2, cy0 + 2, cw - 4, ch - 4, beyond ? PLATE_BG : th.well);
+            else if (beyond) fill_rect_land(map, stride_px, cx0, cy0, cw, ch, PLATE_BG);
+        }
+        if (lp) {                                     /* loop point marker */
+            int32_t mx = x0 + (lp % per) * (cw + gap) - gap / 2 - 1;
+            int mr = lp / per;
+            fill_rect_land(map, stride_px, mx, y0 + mr * (ch + rgap) - 4, 3, ch + 8, UI_INK);
         }
         break;
     }
@@ -2915,6 +3000,9 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         send_ctrl_set(w->param_key, buf);
         break;
     }
+    case W_EUCLID:
+        send_ctrl_set(w->param_key, w->text[0] ? w->text : "go");
+        break;
     case W_READOUT:
     case W_ENV:
         break;
@@ -3136,6 +3224,10 @@ static void update_touch_state(const struct input_event *ev) {
                     }
                     break;
                 }
+                case W_EUCLID:
+                    send_idx = i; send_force = 1; send_snapshot = *w;
+                    refresh_request = 1;
+                    break;
                 case W_BITS: {
                     int32_t gap = 8, cell = (w->w - 7 * gap) / 8;
                     int k = (lpx - (w->cx - w->w/2)) / (cell + gap);
@@ -3341,7 +3433,7 @@ static void refresh_page_from_engine(int full) {
     const char *sock = addon_table[addon].ctrl_sock;
     if (!sock[0]) return;
 
-    struct { int valid; float fv; char text[32]; int idx, count; } res[MAX_WIDGETS];
+    struct { int valid; float fv; char text[32]; int idx, count; char eb[72]; int loop, en, sel; } res[MAX_WIDGETS];
     memset(res, 0, sizeof(res));
     char buf[64];
     static char big[16384];
@@ -3373,6 +3465,22 @@ static void refresh_page_from_engine(int full) {
                 if (w->idx_key[0] && ctrl_get(sock, w->idx_key, buf, sizeof(buf)) == 0) res[i].idx = atoi(buf);
                 if (w->count_key[0] && ctrl_get(sock, w->count_key, buf, sizeof(buf)) == 0) res[i].count = atoi(buf);
             }
+            break;
+        case W_EUCLID:
+            if (w->get_key[0] && ctrl_get(sock, w->get_key, big, sizeof(big)) == 0) {
+                /* "steps|b,b,..|play|loop|enabled|selected" */
+                char *f[6] = {0}; int nf = 0; char *p = big;
+                for (f[nf++] = p; nf < 6 && (p = strchr(p, '|')); ) { *p++ = 0; f[nf++] = p; }
+                int k = 0;
+                if (nf >= 2) for (p = f[1]; *p && k < 64; p++) if (*p == '0' || *p == '1') res[i].eb[k++] = *p;
+                res[i].eb[k] = 0;
+                res[i].count = atoi(f[0]);
+                res[i].idx = nf > 2 ? atoi(f[2]) : -1;
+                res[i].loop = nf > 3 ? atoi(f[3]) : 0;
+                res[i].en = nf > 4 ? atoi(f[4]) : 1;
+                res[i].sel = nf > 5 ? atoi(f[5]) : 0;
+                res[i].valid = 1; any_ok = 1;
+            } else if (!any_ok) return;
             break;
         case W_BITS:
             if (w->get_key[0] && ctrl_get(sock, w->get_key, buf, sizeof(buf)) == 0) {
@@ -3445,6 +3553,14 @@ static void refresh_page_from_engine(int full) {
                 if (v >= 0 && v < w->n_options && v != w->state) { w->state = v; changed = 1; }
                 break;
             }
+            case W_EUCLID:
+                if (strcmp(w->eu_bits, res[i].eb)) { strncpy(w->eu_bits, res[i].eb, sizeof(w->eu_bits) - 1); changed = 1; }
+                if (res[i].idx != w->ival) { w->ival = res[i].idx; changed = 1; }
+                if (res[i].count > 0 && res[i].count != w->imax) { w->imax = res[i].count; changed = 1; }
+                if (res[i].loop != w->eu_loop) { w->eu_loop = res[i].loop; changed = 1; }
+                if (res[i].en != w->eu_en) { w->eu_en = res[i].en; changed = 1; }
+                if (res[i].sel != w->eu_sel) { w->eu_sel = res[i].sel; changed = 1; }
+                break;
             case W_BITS:
                 if (strcmp(w->text, res[i].text)) { strncpy(w->text, res[i].text, sizeof(w->text) - 1); changed = 1; }
                 if (res[i].idx != w->ival) { w->ival = res[i].idx; changed = 1; }
@@ -3484,8 +3600,8 @@ static void *refresh_thread_fn(void *arg) {
         idle_ms += 50;
         int req = __atomic_exchange_n(&refresh_request, 0, __ATOMIC_RELAXED);
         int fast = 0;   /* a step-bits widget needs a live play head */
-        for (int i = 0; i < n_page_widgets; i++) if (page_widgets[i].kind == W_BITS) { fast = 1; break; }
-        if (page_epoch != seen_epoch || req || idle_ms >= (fast ? 200 : 1500)) {
+        for (int i = 0; i < n_page_widgets; i++) if ((page_widgets[i].kind == W_BITS || page_widgets[i].kind == W_EUCLID)) { fast = 1; break; }
+        if (page_epoch != seen_epoch || req || idle_ms >= (fast ? 120 : 1500)) {
             if (req) { struct timespec w = { 0, 150 * 1000 * 1000 }; nanosleep(&w, NULL); } /* let a bank load finish */
             static int pass = 0;
             /* List contents (bank names, patch names) are refetched on a
