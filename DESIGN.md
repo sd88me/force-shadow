@@ -2526,6 +2526,36 @@ in `force_shadow.c`; the page itself is `force-dx7/addon/shadow_page.conf`
   reported it good. The list/readback path against a running `dx7_host`
   was not separately verified by an automated test or a captured log.
 
+## Live load test #27 (2026-09-20): JV-880 page, dot-matrix top bar, and a widget-key truncation bug
+
+Shipped the JV-880 page (`force-jv880/addon/shadow_page.conf`, slot 2, 7 tabs:
+PLAY, PATCH, TONE 1-4, BANKS). `SHIFT+SCENE-2` now uses `SCRIPT-20` (the
+page-toggle script `KNOBS+SCENE-2` already used), same one-line rebind
+procedure as DX7/Maze Voice: timestamped backup, one line, `midiloop test`.
+
+**New page-file options** (all default off; existing pages unchanged):
+- `frame_style=plain`: frames without accent corner brackets / title bullet.
+- `topbar_style=display` plus `theme_display_bg/cell/ink/off/bezel`: the whole
+  top bar becomes a backlit dot-matrix LCD in a rounded bezel; readout/stepper
+  cells in the top bar and the nameplate/ENGINE cell use a 5x7 dot font
+  (`DOTFONT`, `dot_cell()`), lit dots on a faint unlit grid. ENGINE ON is drawn
+  inverted, OFF as an outlined cell.
+
+**Real bug found live**: `ui_widget_t.param_key/get_key/idx_key/count_key` were
+`char[20]`, so `nvram_patchCommon_patchlevel` was sent as
+`nvram_patchCommon_p` (visible in `/tmp/force_shadow.log` as
+`SET nvram_patchCommon_p ...`). Writes hit a nonexistent key and the readback
+failed, so knobs snapped back to default on every tab switch. Widened to 48.
+**Lesson:** grep the log's `addon_ctrl ... SET` lines against the real key
+names on the first live test of any page with long keys.
+
+**List pager overlap**: a list's tile grid must leave `LIST_PAGER_H` (56px)
+free at the bottom of its box, or taps on the pager arrows land on the bottom
+tile row. Patch list uses rows=14 for a 580px box.
+
+Deployed and confirmed live by the user (page, banks, patch list, top bar,
+parameter persistence).
+
 ## Not yet done
 
 - ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real

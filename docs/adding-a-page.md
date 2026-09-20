@@ -123,12 +123,14 @@ enum_v cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<ind
 ```
 
 Optional top-level keys (added with the DX7 page): `style=lcd` (dotted-arc
-dark knobs, bracketed frames, LCD nameplate), `int_values=1` (host uses
+dark knobs, bracketed frames, LCD nameplate), `frame_style=plain` (no corner brackets/bullets on frames), `topbar_style=display` with
+`theme_display_bg|cell|ink|off|bezel` (dot-matrix LCD top bar; see the JV-880 page),
+`int_values=1` (host uses
 `atoi()`: knobs send a rounded integer, toggles `1`/`0`, enums their
 option *index*), and `theme_<name>=RRGGBB` (no `#`) for `bg panel line ink
 ink_dim ink_faint accent accent_hi knob_face knob_ring bar seg_active
 seg_inactive seg_active_tx btn_text well knob_off tab_on lcd`; unset keys
-keep Maze Voice's palette. More widgets (up to 8 tabs, 64 widgets each;
+keep Maze Voice's palette. More widgets (up to 8 tabs, 64 widgets each; widget keys up to 47 chars;
 enums up to 6 options, optional `sw=<segment px>`):
 
 ```
