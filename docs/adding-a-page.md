@@ -137,6 +137,7 @@ enums up to 6 options, optional `sw=<segment px>`):
 readout cx=<n> cy=<n> w=<n> h=<n> label="<text>" get=<key>
 stepper cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<text key> idx=<index key> count=<count key> min=<n> max=<n> numbered=<0|1>
 env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>   # DX7 EG graph from sibling knobs <prefix>r1..r4,l1..l4
+env     cx=<n> cy=<n> w=<n> h=<n> prefix=<id> tkey=<pattern%d> lkey=<pattern%d> lmin=<n> lmax=<n> nl=<3|4>   # JV-style EG (time 0-127, levels lmin..lmax)
 ```
 
 ```
@@ -454,3 +455,13 @@ screen/pads/touch/audio normal at every step and after every revert.
 7. Update `DESIGN.md` with what you built and what you found (this
    project's own convention — every non-obvious constant here exists
    because a past mistake is documented next to it).
+
+
+## Draggable envelope graphs (`env`)
+
+Both `env` forms are interactive: drag one of the four handles (L1, L2, L3, release end) -- x sets that
+segment's rate/time, y its level. The eight sibling knobs must be on the same tab (DX7: visible; JV: add
+`hidden=1` to a `knob` line so it is read back and kept in sync but not drawn or touchable). The graph
+uses a fixed time scale so a drag never rescales the other points. While dragging, the readback worker
+does not overwrite knob values; the exact integer values are sent with the normal throttle, and the
+final value unconditionally on release. Keys used with `tkey`/`lkey` must be at most 47 characters.

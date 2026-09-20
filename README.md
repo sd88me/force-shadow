@@ -27,11 +27,15 @@ addon (JV-880, ...)? Start with [docs/adding-a-page.md](docs/adding-a-page.md).
 
 ## Current state / what's next
 
-- Pages live on hardware: Maze Voice (3 tabs) and DX7 (8 tabs). Both are
+- Pages live on hardware: Maze Voice (3 tabs), DX7 (8 tabs) and JV-880 (7 tabs), all
   data-driven `shadow_page.conf` files shipped by their own addons.
-- Next obvious addon: **JV-880** -- the `list` widget (paged names + A-Z jump
-  + patch list) and the top-bar `readout`/`stepper` were built generically
-  so its bank/patch browsing can reuse them.
+- Widgets worth knowing: `list` (paged names + A-Z jump), top-bar `readout`/`stepper`, and `env`
+  -- an envelope graph you can **drag** (DX7 mode: `prefix=` + sibling knobs `r1..4/l1..4`;
+  JV mode: `tkey=`/`lkey=` patterns with `%d`). The graph reads and updates its sibling knobs,
+  so knobs and graph stay in sync. Optional look switches: `frame_style=plain`,
+  `topbar_style=display` (dot-matrix LCD top bar).
+- Touch input is drained per batch before repainting (a full repaint is ~30-40 ms on the Force);
+  `perf:` lines in `/tmp/force_shadow.log` flag slow redraws / a lagging touch thread.
 - Open ideas (see DESIGN.md "Not yet done"): "any other button also
   reverts", left-aligned/uneven text polish, per-widget value conventions
   beyond `int_values` (e.g. DX7's L/R/L+R `mix.channel` needs literal text

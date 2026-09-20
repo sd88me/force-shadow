@@ -2556,6 +2556,25 @@ tile row. Patch list uses rows=14 for a 580px box.
 Deployed and confirmed live by the user (page, banks, patch list, top bar,
 parameter persistence).
 
+## Live load test #28 (2026-09-20): draggable envelope graphs, and the touch-thread backlog
+
+**Draggable `env` graph.** The `env` widget became interactive (DX7 and JV forms, see
+`docs/adding-a-page.md`): touch-down picks the nearest of four handles within 48px, a drag maps x to
+rate/time (fixed scale) and y to level, updates the sibling knob states (so knobs and graph stay in
+sync) and sends the exact integer SETs (throttled, final value forced on release). `hidden=1` knobs keep
+readback working without drawing. Live-confirmed on JV-880 and DX7.
+
+**Real bug found live**: dragging felt sluggish and redrew seconds after release. Added `perf:` log lines
+(touch-event age, slow redraws): the touch thread was handling events up to **3.6 s** after the kernel
+stamped them while CPU sat ~85% idle and each full repaint took only ~30-40 ms. Cause: the touch loop read
+ONE input event and did a full repaint after EACH one; a finger sample is 2-3 events, so events arrived
+faster than 35 ms repaints could clear. Fix: drain every already-queued event (up to 512), then repaint
+once per batch. After the fix the log shows no touch-lag lines. **Lesson:** measure event age on the device
+before optimizing the renderer; the renderer was never the bottleneck.
+
+Also hit again after a deploy: the boot-time `LD_PRELOAD` race (count 0 in MPC's environ) -- re-run
+`run_ForceShadow.sh`, restart `acvs` again.
+
 ## Not yet done
 
 - ~~Per-addon data-driven GUI~~ — **done, live load test #22**: a real
