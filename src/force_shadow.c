@@ -597,6 +597,9 @@ typedef struct {
     uint32_t seg_active, seg_inactive, seg_active_tx, btn_text;
     uint32_t well, knob_off, tab_on_bg, lcd_bg;
     int lcd;
+    int plain_frames;   /* frame_style=plain: no accent corner brackets / title bullet */
+    int dsp;            /* topbar_style=display: whole top bar is a simulated dot-matrix LCD */
+    uint32_t dsp_bg, dsp_cell, dsp_ink, dsp_off, dsp_bezel;
 } ui_theme_t;
 
 static const ui_theme_t THEME_DEFAULT = {
@@ -717,6 +720,74 @@ static void draw_text_land_c(uint32_t *map, uint32_t stride_px,
     draw_text_land(map, stride_px, cx - text_width_land(s, scale)/2, y, s, scale, color);
 }
 
+/* ---- Dot-matrix display (topbar_style=display) ----
+ * Rounded rect, and text drawn as a grid of lit/unlit dots sampled from
+ * the baked hinted glyphs (scales 2.0/2.5 only). */
+static void fill_rrect_land(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y,
+                            int32_t w, int32_t h, int32_t r, uint32_t c) {
+    for (int32_t j = 0; j < h; j++) {
+        int32_t inset = 0;
+        if (j < r) { int32_t d = r - j; inset = r; while (inset > 0 && (r - inset) * (r - inset) + d * d > r * r) inset--; inset = r - inset; }
+        else if (j >= h - r) { int32_t d = j - (h - r - 1); inset = r; while (inset > 0 && (r - inset) * (r - inset) + d * d > r * r) inset--; inset = r - inset; }
+        fill_rect_land(map, stride_px, x + inset, y + j, w - 2 * inset, 1, c);
+    }
+}
+/* 5x7 dot-matrix font (HD44780 style), rows top->bottom, 5 bits each. */
+typedef struct { char c; uint8_t r[7]; } dotglyph_t;
+static const dotglyph_t DOTFONT[] = {
+ {'0',{14,17,19,21,25,17,14}},{'1',{4,12,4,4,4,4,14}},{'2',{14,17,1,2,4,8,31}},{'3',{31,2,4,2,1,17,14}},
+ {'4',{2,6,10,18,31,2,2}},{'5',{31,16,30,1,1,17,14}},{'6',{6,8,16,30,17,17,14}},{'7',{31,1,2,4,8,8,8}},
+ {'8',{14,17,17,14,17,17,14}},{'9',{14,17,17,15,1,2,12}},
+ {'A',{14,17,17,31,17,17,17}},{'B',{30,17,17,30,17,17,30}},{'C',{14,17,16,16,16,17,14}},{'D',{28,18,17,17,17,18,28}},
+ {'E',{31,16,16,30,16,16,31}},{'F',{31,16,16,30,16,16,16}},{'G',{14,17,16,23,17,17,15}},{'H',{17,17,17,31,17,17,17}},
+ {'I',{14,4,4,4,4,4,14}},{'J',{7,2,2,2,2,18,12}},{'K',{17,18,20,24,20,18,17}},{'L',{16,16,16,16,16,16,31}},
+ {'M',{17,27,21,21,17,17,17}},{'N',{17,17,25,21,19,17,17}},{'O',{14,17,17,17,17,17,14}},{'P',{30,17,17,30,16,16,16}},
+ {'Q',{14,17,17,17,21,18,13}},{'R',{30,17,17,30,20,18,17}},{'S',{15,16,16,14,1,1,30}},{'T',{31,4,4,4,4,4,4}},
+ {'U',{17,17,17,17,17,17,14}},{'V',{17,17,17,17,17,10,4}},{'W',{17,17,17,21,21,21,10}},{'X',{17,17,10,4,10,17,17}},
+ {'Y',{17,17,10,4,4,4,4}},{'Z',{31,1,2,4,8,16,31}},
+ {'-',{0,0,0,31,0,0,0}},{'.',{0,0,0,0,0,12,12}},{'/',{1,1,2,4,8,16,16}},{':',{0,12,12,0,12,12,0}},
+ {'+',{0,4,4,31,4,4,0}},{'#',{10,10,31,10,31,10,10}},{'&',{12,18,20,8,21,18,13}},{'>',{16,8,4,2,4,8,16}},
+};
+static const uint8_t *dot_glyph(char ch) {
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    for (size_t i = 0; i < sizeof(DOTFONT) / sizeof(DOTFONT[0]); i++)
+        if (DOTFONT[i].c == ch) return DOTFONT[i].r;
+    return NULL;
+}
+static int32_t dot_text_width(const char *s, int32_t p) { return (int32_t)strlen(s) * 6 * p; }
+/* Grid-aligned cell: unlit dot grid fills the cell, lit dots of the text
+ * land on the same grid (5x7 glyph per 6 columns), centred in the cell. */
+static void dot_cell(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y, int32_t w, int32_t h,
+                     const char *s, int32_t p, uint32_t cell_bg, uint32_t unlit, uint32_t lit) {
+    fill_rrect_land(map, stride_px, x, y, w, h, 5, cell_bg);
+    int32_t ncols = s ? (int32_t)strlen(s) * 6 - 1 : 0;
+    int32_t gcols = (w - 8) / p, grows = (h - 6) / p;
+    int32_t gx = x + (w - gcols * p) / 2 + (p - (p > 3 ? 3 : 2)) / 2, gy = y + (h - grows * p) / 2 + 1;
+    int32_t du = p - 2, dl = p > 3 ? p - 1 : p - 1;
+    int32_t c0 = (gcols - ncols) / 2, r0 = (grows - 7) / 2;
+    for (int32_t r = 0; r < grows; r++)
+        for (int32_t c = 0; c < gcols; c++)
+            fill_rect_land(map, stride_px, gx + c * p, gy + r * p, du, du, unlit);
+    for (int32_t i = 0; s && s[i]; i++) {
+        const uint8_t *g = dot_glyph(s[i]);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 5; c++)
+                if (g[r] & (16 >> c))
+                    fill_rect_land(map, stride_px, gx + (c0 + i * 6 + c) * p - (dl - du) / 2,
+                                   gy + (r0 + r) * p - (dl - du) / 2, dl, dl, lit);
+    }
+}
+/* Picks the biggest pitch (4, else 3) that fits, truncating at pitch 3. */
+static void dot_cell_fit(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y, int32_t w, int32_t h,
+                         const char *s, uint32_t cell_bg, uint32_t unlit, uint32_t lit) {
+    char tb[48]; snprintf(tb, sizeof(tb), "%s", s);
+    int32_t p = 4;
+    if (dot_text_width(tb, p) > w - 20) p = 3;
+    while (strlen(tb) > 1 && dot_text_width(tb, p) > w - 20) tb[strlen(tb) - 1] = 0;
+    dot_cell(map, stride_px, x, y, w, h, tb, p, cell_bg, unlit, lit);
+}
+
 /* ---- Multi-page Maze Voice control UI ----
  *
  * Replaces the original fixed 6-knob mockup with the full layout worked
@@ -795,7 +866,7 @@ typedef struct {
     int32_t hit_hw, hit_hh;   /* half-width/half-height hit box */
     int32_t radius;           /* knob draw radius */
     char label[24];
-    char param_key[20];       /* maze_host SET key; "" = no DSP binding */
+    char param_key[48];       /* maze_host SET key; "" = no DSP binding */
     float pmin, pmax;         /* knob: real-world value range */
     int state;                /* knob: 0-100 pct; toggle: 0/1; enum: active idx */
     const char *options[MAX_OPTIONS];
@@ -803,9 +874,9 @@ typedef struct {
     int32_t seg_x[MAX_OPTIONS], seg_y[MAX_OPTIONS], seg_w, seg_h; /* enum only */
     /* readout/stepper/env only */
     int32_t w, h;             /* box size */
-    char get_key[20];         /* GET key for the displayed text */
-    char idx_key[20];         /* stepper: GET key for the current index */
-    char count_key[20];       /* stepper: GET key for the item count (max = count-1) */
+    char get_key[48];         /* GET key for the displayed text */
+    char idx_key[48];         /* stepper: GET key for the current index */
+    char count_key[48];       /* stepper: GET key for the item count (max = count-1) */
     char text[32];            /* last text read from the engine (upper-cased) */
     int ival, imin, imax;     /* stepper index + bounds */
     int numbered;             /* stepper/list: prefix text with the 1-based index */
@@ -1338,6 +1409,8 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             else if (strcmp(k, "engine_nsmodule_path") == 0) strncpy(parsed.engine_nsmodule_path, v, sizeof(parsed.engine_nsmodule_path) - 1);
             else if (strcmp(k, "engine_dirname") == 0) strncpy(parsed.engine_dirname, v, sizeof(parsed.engine_dirname) - 1);
             else if (strcmp(k, "style") == 0) parsed.theme.lcd = (strcmp(v, "lcd") == 0);
+            else if (strcmp(k, "frame_style") == 0) parsed.theme.plain_frames = (strcmp(v, "plain") == 0);
+            else if (strcmp(k, "topbar_style") == 0) parsed.theme.dsp = (strcmp(v, "display") == 0);
             else if (strcmp(k, "int_values") == 0) parsed.int_values = atoi(v);
             else if (strncmp(k, "theme_", 6) == 0) {
                 /* theme_<name>=RRGGBB (no '#': the tokenizer treats a
@@ -1364,6 +1437,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 else if (!strcmp(n, "knob_off"))    t->knob_off = c;
                 else if (!strcmp(n, "tab_on"))      t->tab_on_bg = c;
                 else if (!strcmp(n, "lcd"))         t->lcd_bg = c;
+                else if (!strcmp(n, "display_bg"))    t->dsp_bg = c;
+                else if (!strcmp(n, "display_cell"))  t->dsp_cell = c;
+                else if (!strcmp(n, "display_ink"))   t->dsp_ink = c;
+                else if (!strcmp(n, "display_off"))   t->dsp_off = c;
+                else if (!strcmp(n, "display_bezel")) t->dsp_bezel = c;
                 else logline("shadow_page[%s]: unknown theme key '%s' -- ignored", path, k);
             }
             /* engine_arguments_json is handled earlier, as a raw
@@ -1522,12 +1600,14 @@ static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t
         fill_rect_land(map, stride_px, f->x, f->y, 1, f->h, PLATE_LINE);
         fill_rect_land(map, stride_px, f->x + f->w - 1, f->y, 1, f->h, PLATE_LINE);
         int32_t bl = 16;
-        fill_rect_land(map, stride_px, f->x, f->y, bl, 2, UI_ACCENT);
-        fill_rect_land(map, stride_px, f->x, f->y, 2, bl, UI_ACCENT);
-        fill_rect_land(map, stride_px, f->x + f->w - bl, f->y + f->h - 2, bl, 2, UI_ACCENT);
-        fill_rect_land(map, stride_px, f->x + f->w - 2, f->y + f->h - bl, 2, bl, UI_ACCENT);
-        fill_rect_land(map, stride_px, f->x + 16, f->y + 16, 9, 9, UI_ACCENT);
-        draw_text_land(map, stride_px, f->x + 34, f->y + 14, f->title, 1.5f, UI_ACCENT_HI);
+        if (!th.plain_frames) {
+            fill_rect_land(map, stride_px, f->x, f->y, bl, 2, UI_ACCENT);
+            fill_rect_land(map, stride_px, f->x, f->y, 2, bl, UI_ACCENT);
+            fill_rect_land(map, stride_px, f->x + f->w - bl, f->y + f->h - 2, bl, 2, UI_ACCENT);
+            fill_rect_land(map, stride_px, f->x + f->w - 2, f->y + f->h - bl, 2, bl, UI_ACCENT);
+            fill_rect_land(map, stride_px, f->x + 16, f->y + 16, 9, 9, UI_ACCENT);
+        }
+        draw_text_land(map, stride_px, f->x + (th.plain_frames ? 18 : 34), f->y + 14, f->title, 1.5f, UI_ACCENT_HI);
         fill_rect_land(map, stride_px, f->x + 16, f->y + 36, f->w - 32, 1, PLATE_LINE);
         return;
     }
@@ -1700,18 +1780,29 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
             draw_text_land(map, stride_px, x0, y0 - 22, w->label, 1.5f, UI_INK_DIM);
         if (w->kind == W_STEPPER) {
             /* end buttons are square, box-height wide */
-            fill_rect_land(map, stride_px, x0, y0, w->h, w->h, th.plate_line);
-            fill_rect_land(map, stride_px, x0 + w->w - w->h, y0, w->h, w->h, th.plate_line);
-            draw_arrow_land(map, stride_px, x0 + w->h/2, w->cy, w->h/4, -1, UI_ACCENT_HI);
-            draw_arrow_land(map, stride_px, x0 + w->w - w->h/2, w->cy, w->h/4, 1, UI_ACCENT_HI);
+            uint32_t abg = (th.dsp && w->cy < TOPBAR_H) ? th.dsp_bezel : th.plate_line;
+            uint32_t afg = (th.dsp && w->cy < TOPBAR_H) ? th.dsp_bg : UI_ACCENT_HI;
+            fill_rrect_land(map, stride_px, x0, y0, w->h, w->h, 5, abg);
+            fill_rrect_land(map, stride_px, x0 + w->w - w->h, y0, w->h, w->h, 5, abg);
+            draw_arrow_land(map, stride_px, x0 + w->h/2, w->cy, w->h/4, -1, afg);
+            draw_arrow_land(map, stride_px, x0 + w->w - w->h/2, w->cy, w->h/4, 1, afg);
             bx = x0 + w->h + 3; bw = w->w - 2*w->h - 6;
         }
+        int topdsp = th.dsp && w->cy < TOPBAR_H;
+        if (!topdsp) {
         fill_rect_land(map, stride_px, bx, y0, bw, w->h, th.lcd_bg);
         fill_rect_land(map, stride_px, bx, y0, bw, 1, PLATE_LINE);
         fill_rect_land(map, stride_px, bx, y0 + w->h - 1, bw, 1, PLATE_LINE);
+        }
         char tb[48];
         if (w->kind == W_STEPPER && w->numbered) snprintf(tb, sizeof(tb), "%02d  %s", w->ival + 1, w->text);
         else snprintf(tb, sizeof(tb), "%s", w->text);
+        if (topdsp) {
+            dot_cell_fit(map, stride_px, bx, y0, bw, w->h, tb, th.dsp_cell, th.dsp_off, th.dsp_ink);
+            if (w->kind == W_READOUT && w->goto_tab >= 0)
+                draw_arrow_land(map, stride_px, bx + bw - 14, w->cy, 6, 1, th.dsp_ink);
+            break;
+        }
         float sc = 2.0f;
         if (text_width_land(tb, sc) > bw - 16) sc = 1.5f;
         while (strlen(tb) > 1 && text_width_land(tb, sc) > bw - 16) tb[strlen(tb) - 1] = 0;
@@ -1878,7 +1969,16 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
     fill_rect_land(map, stride_px, 0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     fill_rect_land(map, stride_px, 0, TOPBAR_H, LAND_W, 1, PLATE_LINE);
     char title[40];
-    if (th.lcd) {
+    if (th.dsp) {
+        /* Whole bar = backlit dot-matrix LCD: dark rounded bezel, green
+         * glass, dark dot cells for nameplate / bank / patch / engine. */
+        fill_rrect_land(map, stride_px, 8, 5, LAND_W - 16, TOPBAR_H - 10, 12, th.dsp_bezel);
+        fill_rrect_land(map, stride_px, 12, 9, LAND_W - 24, TOPBAR_H - 18, 9, th.dsp_bg);
+        snprintf(title, sizeof(title), "%s", ad->display_name);
+        int32_t tw_px = dot_text_width(title, 4) + 24;
+        fill_rrect_land(map, stride_px, 17, 11, tw_px + 6, 50, 8, th.dsp_bezel);
+        dot_cell(map, stride_px, 20, 14, tw_px, 44, title, 4, th.dsp_bezel, 0xFF1C2612u, 0xFFCDEB63u);
+    } else if (th.lcd) {
         /* LCD nameplate instead of the plain title. */
         snprintf(title, sizeof(title), "%s", ad->display_name);
         int32_t tw_px = text_width_land(title, 2.5f) + 48;
@@ -1897,11 +1997,20 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
      * this project's own web GUIs' toggle convention. Only drawn for an
      * addon that actually has an engine to control. */
     if (ad->engine_process_name[0]) {
+      if (th.dsp) {
+        /* Outlined cell always; ON = inverted (dark glass, green dots). */
+        fill_rrect_land(map, stride_px, ENGINE_BTN_X - 3, 11, ENGINE_BTN_W + 6, 50, 8, th.dsp_bezel);
+        if (engine_on_snap)
+            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE ON", 3, th.dsp_bezel, 0xFF1C2612u, 0xFFCDEB63u);
+        else
+            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE OFF", 3, th.dsp_cell, th.dsp_off, th.dsp_ink);
+      } else {
         uint32_t bg = engine_on_snap ? UI_ACCENT : PLATE_LINE;
         uint32_t fg = engine_on_snap ? BTN_TEXT : UI_INK_FAINT;
         fill_rect_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bg);
         draw_text_land_c(map, stride_px, ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
                           engine_on_snap ? "ENGINE ON" : "ENGINE OFF", 2, fg);
+      }
     }
 
     for (int i = 0; i < n_frames; i++) render_frame_box(map, stride_px, &frames[i]);
