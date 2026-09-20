@@ -600,6 +600,9 @@ typedef struct {
     int plain_frames;   /* frame_style=plain: no accent corner brackets / title bullet */
     int dsp;            /* topbar_style=display: whole top bar is a simulated dot-matrix LCD */
     uint32_t dsp_bg, dsp_cell, dsp_ink, dsp_off, dsp_bezel;
+    /* style=td3 (Acid): light chassis, charcoal boxes, red buttons, pill engine button */
+    int td3;
+    uint32_t box, btn_bg, chrome_ink, go_on, go_off, tabs_bg;
 } ui_theme_t;
 
 static const ui_theme_t THEME_DEFAULT = {
@@ -729,6 +732,21 @@ static void fill_rrect_land(uint32_t *map, uint32_t stride_px, int32_t x, int32_
         int32_t inset = 0;
         if (j < r) { int32_t d = r - j; inset = r; while (inset > 0 && (r - inset) * (r - inset) + d * d > r * r) inset--; inset = r - inset; }
         else if (j >= h - r) { int32_t d = j - (h - r - 1); inset = r; while (inset > 0 && (r - inset) * (r - inset) + d * d > r * r) inset--; inset = r - inset; }
+        fill_rect_land(map, stride_px, x + inset, y + j, w - 2 * inset, 1, c);
+    }
+}
+/* Proper rounded rect (corner insets from the circle equation) for style=td3. */
+static void fill_rr_land(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y,
+                         int32_t w, int32_t h, int32_t r, uint32_t c) {
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    for (int32_t j = 0; j < h; j++) {
+        int32_t dy = j < r ? r - j - 1 : (j >= h - r ? j - (h - r) : -1);
+        int32_t inset = 0;
+        if (dy >= 0) {
+            while (inset < r && (r - inset - 1) * (r - inset - 1) + dy * dy >= r * r) inset++;
+            /* row is inside the circle from x offset `inset` */
+        }
         fill_rect_land(map, stride_px, x + inset, y + j, w - 2 * inset, 1, c);
     }
 }
@@ -885,6 +903,8 @@ typedef struct {
     /* list only: geometry + which list_stores[] slot holds its data */
     int list_id, cols, rows, tile_h, gap, jump, colmajor;
     float tscale;             /* list tile text scale */
+    int hidden;               /* knob: not drawn/hit-tested, still read back (env graph siblings) */
+    int env_mode;             /* env: 0 = none, 1 = JV (tkey/lkey patterns), 2 = DX7 (prefix + r1..4/l1..4) */
 } ui_widget_t;
 
 typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
@@ -1144,12 +1164,28 @@ static int add_bits(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *
 }
 /* Display-only DX7 envelope graph; param_key is the prefix shared by the
  * eight sibling knobs (e.g. "op1_eg_" -> op1_eg_r1..r4, op1_eg_l1..l4). */
-static int add_env(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *prefix) {
+/* JV-style envelope (tkey/lkey given): the eight sibling knobs have full
+ * keys built from a pattern containing "%d" (1..4), e.g.
+ * tkey=nvram_tone_0_penvtime%d lkey=nvram_tone_0_penvlevel%d. Stored in the
+ * otherwise-unused get_key/idx_key; imin/imax = level range, numbered = how
+ * many levels the envelope has (3 for TVA: its level 4 is always zero). */
+static int add_env(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *prefix,
+                   const char *tkey, const char *lkey, int lmin, int lmax, int nlev) {
     ui_widget_t *w = &page_widgets[n_page_widgets];
     memset(w, 0, sizeof(*w));
     w->kind = W_ENV; w->cx = cx; w->cy = cy; w->w = bw; w->h = bh;
     w->hit_hw = w->hit_hh = -1;
     strncpy(w->param_key, prefix, sizeof(w->param_key)-1);
+    if (tkey[0] && lkey[0]) {
+        strncpy(w->get_key, tkey, sizeof(w->get_key)-1);
+        strncpy(w->idx_key, lkey, sizeof(w->idx_key)-1);
+        w->imin = lmin; w->imax = lmax > lmin ? lmax : lmin + 1; w->numbered = nlev;
+        w->env_mode = 1;
+    } else {
+        w->imin = 0; w->imax = 99; w->numbered = 4;   /* DX7: rates/levels 0-99 */
+        w->env_mode = 2;
+    }
+    w->hit_hw = bw / 2; w->hit_hh = bh / 2;   /* interactive: drag the points */
     return n_page_widgets++;
 }
 static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title) {
@@ -1408,7 +1444,7 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             else if (strcmp(k, "engine_process_name") == 0) strncpy(parsed.engine_process_name, v, sizeof(parsed.engine_process_name) - 1);
             else if (strcmp(k, "engine_nsmodule_path") == 0) strncpy(parsed.engine_nsmodule_path, v, sizeof(parsed.engine_nsmodule_path) - 1);
             else if (strcmp(k, "engine_dirname") == 0) strncpy(parsed.engine_dirname, v, sizeof(parsed.engine_dirname) - 1);
-            else if (strcmp(k, "style") == 0) parsed.theme.lcd = (strcmp(v, "lcd") == 0);
+            else if (strcmp(k, "style") == 0) { parsed.theme.lcd = (strcmp(v, "lcd") == 0); parsed.theme.td3 = (strcmp(v, "td3") == 0); }
             else if (strcmp(k, "frame_style") == 0) parsed.theme.plain_frames = (strcmp(v, "plain") == 0);
             else if (strcmp(k, "topbar_style") == 0) parsed.theme.dsp = (strcmp(v, "display") == 0);
             else if (strcmp(k, "int_values") == 0) parsed.int_values = atoi(v);
@@ -1437,6 +1473,12 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 else if (!strcmp(n, "knob_off"))    t->knob_off = c;
                 else if (!strcmp(n, "tab_on"))      t->tab_on_bg = c;
                 else if (!strcmp(n, "lcd"))         t->lcd_bg = c;
+                else if (!strcmp(n, "box"))         t->box = c;
+                else if (!strcmp(n, "btn_bg"))      t->btn_bg = c;
+                else if (!strcmp(n, "chrome_ink"))  t->chrome_ink = c;
+                else if (!strcmp(n, "go_on"))       t->go_on = c;
+                else if (!strcmp(n, "go_off"))      t->go_off = c;
+                else if (!strcmp(n, "tabs"))        t->tabs_bg = c;
                 else if (!strcmp(n, "display_bg"))    t->dsp_bg = c;
                 else if (!strcmp(n, "display_cell"))  t->dsp_cell = c;
                 else if (!strcmp(n, "display_ink"))   t->dsp_ink = c;
@@ -1468,10 +1510,14 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                       atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
                       shadow_page_kv_get(kv, nkv, "title"));
         } else if (strcmp(type, "knob") == 0) {
-            add_knob(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "r")), label, key,
+            int ki = add_knob(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "r")), label, key,
                      (float)atof(shadow_page_kv_get(kv, nkv, "min")),
                      (float)atof(shadow_page_kv_get(kv, nkv, "max")),
                      atoi(shadow_page_kv_get(kv, nkv, "pct")));
+            if (ki >= 0 && atoi(shadow_page_kv_get(kv, nkv, "hidden"))) {
+                page_widgets[ki].hidden = 1;
+                page_widgets[ki].hit_hw = page_widgets[ki].hit_hh = -1;
+            }
         } else if (strcmp(type, "toggle") == 0) {
             add_toggle(cx, cy, label, key, atoi(shadow_page_kv_get(kv, nkv, "on")));
         } else if (strcmp(type, "button") == 0) {
@@ -1511,8 +1557,12 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                     (float)atof(shadow_page_kv_get(kv, nkv, "scale")));
             if (lw < 0) { logline("shadow_page[%s]: more than %d lists -- extra ignored", path, MAX_LISTS); continue; }
         } else if (strcmp(type, "env") == 0) {
+            const char *nl_s = shadow_page_kv_get(kv, nkv, "nl");
             add_env(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
-                    atoi(shadow_page_kv_get(kv, nkv, "h")), shadow_page_kv_get(kv, nkv, "prefix"));
+                    atoi(shadow_page_kv_get(kv, nkv, "h")), shadow_page_kv_get(kv, nkv, "prefix"),
+                    shadow_page_kv_get(kv, nkv, "tkey"), shadow_page_kv_get(kv, nkv, "lkey"),
+                    atoi(shadow_page_kv_get(kv, nkv, "lmin")), atoi(shadow_page_kv_get(kv, nkv, "lmax")),
+                    nl_s[0] ? atoi(nl_s) : 4);
         } else if (strcmp(type, "enum_h") == 0 || strcmp(type, "enum_v") == 0) {
             char optbuf[128];
             strncpy(optbuf, shadow_page_kv_get(kv, nkv, "options"), sizeof(optbuf) - 1);
@@ -1591,6 +1641,13 @@ static void discover_data_driven_addons(void) {
 }
 
 static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t *f) {
+    if (th.td3) {
+        fill_rr_land(map, stride_px, f->x, f->y, f->w, f->h, 10, PLATE_LINE);
+        fill_rr_land(map, stride_px, f->x + 2, f->y + 2, f->w - 4, f->h - 4, 9, th.box);
+        draw_text_land(map, stride_px, f->x + 20, f->y + 14, f->title, 1.5f, UI_ACCENT);
+        fill_rect_land(map, stride_px, f->x + 18, f->y + 38, f->w - 36, 1, th.ink_faint);
+        return;
+    }
     if (th.lcd) {
         /* Panel with an inset fill and accent corner brackets + a square
          * bullet before the title -- the DX7-editor "engraved panel" look. */
@@ -1715,7 +1772,7 @@ static const ui_widget_t *render_ctx_widgets;
 static int render_ctx_n;
 static float widget_real(const ui_widget_t *w) { return w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f); }
 static float sibling_value(const char *prefix, const char *suffix) {
-    char k[24];
+    char k[96];
     snprintf(k, sizeof(k), "%s%s", prefix, suffix);
     for (int i = 0; i < render_ctx_n; i++)
         if (render_ctx_widgets[i].kind == W_KNOB && !strcmp(render_ctx_widgets[i].param_key, k))
@@ -1723,8 +1780,86 @@ static float sibling_value(const char *prefix, const char *suffix) {
     return 0.0f;
 }
 
+static const ui_widget_t *find_knob(const ui_widget_t *arr, int n, const char *key) {
+    for (int i = 0; i < n; i++)
+        if (arr[i].kind == W_KNOB && !strcmp(arr[i].param_key, key)) return &arr[i];
+    return NULL;
+}
+/* Replaces the first "%d" in pattern with n (no printf on conf-supplied text). */
+static void env_key(char *out, size_t cap, const char *pattern, int n) {
+    const char *p = strstr(pattern, "%d");
+    if (!p) { snprintf(out, cap, "%s", pattern); return; }
+    snprintf(out, cap, "%.*s%d%s", (int)(p - pattern), pattern, n, p + 2);
+}
+/* Envelope key for segment i (0..3): time (JV) / rate (DX7) and level. */
+static void env_seg_keys(const ui_widget_t *w, int i, char *kt, char *kl, size_t cap) {
+    if (w->env_mode == 2) {
+        snprintf(kt, cap, "%sr%d", w->param_key, i + 1);
+        snprintf(kl, cap, "%sl%d", w->param_key, i + 1);
+    } else {
+        env_key(kt, cap, w->get_key, i + 1);
+        env_key(kl, cap, w->idx_key, i + 1);
+    }
+}
+/* Envelope graph geometry, shared by the renderer and the touch handler.
+ * Fixed time scale (a full-length envelope exactly fills the graph) so a
+ * dragged point never rescales the others. Points: 0 start, 1..3 = L1..L3,
+ * 4 = end of the sustain hold, 5 = release end (L4). Draggable: 1,2,3,5.
+ * JV: time 0-127 (larger = longer), segment = 6 + t/2, hold 40.
+ * DX7: rate 0-99 (larger = faster), segment = 8 + (99 - r), hold 60. */
+static float env_max_units(const ui_widget_t *w) { return w->env_mode == 2 ? 488.0f : 318.0f; }
+static float env_unit(const ui_widget_t *w) { return (float)(w->w - 24) / env_max_units(w); }
+static float env_seg_dur(const ui_widget_t *w, float t) { return w->env_mode == 2 ? 8.0f + (99.0f - t) : 6.0f + t * 0.5f; }
+static float env_dur_to_t(const ui_widget_t *w, float dur) {
+    float t = w->env_mode == 2 ? 99.0f - (dur - 8.0f) : (dur - 6.0f) * 2.0f;
+    float hi = w->env_mode == 2 ? 99.0f : 127.0f;
+    return t < 0 ? 0 : (t > hi ? hi : t);
+}
+static void env_geom(const ui_widget_t *w, const ui_widget_t *arr, int n, int32_t px[6], int32_t py[6]) {
+    int32_t x0 = w->cx - w->w/2 + 12, y0 = w->cy - w->h/2 + 12, ph = w->h - 24;
+    float span = (float)(w->imax - w->imin), t[4], nlv[4];
+    for (int i = 0; i < 4; i++) {
+        char kt[96], kl[96];
+        env_seg_keys(w, i, kt, kl, sizeof(kt));
+        const ui_widget_t *kt_w = find_knob(arr, n, kt), *kl_w = (i < w->numbered) ? find_knob(arr, n, kl) : NULL;
+        t[i] = kt_w ? widget_real(kt_w) : 0.0f;
+        float lv = kl_w ? widget_real(kl_w) : 0.0f;
+        nlv[i] = (lv - (float)w->imin) * 99.0f / span;
+        if (nlv[i] < 0) nlv[i] = 0; if (nlv[i] > 99) nlv[i] = 99;
+    }
+    float z = w->env_mode == 2 ? nlv[3] : (0 - (float)w->imin) * 99.0f / span;   /* DX7 starts at L4 */
+    if (z < 0) z = 0; if (z > 99) z = 99;
+    float lvj[6] = { z, nlv[0], nlv[1], nlv[2], nlv[2], nlv[3] };
+    float hold = w->env_mode == 2 ? 60.0f : 40.0f;
+    float dtj[6] = { 0, env_seg_dur(w, t[0]), env_seg_dur(w, t[1]), env_seg_dur(w, t[2]), hold, env_seg_dur(w, t[3]) };
+    float u = env_unit(w), acc = 0;
+    for (int i = 0; i < 6; i++) {
+        acc += dtj[i] * u;
+        px[i] = x0 + (int32_t)acc;
+        py[i] = y0 + ph - (int32_t)(ph * lvj[i] / 99.0f);
+    }
+}
+static const int env_pts[4] = { 1, 2, 3, 5 };
+/* Which draggable point (0..3 = segment) is nearest to (lx,ly), or -1. */
+static int env_pick(const ui_widget_t *w, const ui_widget_t *arr, int n, int32_t lx, int32_t ly) {
+    int32_t px[6], py[6];
+    env_geom(w, arr, n, px, py);
+    int best = -1; int32_t bd = 48 * 48;
+    for (int s = 0; s < 4; s++) {
+        int32_t dx = lx - px[env_pts[s]], dy = ly - py[env_pts[s]], d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = s; }
+    }
+    return best;
+}
+/* Dragging state: read by the renderer (highlight + value readout) and the
+ * readback worker (skips knob updates so the engine's old values don't
+ * fight the drag). Touched only under touch_mu. */
+static int env_drag_active = 0, env_drag_seg = -1, env_drag_t = 0, env_drag_l = 0;
+static int32_t env_drag_wcx = 0, env_drag_wcy = 0;
+
 static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *w) {
     char valbuf[24];
+    if (w->hidden) return;
     switch (w->kind) {
     case W_LIST: {
         list_store_t *st = &list_stores[w->list_id];
@@ -1834,27 +1969,26 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         fill_rect_land(map, stride_px, x0 + w->w - 1, y0, 1, w->h, PLATE_LINE);
         for (int g = 1; g < 4; g++)
             fill_rect_land(map, stride_px, x0 + 6, y0 + g * w->h / 4, w->w - 12, 1, PLATE_LINE);
-        float r[4], l[4];
-        static const char *rs[4] = {"r1","r2","r3","r4"}, *ls[4] = {"l1","l2","l3","l4"};
-        for (int i = 0; i < 4; i++) { r[i] = sibling_value(w->param_key, rs[i]); l[i] = sibling_value(w->param_key, ls[i]); }
-        /* DX7 EG: starts at L4, rises to L1, L2, L3 (rates R1..R3), holds
-         * while the key is down, then falls to L4 at R4. Segment time is
-         * inversely related to rate. */
-        float t[5] = {0, 8 + (99 - r[0]), 8 + (99 - r[1]), 8 + (99 - r[2]), 0};
-        float sustain = 60, rel = 8 + (99 - r[3]);
-        float total = t[1] + t[2] + t[3] + sustain + rel;
-        int32_t pw = w->w - 24, ph = w->h - 24;
-        int32_t px[6], py[6];
-        float acc = 0;
-        float lv[6] = { l[3], l[0], l[1], l[2], l[2], l[3] };
-        float dt[6] = { 0, t[1], t[2], t[3], sustain, rel };
-        for (int i = 0; i < 6; i++) {
-            acc += dt[i];
-            px[i] = x0 + 12 + (int32_t)(pw * acc / total);
-            py[i] = y0 + 12 + ph - (int32_t)(ph * lv[i] / 99.0f);
+        if (w->env_mode) {
+            int32_t pxj[6], pyj[6];
+            env_geom(w, render_ctx_widgets, render_ctx_n, pxj, pyj);
+            int dragging = env_drag_active && env_drag_wcx == w->cx && env_drag_wcy == w->cy;
+            for (int i = 0; i < 5; i++) draw_line_land(map, stride_px, pxj[i], pyj[i], pxj[i+1], pyj[i+1], 3, UI_ACCENT);
+            for (int i = 0; i < 6; i++) {
+                int s = -1; for (int k = 0; k < 4; k++) if (env_pts[k] == i) s = k;
+                if (s < 0) { fill_circle_land(map, stride_px, pxj[i], pyj[i], 3, UI_INK_FAINT); continue; }
+                int hot = dragging && env_drag_seg == s;
+                if (hot) fill_circle_land(map, stride_px, pxj[i], pyj[i], 15, UI_ACCENT);
+                fill_circle_land(map, stride_px, pxj[i], pyj[i], hot ? 9 : 8, UI_ACCENT_HI);
+                fill_circle_land(map, stride_px, pxj[i], pyj[i], 3, th.lcd_bg);
+            }
+            if (dragging) {
+                char eb[40];
+                snprintf(eb, sizeof(eb), "%c%d %d  L%d %d", w->env_mode == 2 ? 'R' : 'T', env_drag_seg + 1, env_drag_t, env_drag_seg + 1, env_drag_l);
+                draw_text_land(map, stride_px, x0 + 10, y0 + 8, eb, 1.5f, UI_ACCENT_HI);
+            }
+            break;
         }
-        for (int i = 0; i < 5; i++) draw_line_land(map, stride_px, px[i], py[i], px[i+1], py[i+1], 3, UI_ACCENT);
-        for (int i = 0; i < 6; i++) fill_circle_land(map, stride_px, px[i], py[i], 5, UI_ACCENT_HI);
         break;
     }
     case W_KNOB: {
@@ -1911,6 +2045,13 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
     }
     case W_BUTTON: {
         int32_t bw = text_width_land(w->label, 1.5f) + 36, bh = 39;
+        if (th.td3) {
+            bw += 24; bh = 48;
+            fill_rr_land(map, stride_px, w->cx - bw/2 - 2, w->cy - bh/2 - 2, bw + 4, bh + 4, 10, PLATE_LINE);
+            fill_rr_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, 8, th.btn_bg);
+            draw_text_land_c(map, stride_px, w->cx, w->cy - 7, w->label, 1.5f, BTN_TEXT);
+            break;
+        }
         fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, UI_ACCENT);
         draw_text_land_c(map, stride_px, w->cx, w->cy - 5, w->label, 1.5f, BTN_TEXT);
         break;
@@ -1987,6 +2128,9 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         fill_rect_land(map, stride_px, 24, TOPBAR_H - 13, tw_px, 1, UI_ACCENT);
         draw_text_land(map, stride_px, 48, 24, title, 2.5f, UI_ACCENT_HI);
         fill_rect_land(map, stride_px, 0, TOPBAR_H - 2, LAND_W, 2, UI_ACCENT);
+    } else if (th.td3) {
+        snprintf(title, sizeof(title), "%s", ad->display_name);
+        draw_text_land(map, stride_px, 40, 20, title, 3, th.chrome_ink);
     } else {
         snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
         draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
@@ -2004,6 +2148,13 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
             dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE ON", 3, th.dsp_bezel, 0xFF1C2612u, 0xFFCDEB63u);
         else
             dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE OFF", 3, th.dsp_cell, th.dsp_off, th.dsp_ink);
+      } else if (th.td3) {
+        /* black pill: lit dot + START (red) when stopped, RUNNING (green) when up */
+        uint32_t c = engine_on_snap ? th.go_on : th.go_off;
+        fill_rr_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, ENGINE_BTN_H/2, PLATE_LINE);
+        fill_circle_land(map, stride_px, ENGINE_BTN_X + 26, ENGINE_BTN_Y + ENGINE_BTN_H/2, 8, c);
+        draw_text_land_c(map, stride_px, ENGINE_BTN_X + ENGINE_BTN_W/2 + 14, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
+                          engine_on_snap ? "RUNNING" : "START", 2, c);
       } else {
         uint32_t bg = engine_on_snap ? UI_ACCENT : PLATE_LINE;
         uint32_t fg = engine_on_snap ? BTN_TEXT : UI_INK_FAINT;
@@ -2023,9 +2174,16 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
      * a worse trap than an honest gap. What you see here is exactly
      * what's touchable. */
     int32_t tabbar_y = LAND_H - TABBAR_H;
-    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
-    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, PLATE_LINE);
-    if (ad->num_tabs > 0) {
+    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, TABBAR_H, th.td3 ? th.tabs_bg : BAR_BG);
+    fill_rect_land(map, stride_px, 0, tabbar_y, LAND_W, 1, th.td3 ? th.box : PLATE_LINE);
+    if (th.td3 && ad->num_tabs > 0) {
+        int32_t tw = LAND_W / ad->num_tabs;
+        for (int i = 0; i < ad->num_tabs; i++) {
+            if (i == page) fill_rr_land(map, stride_px, i*tw + 10, tabbar_y + 10, tw - 20, TABBAR_H - 14, 8, th.tab_on_bg);
+            draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 4, ad->tab_names[i], 2,
+                              i == page ? UI_ACCENT : th.chrome_ink);
+        }
+    } else if (ad->num_tabs > 0) {
         int32_t tw = LAND_W / ad->num_tabs;
         for (int i = 0; i < ad->num_tabs; i++) {
             if (i == page) {
@@ -2270,6 +2428,7 @@ static void maybe_redraw_shadow(void) {
      * and touch threads, which could previously paint concurrently. */
     static uint32_t *back = NULL;
     static pthread_mutex_t paint_mu = PTHREAD_MUTEX_INITIALIZER;
+    struct timespec rt0, rt1; clock_gettime(CLOCK_MONOTONIC, &rt0);
     pthread_mutex_lock(&paint_mu);
     size_t fb_bytes = (size_t)shadow_stride_px * SHADOW_H * 4;
     if (!back) back = malloc(fb_bytes);
@@ -2278,6 +2437,16 @@ static void maybe_redraw_shadow(void) {
                         frames_snap, n_frames_snap, page_snap, addon_snap, engine_on);
     if (back) memcpy(shadow_map, back, fb_bytes);
     pthread_mutex_unlock(&paint_mu);
+    clock_gettime(CLOCK_MONOTONIC, &rt1);
+    {
+        static time_t render_last_log = 0; static long render_max_ms = 0;
+        long ms = (rt1.tv_sec - rt0.tv_sec) * 1000L + (rt1.tv_nsec - rt0.tv_nsec) / 1000000L;
+        if (ms > render_max_ms) render_max_ms = ms;
+        if (rt1.tv_sec != render_last_log) {
+            if (render_max_ms > 25) logline("perf: shadow redraw took %ld ms (max this second)", render_max_ms);
+            render_max_ms = 0; render_last_log = rt1.tv_sec;
+        }
+    }
 
     /* Screen-capture diagnostic (2026-09-19): there's no way to see this
      * device's real screen remotely otherwise, which made a live-only bug
@@ -2798,6 +2967,40 @@ static int32_t drag_start_py = 0;
 static int drag_start_value = 0;
 static int touch_down_prev = 0;
 
+/* Applies a touch position to envelope segment `seg` of env widget `w`:
+ * time from x (relative to the previous point, fixed scale), level from y.
+ * Updates the sibling knob states (display) and records the exact SETs. */
+static int env_last_n = 0;
+static char env_last_key[2][96], env_last_val[2][16];
+static void env_apply_touch(ui_widget_t *w, int32_t lx, int32_t ly, int seg) {
+    int32_t px[6], py[6];
+    env_geom(w, page_widgets, n_page_widgets, px, py);
+    int prev = env_pts[seg] - 1;
+    float dur = (float)(lx - px[prev]) / env_unit(w);
+    int tv = (int)(env_dur_to_t(w, dur) + 0.5f);
+    int32_t y0 = w->cy - w->h/2 + 12, ph = w->h - 24;
+    float frac = 1.0f - (float)(ly - y0) / (float)ph;
+    int lv = w->imin + (int)(frac * (float)(w->imax - w->imin) + (frac >= 0 ? 0.5f : -0.5f));
+    if (lv < w->imin) lv = w->imin; if (lv > w->imax) lv = w->imax;
+    env_last_n = 0;
+    char kt[96], kl[96];
+    env_seg_keys(w, seg, kt, kl, sizeof(kt));
+    for (int i = 0; i < n_page_widgets; i++) {
+        ui_widget_t *k = &page_widgets[i];
+        if (k->kind != W_KNOB) continue;
+        float span = k->pmax - k->pmin; if (span <= 0) continue;
+        if (!strcmp(k->param_key, kt)) {
+            k->state = (int)(((float)tv - k->pmin) * 100.0f / span + 0.5f);
+            snprintf(env_last_key[env_last_n], 96, "%s", kt); snprintf(env_last_val[env_last_n], 16, "%d", tv); env_last_n++;
+        } else if (seg < w->numbered && !strcmp(k->param_key, kl)) {
+            k->state = (int)(((float)lv - k->pmin) * 100.0f / span + 0.5f);
+            snprintf(env_last_key[env_last_n], 96, "%s", kl); snprintf(env_last_val[env_last_n], 16, "%d", lv); env_last_n++;
+        }
+        if (k->state < 0) k->state = 0; if (k->state > 100) k->state = 100;
+    }
+    env_drag_t = tv; env_drag_l = (seg < w->numbered) ? lv : 0;
+}
+
 /* Point-in-box hit-test against every widget on the current page;
  * returns the first (only) match, or -1. Widgets never overlap in this
  * project's own layouts, so "first match" is unambiguous. */
@@ -2812,6 +3015,19 @@ static int hit_test_widget(int32_t lpx, int32_t lpy) {
 }
 
 static void update_touch_state(const struct input_event *ev) {
+    /* Diagnostics: how far behind the finger the touch thread is running.
+     * Logs (at most once a second) only when an event was handled >40ms after
+     * the kernel stamped it. */
+    {
+        static long lag_max_ms = 0; static time_t lag_last_log = 0;
+        struct timeval nowtv; gettimeofday(&nowtv, NULL);
+        long age = (nowtv.tv_sec - ev->time.tv_sec) * 1000L + (nowtv.tv_usec - ev->time.tv_usec) / 1000L;
+        if (age > lag_max_ms) lag_max_ms = age;
+        if (lag_max_ms > 40 && nowtv.tv_sec != lag_last_log) {
+            logline("perf: touch event handled %ld ms after kernel timestamp (max this second)", lag_max_ms);
+            lag_max_ms = 0; lag_last_log = nowtv.tv_sec;
+        } else if (nowtv.tv_sec != lag_last_log && lag_max_ms <= 40) { lag_max_ms = 0; }
+    }
     /* Set below while touch_mu is held, acted on (send_ctrl_set, a
      * blocking-ish socket call) only after it's released -- never do
      * potentially-slow I/O while holding a lock the commit thread also
@@ -2820,6 +3036,8 @@ static void update_touch_state(const struct input_event *ev) {
      * release), so one slot is enough. */
     int send_idx = -1, send_force = 0;
     ui_widget_t send_snapshot = {0};
+    int env_send_n = 0, env_send_force = 0;
+    char env_send_key[2][96], env_send_val[2][16];
     /* Same deferred-dispatch principle for the top-bar engine button --
      * separate from send_idx/send_snapshot above since it's not a
      * page_widgets[] entry and goes to a different function entirely. */
@@ -2883,6 +3101,19 @@ static void update_touch_state(const struct input_event *ev) {
                     active_widget = i;
                     drag_start_py = lpy;
                     drag_start_value = w->state;
+                    break;
+                case W_ENV:
+                    if (w->env_mode) {
+                        int sgm = env_pick(w, page_widgets, n_page_widgets, lpx, lpy);
+                        if (sgm >= 0) {
+                            active_widget = i; env_drag_active = 1; env_drag_seg = sgm;
+                            env_drag_wcx = w->cx; env_drag_wcy = w->cy;
+                            env_apply_touch(w, lpx, lpy, env_drag_seg);
+                            shadow_redraw_needed = 1;
+                            env_send_n = env_last_n; memcpy(env_send_key, env_last_key, sizeof(env_send_key));
+                            memcpy(env_send_val, env_last_val, sizeof(env_send_val)); env_send_force = 0;
+                        }
+                    }
                     break;
                 case W_TOGGLE:
                     w->state = !w->state;
@@ -2960,8 +3191,6 @@ static void update_touch_state(const struct input_event *ev) {
                         shadow_redraw_needed = 1;
                     }
                     break;
-                case W_ENV:
-                    break;
                 case W_ENUM_H:
                 case W_ENUM_V:
                     for (int j = 0; j < w->n_options; j++) {
@@ -2982,6 +3211,12 @@ static void update_touch_state(const struct input_event *ev) {
         touch_to_landscape(touch_x, touch_y, &lpx, &lpy);
         (void)lpx;
         ui_widget_t *w = &page_widgets[active_widget];
+        if (w->kind == W_ENV) {
+            env_apply_touch(w, lpx, lpy, env_drag_seg);
+            shadow_redraw_needed = 1;
+            env_send_n = env_last_n; memcpy(env_send_key, env_last_key, sizeof(env_send_key));
+            memcpy(env_send_val, env_last_val, sizeof(env_send_val)); env_send_force = 0;
+        } else {
         int32_t dy_dragged = drag_start_py - lpy; /* positive = moved up */
         int new_val = drag_start_value + (int)((dy_dragged * 100) / KNOB_DRAG_RANGE_PX);
         if (new_val < 0) new_val = 0;
@@ -2991,15 +3226,23 @@ static void update_touch_state(const struct input_event *ev) {
             shadow_redraw_needed = 1;
             send_idx = active_widget; send_force = 0; send_snapshot = *w;
         }
+        }
     } else if (!touch_down && touch_down_prev && active_widget >= 0) {
         /* Just released, mid-drag: send the final value unconditionally,
          * bypassing the throttle -- otherwise a release landing inside
          * the throttle window would leave the real DSP param on a value
          * older than what the screen (and the user) last saw. */
-        send_idx = active_widget; send_force = 1; send_snapshot = page_widgets[active_widget];
+        if (page_widgets[active_widget].kind == W_ENV) {
+            env_send_n = env_last_n; memcpy(env_send_key, env_last_key, sizeof(env_send_key));
+            memcpy(env_send_val, env_last_val, sizeof(env_send_val)); env_send_force = 1;
+            env_drag_active = 0; shadow_redraw_needed = 1;
+        } else {
+            send_idx = active_widget; send_force = 1; send_snapshot = page_widgets[active_widget];
+        }
         active_widget = -1;
     } else if (!touch_down) {
         active_widget = -1;
+        if (env_drag_active) { env_drag_active = 0; shadow_redraw_needed = 1; }
     }
     touch_down_prev = touch_down;
 
@@ -3007,6 +3250,9 @@ static void update_touch_state(const struct input_event *ev) {
 
     if (send_idx >= 0) {
         send_widget_param(&send_snapshot, send_force);
+    }
+    if (env_send_n > 0 && (env_send_force || ctrl_send_throttle_ok())) {
+        for (int k = 0; k < env_send_n; k++) send_ctrl_set(env_send_key[k], env_send_val[k]);
     }
     if (engine_toggle_addon >= 0) {
         send_engine_toggle(engine_toggle_addon, engine_toggle_want);
@@ -3180,7 +3426,7 @@ static void refresh_page_from_engine(int full) {
     if (active_addon == addon && page_epoch == epoch && n_page_widgets == n) {
         for (int i = 0; i < n; i++) {
             ui_widget_t *w = &page_widgets[i];
-            if (!res[i].valid || i == active_widget) continue;
+            if (!res[i].valid || i == active_widget || env_drag_active) continue;
             switch (w->kind) {
             case W_KNOB: {
                 float span = w->pmax - w->pmin;
@@ -3300,6 +3546,20 @@ static void *touch_thread_fn(void *arg) {
                 ssize_t r = read(fd, &ev, sizeof(ev));
                 if (r == (ssize_t)sizeof(ev)) {
                     update_touch_state(&ev);
+                    /* Perf (2026-09-20): a finger sample is 2-3 input events and
+                     * a full repaint costs ~30-40ms on the Force's CPU, so
+                     * repainting after every single event fell seconds behind
+                     * the finger during a drag (live log: "touch event handled
+                     * 3600 ms after kernel timestamp"). Drain everything
+                     * already queued first, then repaint once for the batch. */
+                    for (int drained = 0; drained < 512; drained++) {
+                        struct pollfd pf2 = { .fd = fd, .events = POLLIN };
+                        if (poll(&pf2, 1, 0) <= 0 || !(pf2.revents & POLLIN)) break;
+                        struct input_event ev2;
+                        if (read(fd, &ev2, sizeof(ev2)) != (ssize_t)sizeof(ev2)) break;
+                        update_touch_state(&ev2);
+                        nevents++;
+                    }
                     /* Live load test #10 found the redraw gated inside
                      * maybe_substitute_fb() never actually painted the
                      * buffer's new content when MPC generated zero
