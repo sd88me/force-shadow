@@ -1,84 +1,239 @@
-# force-shadow
+# Force Shadow
 
-A real on-device "shadow mode" GUI for MockbaMod addons on the Akai
-Force — a button combo takes over the physical touchscreen with an
-addon's own custom-rendered controls, a second press returns to MPC's own
-UI. The [Ableton Move / Schwung](https://github.com/sd88me/schwung-acid)
-equivalent has an official shadow-display API from Ableton; the Force has
-none, so this is original R&D against the Force's actual DRM/KMS display
-stack, not a port of anything.
+**Custom on-screen control surfaces for background add-ons on the Akai Force.**
 
-**Status: working end-to-end on real hardware.** A second process's own
-rendered buffer is substituted onto the Force's real physical screen on
-command (`KNOBS+SCENE-1`..`7`), the touchscreen taken over at the same
-moment, and both cleanly revert to MPC's own UI on a second press. The
-one page actually built today — [`force-maze`](https://github.com/sd88me/force-maze)'s
-Maze Voice, a 3-page control surface covering its full parameter set
-(knobs, toggles, buttons, enum selectors) — drives the real, running DSP
-through `maze_host`'s own control socket, confirmed live: every widget on
-every page audibly/functionally responds. See [DESIGN.md](DESIGN.md) for
-the full research writeup, live-test history, and incident log; the
-`addon/` directory is a real installable MockbaMod addon, not just a test
-harness. A second, much larger page is live too: [`force-dx7`](https://github.com/sd88me/force-dx7)'s
-8-tab DX7 GUI (GLOBAL, OP1-OP6, BANKS) with its own colour theme and LCD
-widget style, a live bank/patch top bar, a paged bank grid with an A-Z jump
-strip, and state read back from the engine. Building a page for another
-addon (JV-880, ...)? Start with [docs/adding-a-page.md](docs/adding-a-page.md).
+Force Shadow lets a companion add-on take over the Force's own physical
+screen and touchscreen — on demand, with a button press — to show its own
+purpose-built control page (knobs, toggles, envelope graphs, patch/bank
+lists, and more), then hand the display back to MPC exactly as it was.
+It is the shared visualisation/control layer this whole family of add-ons
+is built on top of; it makes no sound and sequences nothing by itself.
 
-## Current state / what's next
+**Status: v1.0 — stable release**, running on real Force hardware. This
+document is the install/usage manual. For internals, extension points,
+and the technical design, see [DESIGN.md](DESIGN.md).
 
-- Pages live on hardware: Maze Voice (3 tabs), DX7 (8 tabs) and JV-880 (7 tabs), all
-  data-driven `shadow_page.conf` files shipped by their own addons.
-- Widgets worth knowing: `list` (paged names + A-Z jump), top-bar `readout`/`stepper`, and `env`
-  -- an envelope graph you can **drag** (DX7 mode: `prefix=` + sibling knobs `r1..4/l1..4`;
-  JV mode: `tkey=`/`lkey=` patterns with `%d`). The graph reads and updates its sibling knobs,
-  so knobs and graph stay in sync. Optional look switches: `frame_style=plain`,
-  `topbar_style=display` (dot-matrix LCD top bar).
-- Touch input is drained per batch before repainting (a full repaint is ~30-40 ms on the Force);
-  `perf:` lines in `/tmp/force_shadow.log` flag slow redraws / a lagging touch thread.
-- Open ideas (see DESIGN.md "Not yet done"): "any other button also
-  reverts", left-aligned/uneven text polish, per-widget value conventions
-  beyond `int_values` (e.g. DX7's L/R/L+R `mix.channel` needs literal text
-  and isn't on the DX7 page).
-- Text can only use baked scales (1, 1.5, 2, 2.5, 3) for crisp glyphs --
-  regenerate `src/font_hi.h` with `tools/gen_font_hi.py` to add one.
-- Live-testing rules (verify `force_shadow.so` really is in MPC's
-  `LD_PRELOAD` after every restart; upload libs via `.new` + `mv`) are in
-  DESIGN.md, live load test #26 and earlier incident write-ups.
+---
 
-## Layout
+## Table of contents
+
+- [What is Shadow Mode?](#what-is-shadow-mode)
+- [Features](#features)
+- [Control pages included in this release](#control-pages-included-in-this-release)
+- [Part of a bigger family](#part-of-a-bigger-family)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Using Force Shadow](#using-force-shadow)
+- [Uninstalling](#uninstalling)
+- [Building from source](#building-from-source)
+- [Diagnostic tools](#diagnostic-tools)
+- [Troubleshooting](#troubleshooting)
+- [Building a page for your own add-on](#building-a-page-for-your-own-add-on)
+- [Project layout](#project-layout)
+- [Credits & related projects](#credits--related-projects)
+
+---
+
+## What is Shadow Mode?
+
+The Force's own application (MPC) draws directly to the display hardware
+itself — there's no window manager or compositor sitting in between, and
+no supported way for a second app to put anything on screen at the same
+time. That's a real problem for any add-on that runs its own background
+sound or sequencing engine *outside* MPC: it can have a web-based control
+panel, or answer to blind MIDI CC numbers, but it can't have a real,
+native-feeling touchscreen GUI on the Force's own display — until now.
+
+**Shadow Mode is a way to temporarily "step in front of" MPC's own screen
+output for one add-on at a time.** Press a button combo, and Force Shadow
+swaps in that add-on's own rendered control page and takes over the
+touchscreen so your taps and drags go to its knobs and buttons instead of
+MPC's own UI. Everything you touch is applied live, in real time, to the
+actual running engine — turn a knob and you hear the sound change
+immediately. Press the same combo again (or almost any of the Force's own
+mode buttons) and both the screen and the touchscreen revert to normal
+MPC operation instantly, exactly as if nothing had happened.
+
+Nothing about MPC itself is modified to make this work. Force Shadow is a
+small library that loads alongside MPC and — only while a shadow page is
+open — substitutes its own picture for the screen and grabs the
+touchscreen. The moment Shadow Mode is off, MPC owns the display and
+touch input completely, and behaves as if Force Shadow weren't installed
+at all.
+
+## Features
+
+- **Real touchscreen control for background engines.** Knobs, on/off
+  toggles, momentary buttons, multi-option selectors, draggable envelope
+  graphs, and paged bank/patch browsers with an A-Z jump strip and page
+  arrows — all driven live against the add-on's own running engine, with
+  on-screen values reading back what the engine is actually doing (so a
+  knob updates itself correctly after you load a different patch, for
+  example).
+- **Multi-tab pages.** Each add-on's control surface can span several
+  tabs (Maze Voice ships 3, JV-880 ships 7 — DX7's page is a single,
+  intentionally minimal tab for now, see below), navigated with a
+  bottom tab bar.
+- **One button to open, the same button to close.** No separate "start
+  the engine" and "show its screen" combos to remember — see
+  [Using Force Shadow](#using-force-shadow) below.
+- **On-screen engine On/Off button.** Each add-on's page has its own
+  status button in the top bar that starts or stops its background
+  engine process directly — no extra hardware combo needed for that.
+- **Quick exit from almost any button.** Pressing most of the Force's own
+  mode buttons (MENU, LOAD, SAVE, MATRIX, CLIP, MIXER, NAVIGATE) while a
+  shadow page is open backs straight out to normal MPC operation, not
+  just the one combo that opened it.
+- **Data-driven pages.** Every add-on ships its own small `shadow_page.conf`
+  text file describing its own layout. Force Shadow discovers and loads
+  these automatically — adding, tweaking, or re-theming an add-on's page
+  never requires rebuilding or redeploying Force Shadow itself.
+- **Per-add-on visual themes.** Colour palette and widget style (flat
+  panel, engraved LCD look, or a TB-303-style chassis) are set per page,
+  so each add-on can look like its own instrument rather than a generic
+  shared skin.
+- **Fails safe, always.** If anything about the setup can't be confirmed
+  safe (a resource fails to allocate, a config file is malformed, a
+  property can't be resolved), Shadow Mode simply doesn't activate for
+  that page — MPC's own display and behaviour are completely unaffected,
+  and always start "off" after every boot until you explicitly invoke it.
+- **No extra runtime dependencies on the Force.** The whole interposer
+  links against exactly `libc`/`libpthread`/`libdl` — nothing else to
+  install on-device.
+
+## Control pages included in this release
+
+| Add-on | Tabs | What it controls |
+|---|---|---|
+| **Maze Voice** | 3 | Full parameter set of the Labyrinth-inspired synth voice: oscillators/EG, wavefolder/filter, mod/random/output mix |
+| **DX7 (Dexed) emulator** | minimal today | Output level, algorithm, feedback, transpose — proves the page format; a full multi-operator page is planned |
+| **JV-880 emulator** | 7 | Play/patch controls, four tone pages, and a paged bank/patch browser with a dot-matrix-style top bar |
+
+All three pages ship inside their own add-on's install (as a
+`shadow_page.conf` file), not inside Force Shadow itself — Force Shadow
+only provides the engine that reads and renders them.
+
+## Part of a bigger family
+
+Force Shadow is a **prerequisite, not a destination** — it has no sound
+engine of its own. It exists to give the following add-ons (shipping
+alongside or after it) a proper on-screen control surface:
+
+- **Maze Voice** — a Moog Labyrinth-inspired synth voice *(page shipped in this release)*
+- **Maze Sequencer** — a companion step sequencer for the Maze voice engine *(coming soon)*
+- **ACID Sequencer** — a TB-303-style bassline sequencer *(coming soon)*
+- **JV-880 emulator** *(page shipped in this release)*
+- **DX7 / Dexed emulator** *(minimal page shipped in this release; full page planned)*
+
+Install Force Shadow first, then install whichever of the above add-ons
+you want — each one brings its own control page along with it.
+
+## Requirements
+
+- An Akai Force running **MockbaMod** (the custom firmware add-on
+  framework) — Force Shadow is installed as a MockbaMod add-on.
+- **MidiLoop** installed and configured (used for the hardware button
+  combo that opens/closes shadow pages).
+- SSH access to the device for installation.
+- No other software to install on the Force itself.
+
+## Installation
+
+1. **Copy the add-on onto the device**, replacing any previous copy:
+   ```
+   ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceShadow'
+   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceShadow
+   ```
+2. **Enable it:**
+   ```
+   ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh ENABLE'
+   ```
+   This arms Force Shadow to load at boot. It always starts **inactive**
+   (pass-through only) — nothing changes on screen until you explicitly
+   open a shadow page.
+3. **Bind the hardware button combo** (one-time step — this is kept
+   separate from step 2 because it edits MidiLoop's own shared config
+   file, so it's deliberately not automatic):
+   ```
+   ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/bind_midiloop.sh'
+   ```
+   This is safe to re-run at any time: it backs up both files it touches
+   first, never overwrites a button combo that's already bound to
+   something else, validates the result with MidiLoop's own config
+   checker before reloading, and is a clean no-op if everything is
+   already bound correctly.
+4. **Restart the Force** (or `systemctl restart acvs`) so the new
+   add-on is picked up.
+
+That's it — Force Shadow is now installed and armed. Nothing is visible
+or different in normal use until you open a shadow page (see below).
+
+> If Shadow Mode doesn't respond the very first time after a fresh power
+> cycle, see [Troubleshooting](#troubleshooting) — a quick retry almost
+> always resolves it.
+
+## Using Force Shadow
+
+**Opening a page:** press and hold the button combo for the add-on you
+want (e.g. **SHIFT + SCENE-3** or **KNOBS + SCENE-3** for Maze Voice —
+either combo works and does the same thing). Hold the modifier down,
+tap the SCENE pad, then release both — pressing and releasing
+simultaneously doesn't register, they need to be a proper hold-then-tap.
+
+**Closing a page:** press the same combo again, or press almost any of
+the Force's own mode buttons (MENU, LOAD, SAVE, MATRIX, CLIP, MIXER,
+NAVIGATE) — any of these immediately returns you to normal MPC
+operation.
+
+**Navigating tabs:** tap a tab name along the bottom bar of a multi-tab
+page.
+
+**Turning the add-on's engine on or off:** tap the status button in the
+top-right corner of its page (reads ENGINE ON / ENGINE OFF, or a
+lit/unlit dot depending on the page's visual style). This starts or
+stops that add-on's background process directly — no separate combo
+needed.
+
+**Controlling a parameter:** drag a knob up/down to change its value,
+tap a toggle or enum segment to flip it, tap and drag an envelope
+graph's control points, or tap a bank/patch tile (with the A-Z strip
+and page arrows for longer lists). Every change is sent to the running
+engine immediately; on-screen values also read back from the engine
+periodically, so switching tabs or loading a different patch keeps
+everything in sync.
+
+**Manual override (for testing without the hardware combo):** SSH in
+and run
+```
+ssh root@<force-ip> 'touch /tmp/force_shadow_on'
+```
+to force the Maze Voice page open, and `rm /tmp/force_shadow_on` to
+close it again. This bypasses MidiLoop entirely and always works even
+if the button binding step above hasn't been run yet.
+
+## Uninstalling
 
 ```
-DESIGN.md          full research writeup — read this first
-docs/
-  adding-a-page.md  practical guide: how to build another addon's shadow
-                     page (widget API, DSP wiring, layout constants,
-                     offline-first testing workflow)
-src/
-  force_shadow.c    the LD_PRELOAD interposer: DRM/KMS buffer substitution,
-                     touch takeover, the 3-page widget renderer, DSP wiring
-  font8x8.h          9x9 alpha bitmap font (legacy fallback for unbaked text scales)
-  font_hi.h          hinted glyph tables at text scales 1/1.5/2/2.5/3 --
-                      GENERATED by tools/gen_font_hi.py, used for all text
-addon/              real installable MockbaMod addon — see "Deploy / enable"
-tools/
-  atomic_probe.c    cross-compiled diagnostic: ptrace-catches MPC's next
-                    DRM_IOCTL_MODE_ATOMIC call and dumps its live contents
-                    (objs/props/values) synchronously, avoiding the race
-                    of reading /proc/<pid>/mem well after the fact
-  getfb.c           plain read-only DRM_IOCTL_MODE_GETFB query, for
-                    cross-checking a live FB_ID's actual buffer format
-  gen_font_hi.py   bakes src/font_hi.h from DejaVu Sans Mono Bold (Pillow, run
-                    in a python:3.11-slim container -- see its docstring)
-  render_preview.c  host-side (native, no cross-compile) preview tool —
-                    shares force_shadow.c's own drawing primitives, writes
-                    a PPM so a new page's layout can be checked visually
-                    offline before ever touching the device
+ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh DISABLE'
 ```
+cleanly reverts the boot-time library load, no reboot required to take
+effect on the next MPC restart. To remove the add-on entirely:
+```
+ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh UNINSTALL'
+ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceShadow'
+```
+The MidiLoop button bindings made by `bind_midiloop.sh` are left in
+place (they're harmless with the add-on removed — they simply won't do
+anything) unless you restore your own backed-up copy of
+`midiloop.config`/`USER-SCRIPTS.sh` (both are backed up, timestamped,
+under the same directory, every time `bind_midiloop.sh` runs).
 
-## Build
+## Building from source
 
-```bash
+Cross-compiled for the Force's armhf target via Docker + QEMU — no
+toolchain needs installing locally beyond Docker itself.
+
+```
 docker run --rm --platform linux/arm/v7 \
   -v "$PWD/src":/build -w /build \
   arm32v7/debian:stretch bash -c '
@@ -90,91 +245,133 @@ EOF
     gcc -O2 -Wall -Wextra -fPIC -shared -o force_shadow.so force_shadow.c -ldl -lpthread && strip force_shadow.so
   '
 ```
+Writes `src/force_shadow.so` — copy it into `addon/force_shadow.so`
+before deploying. Dependency profile is exactly
+`libc`/`libpthread`/`libdl` (verify with `readelf -d force_shadow.so`).
 
-Writes `src/force_shadow.so` — copy it into `addon/force_shadow.so` before
-deploying (see below). Dependency profile stays exactly `libc`/`libpthread`/
-`libdl` — confirmed after every change that's touched this file.
-
-Exit helper (`src/exit_watch.c` -> `addon/force_shadow_exitwatch`), built the
-same way in an armv7 Debian bookworm container with `libasound2-dev`
-installed: `gcc -O2 -Wall -o addon/force_shadow_exitwatch src/exit_watch.c -lasound && strip addon/force_shadow_exitwatch`.
-
-## Deploy / enable
-
-```bash
-ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceShadow'   # see note below
-scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceShadow
-ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh ENABLE'
+The small exit-watch helper (`src/exit_watch.c` →
+`addon/force_shadow_exitwatch`, the process that makes the Force's own
+mode buttons back out of Shadow Mode) is built the same way, in an
+armv7 Debian **bookworm** container with `libasound2-dev` installed:
+```
+gcc -O2 -Wall -o addon/force_shadow_exitwatch src/exit_watch.c -lasound && strip addon/force_shadow_exitwatch
 ```
 
-`scp -r addon dest` copies `addon` itself as a subdirectory of `dest` if
-`dest` already exists (`dest/addon/...`) rather than merging its contents
-into `dest` — the `rm -rf` first avoids that (safe to skip only when
-deploying to a path that doesn't exist yet).
+> Debian **stretch**'s own package mirrors have gone end-of-life; the
+> `sources.list` rewrite above (pointing at `archive.debian.org` with
+> `-o Acquire::Check-Valid-Until=false`) is required for the build to
+> succeed at all.
 
-`manage.sh ENABLE` arms `force_shadow.so` at boot, always starting
-**inactive** (pass-through only) until shadow mode is explicitly turned
-on — confirmed safe across every live test in this project's history, the
-same principle `force-audioin`'s own "zero voices at boot" arming uses.
-`manage.sh DISABLE`/`UNINSTALL` cleanly revert, both live-confirmed.
-
-**One more one-time step** to get the real hardware toggle
-(`KNOBS+SCENE-1..7`) working, since it needs to patch MidiLoop's own
-shared config — deliberately *not* automatic (see the script's own header
-for why):
-
-```bash
-ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/bind_midiloop.sh'
-```
-
-Idempotent and safe to re-run; backs up both files it touches first,
-refuses rather than guessing if any target slot is already bound to
-something else, and validates with MidiLoop's own config checker before
-reloading. Without this step the addon still works via the manual SSH
-override (`touch /tmp/force_shadow_on`) — useful for testing without
-touching MidiLoop's config at all.
-
-Logs: `/tmp/force_shadow.log`.
+**Never `scp` a new `force_shadow.so` directly over a loaded one** on a
+live device — upload to a `.new` filename and `mv` it into place, so a
+currently-running MPC process keeps its old mapping cleanly until the
+next restart instead of racing a partial overwrite.
 
 ## Diagnostic tools
 
-`atomic_probe`/`getfb` are built with the same Docker+QEMU armhf toolchain
-as above, pointed at `tools/` instead of `src/`:
+Two small read-only cross-compiled tools live in `tools/`, useful if you
+ever need to inspect the display pipeline directly (not needed for
+normal use):
+- **`atomic_probe`** — dumps the live contents of the next screen-update
+  call the Force's own app makes, for confirming plane/property IDs on
+  a given firmware build.
+- **`getfb`** — a plain, independent, read-only query of a framebuffer's
+  format/size, useful for cross-checking `atomic_probe`'s output.
 
-```bash
-docker run --rm --platform linux/arm/v7 \
-  -v "$PWD/tools":/build -w /build \
-  arm32v7/debian:stretch bash -c '
-    cat > /etc/apt/sources.list <<EOF
-deb http://archive.debian.org/debian stretch main
-deb http://archive.debian.org/debian-security stretch/updates main
-EOF
-    apt-get -o Acquire::Check-Valid-Until=false update -qq && apt-get install -y --no-install-recommends gcc libc6-dev
-    gcc -O2 -Wall -o atomic_probe atomic_probe.c && strip atomic_probe
-    gcc -O2 -Wall -o getfb getfb.c && strip getfb
-  '
+Both build with the same Docker+QEMU toolchain as above, pointed at
+`tools/` instead of `src/`. `atomic_probe` briefly slows the traced
+thread down while it runs (expect a short stutter); it's hard-capped to
+a few seconds and always cleans up after itself. `getfb` carries none
+of that risk.
+
+Runtime logs (helpful for any of the troubleshooting steps below) are
+written to **`/tmp/force_shadow.log`** on the device.
+
+## Troubleshooting
+
+**A shadow page doesn't open on the very first try after a fresh power
+cycle.** This is a known, occasional race in how the Force's own boot
+sequence loads add-on libraries — Force Shadow simply isn't loaded into
+that particular MPC process yet. Restart the app service once
+(`systemctl restart acvs`) and try again; this reliably resolves it. No
+further action needed once a page opens successfully.
+
+**The button combo doesn't seem to register.** The modifier (SHIFT or
+KNOBS) needs to be **pressed and held**, the SCENE pad **tapped while
+still held**, then both released — pressing them at exactly the same
+instant, or releasing the modifier first, won't register.
+
+**A little screen tearing during a drag.** A small amount of cosmetic
+tearing can appear while actively dragging a knob or envelope point —
+this is a known, low-priority visual artifact of how frames are
+composited and doesn't affect control accuracy or engine behaviour.
+
+**Shadow Mode won't turn off / the screen looks stuck.** The manual
+override always works as a fallback:
+```
+ssh root@<force-ip> 'rm -f /tmp/force_shadow_on /tmp/force_shadow_page'
+```
+If that doesn't clear it, `systemctl restart acvs` (or a full power
+cycle in the worst case) always returns the device to a clean state —
+nothing this add-on does has any persistent effect across a restart.
+
+**Nothing seems to be happening at all / want to check what's going
+on.** Tail the log:
+```
+ssh root@<force-ip> 'tail -f /tmp/force_shadow.log'
+```
+and check that `force_shadow.so` actually appears in the running MPC
+process's environment:
+```
+ssh root@<force-ip> 'tr "\0" "\n" < /proc/$(pidof MPC)/environ | grep force_shadow'
 ```
 
-(Debian stretch's own package repos went EOL after this toolchain was
-first set up — `deb.debian.org`/`security.debian.org` now 404 on
-`stretch`. The `sources.list` rewrite (both here and in the main build
-above) points at `archive.debian.org` instead, confirmed working
-2026-09-19.)
+## Building a page for your own add-on
 
-`atomic_probe` briefly slows the traced thread down (Python/C single-step
-overhead, not `strace`'s own optimized internals) — expect a short
-touch/audio stutter while it runs. It's hard-capped at a few seconds of
-wall-clock time and always detaches, even on error. `getfb` is a plain,
-independent read-only query and carries none of that risk.
+Force Shadow's control pages are entirely data-driven: an add-on ships
+a small `shadow_page.conf` text file (widgets, layout, colours, and the
+control-socket path to talk to) alongside its own install, and Force
+Shadow discovers and loads it automatically at boot — no changes to
+Force Shadow's own code are needed to add a new add-on's page. See
+**[docs/adding-a-page.md](docs/adding-a-page.md)** for the full guide
+(widget types, the config file format, wiring up a control socket, and
+an offline preview tool for checking a new layout before ever touching
+the device), and [DESIGN.md](DESIGN.md) for how the rendering/control
+pipeline works underneath.
 
-## Related
+## Project layout
 
-- [`force-audioin`](https://github.com/sd88me/force-audioin) — the audio
-  equivalent of this project (`LD_PRELOAD`-interposing `snd_pcm_readi`
-  instead of `drmModeAtomicCommit`), already shipped. Its own `DESIGN.md`
-  and incident history are the main precedent this project's risk section
-  draws from.
-- [`force-maze`](https://github.com/sd88me/force-maze),
-  [`force-acid`](https://github.com/sd88me/force-acid) — other addons in
-  this family, for the general project conventions (repo layout, build
-  toolchain, `manage.sh`/`NSMODULE.json` addon contract).
+```
+DESIGN.md            technical design & architecture reference
+docs/
+  adding-a-page.md    practical guide: building another add-on's shadow page
+src/
+  force_shadow.c      the interposer: display substitution, touch takeover,
+                       the widget renderer, and DSP control wiring
+  exit_watch.c         the "any other button also exits" helper process
+  font8x8.h / font_hi.h  bitmap fonts used for on-screen text
+addon/                the real installable MockbaMod add-on
+                       (manage.sh, run_ForceShadow.sh, bind_midiloop.sh)
+tools/                offline diagnostic and page-preview tools
+```
+
+## Credits & related projects
+
+Built by [sd88me](https://github.com/sd88me).
+
+- **[MockbaMod](https://github.com/MockbaTheBorg/MockbaMod)** by
+  [MockbaTheBorg](https://github.com/MockbaTheBorg) — the custom
+  firmware add-on framework for the Akai Force that Force Shadow is
+  built to run on top of, and a prerequisite for installing it (see
+  [Requirements](#requirements)).
+- **[force-audioin](https://github.com/sd88me/force-audioin)** — the
+  audio equivalent of this project, already shipped, and the design
+  precedent Force Shadow's own safety model builds on.
+- **[force-maze](https://github.com/sd88me/force-maze)** — Maze Voice,
+  the first control page shipped alongside this release.
+- **[force-acid](https://github.com/sd88me/force-acid)** — the ACID
+  Sequencer family of add-ons.
+
+## License
+
+[MIT](LICENSE) — see the [LICENSE](LICENSE) file in this repository.
