@@ -1,467 +1,413 @@
-# Adding a new shadow-mode control page
+# Adding a shadow-mode page for your own add-on
 
-Practical reference for building another addon's shadow-mode page (JV-880,
-Maze Sequencer, Acid Sequencer, Euclidier, Riffmaker — the slots already
-reserved in `KNOBS+SCENE-N`, currently all safe no-ops; DX7 has a minimal
-proof-of-concept page, Maze Voice has its full real one). `DESIGN.md` is
-the chronological research log (read it for *why* things work the way
-they do, and for the incident history behind every non-obvious constant);
-this doc is the distilled *how*.
+This is the practical, step-by-step guide to giving another add-on its
+own Force Shadow control page. [DESIGN.md](../DESIGN.md) explains *why*
+the rendering/control pipeline works the way it does; this doc is the
+*how*.
 
-**A page is a plain text file the addon ships itself, not C code you add
-here.** `force-maze/maze-voice/addon/shadow_page.conf` (the full, real,
-live-tested example — 3 tabs, every widget kind) and
-`force-dx7/addon/shadow_page.conf` (a minimal 4-knob one) are the two
-real references — read one of those alongside this doc, not instead of
-it. See "The page file format" below for the full spec. A compile-time
-C function is still supported for a layout that genuinely needs real
-code (a loop over a params array, say) — see "The two-layer page model"
-and "The widget system" below — but it's the exception now, not the
-default.
+**The most important thing to understand up front:** a page is a plain
+text file your own add-on ships (`shadow_page.conf`), not C code added
+to Force Shadow itself. Adding a new add-on's page never requires
+touching Force Shadow's own source — see
+[The two-layer page model](#the-two-layer-page-model) below for why.
 
-**Read this whole doc before writing anything.** The single biggest
-thing to understand up front is the next section.
+Two real, working examples ship in this family of add-ons and are worth
+reading alongside this guide:
+- `force-maze/maze-voice/addon/shadow_page.conf` — the full reference
+  example (3 tabs, every widget kind in use).
+- `force-dx7/addon/shadow_page.conf` — a minimal 4-knob example.
+
+---
+
+## Contents
+
+- [The two-layer page model](#the-two-layer-page-model)
+- [The page file format](#the-page-file-format)
+- [The widget system](#the-widget-system)
+- [Finding your add-on's own parameters and control protocol](#finding-your-add-ons-own-parameters-and-control-protocol)
+- [The hardware combo](#the-hardware-combo)
+- [Engine on/off button](#engine-onoff-button)
+- [Layout constants](#layout-constants)
+- [Test offline first, then stage on the device](#test-offline-first-then-stage-on-the-device)
+- [Checklist](#checklist)
+
+---
 
 ## The two-layer page model
 
-There are **two independent numbering schemes** in play, and they are
-not the same thing:
+There are two independent, easy-to-conflate numbering schemes:
 
-1. **Which addon's overlay to show** — `active_addon`, resolved by
-   `poll_toggle()` (`src/force_shadow.c`, ~line 1214) from the number
-   MidiLoop's `KNOBS+SCENE-N` combos write to `/tmp/force_shadow_page`
-   (`SHADOW_PAGE_FILE`), validated against `addon_table[]` (see below).
-2. **Which internal tab is showing, within whichever addon is active** —
-   `current_page`, switched by tapping the on-screen tab bar
-   (`update_touch_state()`, ~line 1503) and rendered via
-   `addon_table[active_addon].tab_names[]`.
+- **Which add-on's page is showing** (`active_addon`) — resolved from
+  the slot number (`1`–`7`) that a `SHIFT+SCENE-N` combo writes to a
+  small state file, validated against a compile-time registry,
+  `addon_table[]`.
+- **Which tab is showing within that add-on's page** (`current_page`)
+  — switched by tapping the on-screen tab bar, and rendered from that
+  add-on's own `tab_names[]`.
 
-**Generalized (2026-09-19, live load test #20)** — this used to be
-single-addon (`poll_toggle()` only recognized one hardcoded page number,
-`current_page`/`PAGE_NAMES[]`/`send_maze_set()`/`MAZE_CTRL_SOCK` were all
-Maze-Voice-specific), which is what made this doc's original version of
-this section a warning rather than a description. Now there's a real
-registry:
+`addon_table[]` is a fixed-size array of slots, each describing one
+add-on:
 
 ```c
-#define ADDON_NONE       0
-#define ADDON_DX7        1
-#define ADDON_JV880      2
-#define ADDON_MAZE_VOICE 3
-#define ADDON_MAZE_SEQ   4
-#define ADDON_ACID_SEQ   5
-#define ADDON_EUCLIDIER  6
-#define ADDON_RIFFMAKER  7
-
 typedef struct {
-    char ctrl_sock[64];        /* this addon's own control-socket path */
-    char display_name[24];     /* shown in the top bar, e.g. "MAZE VOICE" */
-    int num_tabs;
+    char ctrl_sock[64];         /* this add-on's own control-socket path */
+    char display_name[24];      /* shown in the top bar, e.g. "MAZE VOICE" */
+    int  num_tabs;
     char tab_names[MAX_TABS][24];
-    void (*build_tab)(int tab); /* NULL = not implemented yet, safe no-op */
+    void (*build_tab)(int tab); /* NULL = not implemented, safe no-op */
 
-    /* Engine on/off button, see its own section below.
-     * engine_process_name[0]==0 = no button drawn for this addon. */
+    /* Engine on/off button — see "Engine on/off button" below.
+     * engine_process_name[0] == 0 means no button is drawn at all. */
     char engine_process_name[32];
     char engine_nsmodule_path[160];
     char engine_dirname[32];
     char engine_arguments_json[768];
 } addon_descriptor_t;
-
-/* Empty at compile time (2026-09-19, live load test #22 -- Maze Voice,
- * this table's only occupant until then, has since been ported to its
- * own shadow_page.conf). discover_data_driven_addons() fills in any
- * slot still at its zero-initialized default from a real file on disk
- * -- see "The page file format" below. A hand-tuned compile-time entry
- * here would still always win over a same-numbered file, for a layout
- * that genuinely needs real code -- fixed-size char arrays, not
- * `const char *`, since a data-driven entry's strings come from a
- * parsed file, not a string literal with the whole process's lifetime. */
-static addon_descriptor_t addon_table[NUM_ADDON_SLOTS];
 ```
 
-**Adding a new addon page is purely additive** — ship its own
-`shadow_page.conf` (see below), or, for the rarer case a layout needs
-real code, one new `addon_table[]` initializer entry plus a
-`build_<addon>_tab()` function. Either way you do *not* need to touch
-`poll_toggle()`, `render_shadow_page()`, or the DSP send path
-(`send_ctrl_set()`) — all three already dispatch generically over
-`addon_table[active_addon]`. A slot with no entry (`NULL build_tab`, the
-default for a zeroed array element) stays a safe, silent no-op, exactly
-like every reserved-but-unbuilt slot today.
+At startup, every slot still at its zero-initialized default is filled
+in automatically from a real `shadow_page.conf` file found on disk (see
+below). A hand-written, compile-time entry — for the rare layout that
+genuinely needs real code (a loop over a params array, say) — always
+takes priority over a same-numbered file.
+
+**Adding a new add-on's page is purely additive.** You never need to
+modify page-dispatch, rendering, or the DSP send path — all three
+already work generically over `addon_table[active_addon]`. A slot with
+no entry stays a safe, silent no-op.
 
 ## The page file format
 
-A `shadow_page.conf` file, dropped in that addon's own AddOns folder
-(next to its `NSMODULE.json`) and discovered automatically at startup
-(`discover_data_driven_addons()`, `src/force_shadow.c`) — no ForceShadow
-rebuild or redeploy needed for a new page, only for the rendering engine
-itself. Deliberately a small custom line-oriented format, not JSON: this
-project already hand-rolls everything it touches (the DRM structs, the
-bitmap font, the trig tables) rather than reach for a library, and a
-real JSON parser (nested objects/arrays, string escaping) is a lot of
-new surface area for a benefit — interop with other JSON tooling —
-nothing on this device actually needs.
+Drop a `shadow_page.conf` file in your add-on's own install folder
+(next to its `NSMODULE.json`). Force Shadow discovers and loads it
+automatically at boot — no Force Shadow rebuild or redeploy needed for
+a new page, only for changes to the rendering engine itself. It's a
+small, deliberately custom line-oriented format, not JSON — this project
+hand-rolls everything it touches (DRM structs, bitmap fonts, trig
+tables) rather than reach for a library, and a real JSON parser is a lot
+of new surface area for a benefit (interop with other JSON tooling)
+nothing on-device actually needs.
 
 ```
-# comments and blank lines ignored
-page=<1-7, must match a KNOBS+SCENE-N/SHIFT+SCENE-N slot>
+# comments and blank lines are ignored
+page=<1-7, must match a SHIFT+SCENE-N slot>
 ctrl_sock=<path>
 display_name=<shown in the top bar; quote it if it has a space>
-engine_process_name=<PROCESSNAME -- omit the whole engine_* block for no button>
-engine_nsmodule_path=<absolute path to that addon's own NSMODULE.json>
+
+# omit this whole block entirely for "no engine on/off button"
+engine_process_name=<PROCESSNAME>
+engine_nsmodule_path=<absolute path to this add-on's own NSMODULE.json>
 engine_dirname=<DIRNAME>
 engine_arguments_json=<that NSMODULE.json's ARGUMENTS array, verbatim, one line>
 
 [tab <name>]
-frame x=<n> y=<n> w=<n> h=<n> title="<text>"
-knob cx=<n> cy=<n> r=<n> label="<text>" key=<name> min=<f> max=<f> pct=<0-100>
-toggle cx=<n> cy=<n> label="<text>" key=<name> on=<0|1>
-button cx=<n> cy=<n> label="<text>" key=<name>
-enum_h cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
-enum_v cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
+frame   x=<n> y=<n> w=<n> h=<n> title="<text>"
+knob    cx=<n> cy=<n> r=<n> label="<text>" key=<name> min=<f> max=<f> pct=<0-100>
+toggle  cx=<n> cy=<n> label="<text>" key=<name> on=<0|1>
+button  cx=<n> cy=<n> label="<text>" key=<name> [val=<text>]
+enum_h  cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index> [sw=<segment px>]
+enum_v  cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
 ```
 
-Optional top-level keys (added with the DX7 page): `style=lcd` (dotted-arc
-dark knobs, bracketed frames, LCD nameplate), `frame_style=plain` (no corner brackets/bullets on frames), `topbar_style=display` with
-`theme_display_bg|cell|ink|off|bezel` (dot-matrix LCD top bar; see the JV-880 page),
-`int_values=1` (host uses
-`atoi()`: knobs send a rounded integer, toggles `1`/`0`, enums their
-option *index*), and `theme_<name>=RRGGBB` (no `#`) for `bg panel line ink
-ink_dim ink_faint accent accent_hi knob_face knob_ring bar seg_active
-seg_inactive seg_active_tx btn_text well knob_off tab_on lcd`; unset keys
-keep Maze Voice's palette. More widgets (up to 8 tabs, 64 widgets each; widget keys up to 47 chars;
-enums up to 6 options, optional `sw=<segment px>`):
+Repeat `[tab ...]` for each tab, in display order. Values containing a
+space (labels, titles, options lists, a multi-word `display_name`) take
+double quotes; everything else is a bare token.
+
+### Optional top-level keys
+
+| Key | Effect |
+|---|---|
+| `style=lcd` | Dark, dotted-arc knobs with bracketed frames and an LCD-style nameplate. |
+| `frame_style=plain` | Omits corner brackets/title bullet on frames. |
+| `topbar_style=display` | Dot-matrix LCD-style top bar (see the JV-880 page). Pairs with `theme_display_bg/cell/ink/off/bezel`. |
+| `int_values=1` | Host expects integers, not floats/on-off: knobs send a rounded integer, toggles `1`/`0`, enums their option *index*. |
+| `theme_<name>=RRGGBB` (no `#`) | Per-colour override. Names: `bg panel line ink ink_dim ink_faint accent accent_hi knob_face knob_ring bar seg_active seg_inactive seg_active_tx btn_text well knob_off tab_on lcd`. Unset keys keep Maze Voice's default palette. |
+
+Limits: up to 8 tabs, 64 widgets per tab, widget keys up to 47
+characters, enums up to 6 options.
+
+### Additional widgets
 
 ```
-readout cx=<n> cy=<n> w=<n> h=<n> label="<text>" get=<key>
-stepper cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<text key> idx=<index key> count=<count key> min=<n> max=<n> numbered=<0|1>
-env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>   # DX7 EG graph from sibling knobs <prefix>r1..r4,l1..l4
-env     cx=<n> cy=<n> w=<n> h=<n> prefix=<id> tkey=<pattern%d> lkey=<pattern%d> lmin=<n> lmax=<n> nl=<3|4>   # JV-style EG (time 0-127, levels lmin..lmax)
-```
+readout cx=<n> cy=<n> w=<n> h=<n> label="<text>" get=<key> [goto=<tab index> clean=1]
+stepper cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<text key> idx=<index key> count=<count key> min=<n> max=<n> [numbered=<0|1>]
 
-```
+# DX7-style EG graph, driven from sibling knobs <prefix>r1..r4, l1..l4
+env     cx=<n> cy=<n> w=<n> h=<n> prefix=<e.g. op1_eg_>
+
+# JV-style EG graph (time 0-127, levels lmin..lmax)
+env     cx=<n> cy=<n> w=<n> h=<n> prefix=<id> tkey=<pattern%d> lkey=<pattern%d> lmin=<n> lmax=<n> nl=<3|4>
+
 bits    cx=<n> cy=<n> w=<n> h=<n> label="<text>" key=<SET key> get=<state key>
-```
 
-`bits` is a row of 8 tappable step LEDs (Maze Sequencer). `get` is a
-`<length>|b,b,...|<play>` reply (e.g. maze_seq's `s1_state`); a tap SETs `key`
-to the step index; the play head is polled every 200ms. `button` also takes an
-optional `val=<text>`: the value SET on press instead of the default `go`
-(e.g. an advance button with `val=1`).
-
-```
 list    x=<n> y=<n> w=<n> h=<n> key=<SET key> items=<GET key -> JSON [{label|name}]> sel=<GET key for current index>
-        cols=<n> rows=<n> th=<tile px> gap=<n> jump=<0|1 A-Z row> colmajor=<0|1> numbered=<0|1> scale=<text scale>
+        cols=<n> rows=<n> th=<tile px> gap=<n> jump=<0|1, A-Z row> colmajor=<0|1> numbered=<0|1> scale=<text scale>
 ```
 
-`list` is a paged grid of engine-provided names (banks, patches): tap a tile
-to SET `key` to its index, A-Z row jumps pages, pager bar appears only when
-there's more than one page (page count follows the item count). Also
-`readout ... goto=<tab index> clean=1`: tapping the readout opens that tab;
-`clean=1` strips `.syx` and turns `_`/`-` into spaces. Text is drawn from
-hinted glyph tables baked by `tools/gen_font_hi.py` at scales 1, 1.5, 2, 2.5
-and 3 -- add a scale there before using a new one.
+- **`readout`** is display-only by default; `goto=<tab index>` makes
+  tapping it jump to another tab; `clean=1` strips `.syx` and turns
+  `_`/`-` into spaces (handy for filenames used as patch names).
+- **`stepper`** is a `< text >`-style index control; its text, index,
+  and count are all read back from the engine.
+- **`env`** widgets are interactive: drag one of the handles (L1, L2,
+  L3, release end) — x sets that segment's rate/time, y its level. The
+  sibling knobs it reads/writes must be on the same tab (add
+  `hidden=1` to a knob line to keep it synced but not drawn, if you
+  don't want it visible directly). The graph uses a fixed time scale so
+  a drag never rescales the other points. While dragging, the readback
+  worker doesn't overwrite knob values; the value is throttled during
+  the drag and sent unconditionally on release. `tkey`/`lkey` patterns
+  must resolve to at most 47 characters.
+- **`bits`** is a row of 8 tappable step LEDs (used by Maze Sequencer).
+  `get` expects a `<length>|b,b,...|<play head>` reply; a tap `SET`s
+  `key` to the step index; the play head is polled every 200 ms.
+- **`button`**'s optional `val=` sets what's sent on press instead of
+  the default `go` (e.g. an "advance" button with `val=1`).
+- **`list`** is a paged grid of engine-provided names (banks, patches):
+  tapping a tile `SET`s `key` to its index; the optional A-Z row jumps
+  pages; the pager bar only appears when there's more than one page.
 
-`readout`/`stepper` text, stepper index/count, and every knob/toggle/enum
-value are read back from the engine (`GET <key>`) by a worker thread on
-tab entry, after a stepper tap, and every ~1.5s.
+Text is drawn from hinted glyph tables at scales `1, 1.5, 2, 2.5, 3` —
+adding a new scale requires regenerating those tables
+(`tools/gen_font_hi.py`) before using it.
 
-Repeat `[tab ...]` for each tab, in the order they should appear. Values
-with a space (labels, titles, options lists, a multi-word
-`display_name`) take double quotes; everything else is a bare token.
-`engine_arguments_json`'s own value is the one exception that must
-**not** be quoted the normal way — it's raw JSON, full of its own
-embedded quotes, and is parsed as a special-cased "rest of the line" —
-just paste the `NSMODULE.json` `ARGUMENTS` array in as one line, quotes
-and all.
+Readout/stepper text, stepper index/count, and every knob/toggle/enum
+value are read back from the engine (`GET <key>`) by a background
+worker on tab entry, after a stepper tap, and roughly every 1.5 seconds.
 
-**Getting the numbers right**: hand-deriving pixel positions is
-error-prone once a layout has more than a couple of widgets. When
-porting an existing compile-time page (as Maze Voice's own conversion
-did), the reliable way is a temporary debug dump — call the real
-`build_<addon>_tab()` for each tab and log every `page_widgets[]`/
-`page_frames[]` entry's own fields in this file's own syntax, so the
-`.conf` file is transcribed from the layout code's actual computed
-output, not re-derived by hand (see `DESIGN.md`'s "Live load test #22"
-for exactly how that dump was done and removed again afterward). For a
-brand new page, `tools/render_preview.c` (see "Test offline first"
-below) serves the same "see the real numbers before trusting them" role.
+### `engine_arguments_json` is a special case
 
-## The hardware combo: SHIFT+SCENE-N opens the page (2026-09-19)
+Unlike every other value, `engine_arguments_json` is **not** quoted the
+normal way — it's raw JSON, full of its own embedded quotes, and is
+parsed as "the rest of the line." Paste your `NSMODULE.json`'s
+`ARGUMENTS` array in as one line, quotes and all.
 
-Changed from Maze Voice's own original convention (`SHIFT+SCENE-N`
-started/stopped the engine, `KNOBS+SCENE-N` showed the page — two combos
-to remember) to just **`SHIFT+SCENE-N` opens the page**, full stop. The
-page itself now carries the engine on/off control (see below), matching
-how this project's own web GUIs present a live status/control affordance
-rather than requiring a separate hardware combo.
+### Getting pixel positions right
 
-For a new addon, this means rebinding its own `SHIFT+SCENE-N` line in
-`midiloop.config` from whatever engine-toggle script it currently points
-to (e.g. Maze Voice's own `SCRIPT-16`), to the `SCRIPT-N` that
-`bind_midiloop.sh` already bound for its page (`SCRIPT-19`..`25` on this
-device, one per `KNOBS+SCENE-N` slot — see that script's own output for
-the exact numbers it picked). **This is editing an already-bound
-combo**, not an empty slot — `bind_midiloop.sh`'s own safety checks don't
-cover this case (it only ever touches `"-"` slots). Do it by hand,
-carefully: back up `midiloop.config` first (timestamped, matching the
-convention every other script here uses), change only that one line,
-`diff` against the backup to confirm nothing else moved, validate with
-`midiloop test`, then reload (`killall midiloop && <mmPath>/AddOns/
-run_midiloop.sh`). The old script (`SCRIPT-16` for Maze Voice) doesn't
-need deleting — it just becomes unbound, still callable by ID if ever
-needed again.
-
-The now-redundant `KNOBS+SCENE-N` binding (still pointing at the same
-page-toggle script) is harmless and was left in place rather than
-reclaimed — both combos open the same page.
-
-## Engine on/off: a top-bar button, not a combo (2026-09-19)
-
-`render_shadow_page()` draws a real button in the top-right of the top
-bar (`ENGINE_BTN_X/Y/W/H`) whenever `addon_table[active_addon]
-.engine_process_name[0]` is set — dim/grey (`PLATE_LINE` background,
-`UI_INK_FAINT` text) when the engine's off, lit (`UI_ACCENT` background,
-`UI_INK` text) when it's on. `update_touch_state()` hit-tests it
-alongside (not as part of) the tab bar and generic widget system, since
-it must stay tappable across every tab, not just whichever one's
-`page_widgets[]` happens to be built right now.
-
-**How it actually starts/stops the process — read this before assuming
-you can just `fork()`/`exec()` your own addon's binary:** `force_shadow.c`
-runs *inside MPC's own process* (`LD_PRELOAD`'d in). Spawning a child
-process from inside a library injected into a real-time, multi-threaded
-audio host is a real, unnecessary risk on a platform this project has
-already found fragile in less exotic ways (`acvs`-restart-kills-pads,
-same-boot-restart fatigue, `SCHED_FIFO` starving unrelated threads — see
-`DESIGN.md`). Instead, `send_engine_toggle()` (`src/force_shadow.c`,
-~line 1543) fires a plain HTTP POST to **nodeServer's own
-`/moduler/UPDATE` endpoint** (`127.0.0.1:8080`, confirmed live and by
-reading nodeServer's own `app/api/endpoints/moduler/index.js`) — the
-exact same generic addon start/stop mechanism the on-device Modules web
-page itself uses (`child_process.spawn`/`execSync("killall ...")`,
-running in nodeServer's own already-separate, already-proven process).
-Our side is just another bounded plain-socket call, the same risk class
-as `send_ctrl_set()`.
-
-The POST body must echo back that addon's own `NSMODULE.json` fields
-**verbatim** — `CONFIGFILE`, `PROCESSNAME`, `DIRNAME`, and the full
-`ARGUMENTS` array as literal JSON (moduler's own handler overwrites the
-file with whatever `ARGUMENTS` you send, so anything paraphrased or
-stale corrupts it) — plus `RUNNING: true`/`false`. Live load test #21
-found this JSON payload is bigger than it looks: Maze Voice's own six
-`{NAME,VALUE}` argument pairs come to ~350 bytes alone, and an
-undersized buffer (originally 512 bytes) truncated it and **failed
-completely silently** — the button still flipped visually (that's a
-local optimistic update, not proof the request went anywhere), but
-nothing was ever sent and there was no error to find in the log, because
-the buffer-overflow guard didn't log either. Fixed by sizing generously
-(1024/1536 bytes) and by making every early-return in
-`send_engine_toggle()` log why — a new addon with a longer `ARGUMENTS`
-list should check this doesn't recur, not assume the current size is
-infinite headroom.
-
-`engine_on` (the button's rendered state) is refreshed at
-`poll_toggle()`'s own ~2/sec cadence via `is_process_running()` — a
-plain `/proc` scan for a process whose `comm` matches
-`engine_process_name` exactly, the same identity `killall`/`pidof`
-already match on. Not checked on every redraw (a knob drag can trigger
-50-100 redraws/sec; an unbounded directory scan has no business running
-that often) — a button tap optimistically flips `engine_on` immediately
-for instant visual feedback, and the next poll cycle self-corrects if
-the guess didn't match reality.
+Hand-deriving positions is error-prone once a layout has more than a
+couple of widgets. For a brand-new page, use
+[`tools/render_preview.c`](#test-offline-first-then-stage-on-the-device)
+to see the real rendered result before trusting any numbers — it's
+much faster and safer than iterating on the device.
 
 ## The widget system
 
 Every visible, touchable thing is one `ui_widget_t` entry in a flat
-table (`page_widgets[]`, `src/force_shadow.c` ~line 585), built once per
-page/tab (not recomputed per redraw) via a `build_tab()`-style function
-(one per addon, registered in `addon_table[]`), and read by both the
-renderer and the touch hit-tester — so layout math exists in exactly one
-place and can never drift out of sync with what's actually tappable.
-
-Five widget kinds, one builder function each (~line 628):
+table (`page_widgets[]`), built once per page/tab — not recomputed on
+every redraw — and read by both the renderer and the touch hit-tester,
+so layout math exists in exactly one place and can never drift out of
+sync with what's actually tappable.
 
 ```c
-int add_knob(int32_t cx, int32_t cy, int32_t r, const char *label,
-             const char *key, float pmin, float pmax, int initial_pct);
-int add_toggle(int32_t cx, int32_t cy, const char *label,
-               const char *key, int initial_on);
-int add_button(int32_t cx, int32_t cy, const char *label, const char *key);
-int add_enum(int32_t cx, int32_t cy, widget_kind_t kind /* W_ENUM_H or W_ENUM_V */,
-             const char *label, const char *key,
-             const char **opts, int n, int active);
+int  add_knob(int32_t cx, int32_t cy, int32_t r, const char *label,
+              const char *key, float pmin, float pmax, int initial_pct);
+int  add_toggle(int32_t cx, int32_t cy, const char *label,
+                 const char *key, int initial_on);
+int  add_button(int32_t cx, int32_t cy, const char *label, const char *key);
+int  add_enum(int32_t cx, int32_t cy, widget_kind_t kind /* W_ENUM_H or W_ENUM_V */,
+              const char *label, const char *key,
+              const char **opts, int n, int active);
 void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title);
 ```
 
-- `cx, cy` are always the widget's *center*, in landscape pixel space
-  (`LAND_W=1280 x LAND_H=800` — see "Layout constants" below).
-- `key` is the parameter's control-socket key (`""` for a display-only
-  widget with no DSP binding). `add_button`'s key is what gets sent as
-  the value when pressed (see `send_widget_param()`'s `W_BUTTON` case —
-  it always sends the literal string `"go"`, so `key` here is actually
-  the *parameter name* being triggered, matching Maze Voice's
-  `rnd_go` convention — check your target addon's own `module.json`/host
-  source for whether momentary actions follow the same pattern).
-- `add_knob`'s `initial_pct` is `0`-`100` regardless of the real
+- `cx`, `cy` are always the widget's *centre*, in landscape pixel space
+  (`LAND_W=1280` × `LAND_H=800` — see [Layout constants](#layout-constants)).
+- `key` is the parameter's control-socket key (empty string for a
+  display-only widget with no DSP binding).
+- `add_button`'s value on press is always the literal string `"go"`
+  unless overridden with `val=` in the `.conf` file — so `key` here is
+  really the *parameter name* being triggered (matching Maze Voice's
+  `rnd_go` convention). Check your target add-on's own
+  `module.json`/host source for its own convention before assuming it
+  matches.
+- `add_knob`'s `initial_pct` is always 0–100 regardless of the real
   parameter's range; the real value is computed at send-time from
-  `pmin`/`pmax` (see `send_widget_param()`'s `W_KNOB` case). Get
-  `pmin`/`pmax` from the target addon's own `module.json`
-  `ui_hierarchy`/`chain_params` `min`/`max` fields, not by guessing.
+  `pmin`/`pmax`. Get these from your add-on's own `module.json`
+  (`ui_hierarchy`/`chain_params` `min`/`max` fields) — don't guess.
 - `add_enum`'s `opts` are the *literal strings* sent over the control
-  socket on selection (`send_widget_param()` sends `w->options[w->state]`
-  verbatim) — these must match the target addon's own accepted enum
+  socket on selection, and must match your add-on's own accepted enum
   values exactly (e.g. Maze Voice's `route` key accepts exactly
-  `"VCW>VCF"`/`"Parallel"`/`"VCF>VCW"`, read directly from
-  `maze_host.cpp`, not paraphrased).
+  `"VCW>VCF"` / `"Parallel"` / `"VCF>VCW"` — read directly from its host
+  source, don't paraphrase).
 
-These are exactly the fields a `.conf` file's own `knob`/`toggle`/
-`button`/`enum_h`/`enum_v` lines map onto (`parse_shadow_page_conf()`
-calls these same functions, one per widget line) — write your addon's
-page as a `.conf` file (see "The page file format" above) and you're
-using this same builder API already, just without touching C at all. A
-`build_tab()`-style C function calling these directly is only needed for
-the rarer case a layout genuinely can't be expressed as a flat list of
-widgets (a loop over a params array, computed per-row positions, etc.) —
-`generic_data_driven_build_tab()` (`src/force_shadow.c`) is the generic
-one every `.conf`-driven addon actually uses; write your own only if you
-need one.
+A `.conf` file's `knob`/`toggle`/`button`/`enum_h`/`enum_v` lines map
+directly onto these same builder functions — writing a page as a
+`.conf` file uses this exact API already, without touching C at all. A
+hand-written `build_tab()`-style function is only needed for the rarer
+case where a layout genuinely can't be expressed as a flat list of
+widgets (e.g. a loop over a params array with computed per-row
+positions).
 
-## Finding the target addon's own parameters and control protocol
+## Finding your add-on's own parameters and control protocol
 
-Every addon in this family (`force-maze`, `force-dx7`, `force-jv880`,
-confirmed by reading their actual source, not assumed) follows the same
-two-piece convention:
+Every add-on in this family follows the same two-piece convention —
+confirm both by reading the actual source, not by inferring from a
+summary or CC map that might be stale:
 
-1. **`module.json`**'s `capabilities.ui_hierarchy` (or `chain_params` in
-   older addons) — the authoritative list of every parameter's `key`,
-   `label`, `type`, `min`/`max`, and (for enums) accepted option
-   strings. This is what `pmin`/`pmax`/`opts` above should come from —
-   read it directly, don't infer from a CC map or summary doc that might
-   be stale.
-2. **`<name>_host.cpp`**'s `handle_ctrl_line()` (or equivalent) — the
-   real control-socket protocol. **Read this file before assuming the
-   protocol matches Maze Voice's exactly.** Maze Voice's own
-   `chain_params` use `"on"`/`"off"` for boolean enums, but its
-   *host-level* `mix.enabled` control expects `"1"`/`"0"` instead — a
-   real inconsistency found only by reading `maze_host.cpp` directly
-   (see `send_widget_param()`'s `W_TOGGLE` case, and its comment). Do
-   not assume the value convention is uniform even *within* one addon,
-   let alone assume it's the same across different addons.
+- **`module.json`**'s `capabilities.ui_hierarchy` (or `chain_params` in
+  older add-ons) is the authoritative list of every parameter's key,
+  label, type, min/max, and (for enums) accepted option strings. This
+  is what `pmin`/`pmax`/`opts` should come from.
+- **`<name>_host.cpp`**'s `handle_ctrl_line()` (or equivalent) is the
+  real control-socket protocol. **Read this before assuming the
+  protocol matches another add-on's exactly.** For example, Maze
+  Voice's own `chain_params` use `"on"`/`"off"` for boolean enums, but
+  its host-level `mix.enabled` control expects `"1"`/`"0"` instead —
+  don't assume the value convention is uniform even *within* one
+  add-on, let alone across different add-ons.
 
 Each host's control socket path is passed via its own `--ctrl-sock` CLI
-arg (see that addon's own `NSMODULE.json` `ARGUMENTS`) — e.g. Maze
-Voice's is `/tmp/maze_ctrl.sock`, DX7's is `/tmp/dx7_ctrl.sock`, JV-880's
-is `/tmp/jv880_ctrl.sock`. Put your addon's own path in its
-`addon_table[]` entry's `ctrl_sock` field — `send_ctrl_set()` (~line
-1354) already looks it up per active addon, no changes needed there. The
-protocol itself (confirmed identical across at least Maze Voice and DX7
-by reading both `handle_ctrl_line()` implementations) is a plain
-newline-terminated `SET <key> <value>\n` -> `OK\n`/`ERR\n` text line over
-`AF_UNIX`/`SOCK_STREAM`.
+argument (see that add-on's own `NSMODULE.json` `ARGUMENTS`) — for
+example, Maze Voice's is `/tmp/maze_ctrl.sock`, DX7's is
+`/tmp/dx7_ctrl.sock`, JV-880's is `/tmp/jv880_ctrl.sock`. Put your own
+add-on's path in its `shadow_page.conf`'s `ctrl_sock` field — the
+control-send path already looks this up per active add-on
+automatically.
 
-## Layout constants — already solved, don't relitigate
+The protocol itself (confirmed identical across every add-on in this
+family) is a plain newline-terminated text line over
+`AF_UNIX`/`SOCK_STREAM`:
+```
+SET <key> <value>\n   ->  OK\n | ERR\n
+GET <key>\n           ->  <value>\n
+```
 
-These took real live-hardware debugging to get right (see `DESIGN.md`'s
-"Live load test #16"/touch-calibration entries for the full story) —
-reuse them as-is for any new page:
+## The hardware combo
+
+`SHIFT+SCENE-N` opens that add-on's page directly — one combo, no
+separate "start the engine" step. The page itself carries its own
+engine on/off control (see below), the same live status/control
+affordance this family's own web GUIs already use.
+
+If your add-on previously used `SHIFT+SCENE-N` to start/stop its engine
+directly, you'll need to rebind that line in `midiloop.config` to point
+at the same script Force Shadow's own page-open combo uses for that
+slot (see `bind_midiloop.sh`'s own output for the exact script number
+it assigned). **This edits an already-bound combo, not an empty slot**
+— `bind_midiloop.sh`'s safety checks don't cover this case, so do it by
+hand and carefully:
+
+1. Back up `midiloop.config` first (timestamped).
+2. Change only that one line.
+3. Diff against the backup to confirm nothing else moved.
+4. Validate with `midiloop test`.
+5. Reload (`killall midiloop && <path>/AddOns/run_midiloop.sh`).
+
+The old engine-toggle script doesn't need deleting — it simply becomes
+unbound, and stays callable by ID again later if ever needed.
+
+## Engine on/off button
+
+A real button is drawn in the top-right of the top bar whenever
+`addon_table[active_addon].engine_process_name[0]` is set — dim/grey
+when the engine is off, lit when it's on. It's hit-tested alongside
+(not as part of) the tab bar and the generic widget system, so it stays
+tappable across every tab, not just whichever one is currently built.
+
+**Force Shadow itself never spawns your add-on's process directly.**
+Force Shadow runs *inside MPC's own process* (via `LD_PRELOAD`) —
+spawning a child process from inside a library injected into a
+real-time, multi-threaded audio host would be an avoidable new risk.
+Instead, the button fires a plain HTTP POST to the platform's own
+existing add-on management service
+(`127.0.0.1:8080/moduler/UPDATE` — the same endpoint behind the
+on-device Modules web page), which performs the actual process
+spawn/kill itself. Force Shadow's own call is just another bounded,
+fire-and-forget socket call — the same risk class as an ordinary
+parameter `SET`.
+
+The POST body must echo back your add-on's own `NSMODULE.json` fields
+**verbatim** — `CONFIGFILE`, `PROCESSNAME`, `DIRNAME`, and the full
+`ARGUMENTS` array as literal JSON, plus `RUNNING: true`/`false` — the
+management service overwrites the file with whatever `ARGUMENTS` you
+send, so anything paraphrased or stale will corrupt it. Size your
+buffer generously: a modest set of arguments (e.g. six `{NAME,VALUE}`
+pairs) can easily be 300+ bytes once serialized, and a silently
+truncated payload is worse than an error — it looks like it worked (the
+button flips optimistically on tap) but nothing was actually sent.
+
+The button's rendered on/off state is refreshed on a background poll
+(roughly twice a second) by checking whether a process matching
+`engine_process_name` exactly is currently running — not on every
+redraw, since a knob drag alone can trigger 50–100 redraws/second and
+an unbounded process scan has no business running that often. A tap
+optimistically flips the button's visual state immediately for instant
+feedback; the next poll cycle self-corrects if the guess didn't match
+reality.
+
+## Layout constants
+
+Reuse these as-is for any new page:
 
 - `LAND_W=1280`, `LAND_H=800` — the full landscape canvas. Use the full
-  height; there is no touch dead zone (that was a diagnosed-and-fixed
-  bug, not a real constraint — see `touch_to_landscape()`'s own comment).
-- `TOPBAR_H=72`, `TABBAR_H=72`, `CONTENT_Y`/`CONTENT_H` — the standard
-  chrome. A new addon's tabs should render inside `CONTENT_Y..CONTENT_Y+
-  CONTENT_H`, same as Maze Voice's pages.
-- The tab bar itself (rendering + hit-testing, `render_shadow_page()`
-  and `update_touch_state()`) is already generic over
-  `addon_table[active_addon].num_tabs`/`tab_names[]` — a new addon's own
-  tab set just needs its `addon_table[]` entry filled in, no tab-bar code
-  to write.
-- Palette (`PLATE_BG`, `UI_ACCENT`, `KNOB_FACE`, etc., ~line 554) matches
-  Maze Voice's own web GUI. Reuse it for visual consistency across
-  addons unless a specific addon's own web GUI uses a genuinely
-  different palette worth matching instead.
+  height; there is no touch dead zone.
+- `TOPBAR_H=72`, `TABBAR_H=72`, plus `CONTENT_Y`/`CONTENT_H` for the
+  standard chrome. Render a new add-on's tabs inside
+  `CONTENT_Y..CONTENT_Y+CONTENT_H`, same as every other add-on's pages.
+- The tab bar itself is already generic over
+  `addon_table[active_addon].num_tabs`/`tab_names[]` — a new add-on's
+  own tab set just needs its `addon_table[]` entry (or `.conf` file)
+  filled in; there's no tab-bar code to write.
+- The default palette matches this family's own web GUIs. Reuse it for
+  visual consistency across add-ons unless a specific add-on's own web
+  GUI genuinely uses a different one worth matching instead.
 
 ## Test offline first, then stage on the device
 
-**Never iterate a new page's layout live against the device.** Use
-`tools/render_preview.c` — it shares the exact same drawing primitives
-(`put_px`/`fill_circle`/`draw_ring`/the text renderer) the real renderer
-uses, but writes a plain PPM instead of a DRM buffer:
+**Never iterate a new page's layout live against the device.**
+`tools/render_preview.c` shares the exact same drawing primitives the
+real renderer uses, but writes a plain PPM image instead of a DRM
+buffer:
 
-```bash
+```
 cd tools
 gcc -O2 -Wall -Wextra -o render_preview render_preview.c -lm
-./render_preview 0 preview0.ppm   # page/tab index as first arg
+./render_preview 0 preview0.ppm   # page/tab index as the first argument
 ```
 
-Convert to PNG for viewing (no PIL/pip on this host by default — use a
-throwaway container, same as this project's own font-generation
-workflow):
-
-```bash
-docker run --rm -v "$PWD":/work -w /work python:3.11-slim bash -c \
-  "pip install --quiet pillow >/dev/null 2>&1; python3 -c \"
-from PIL import Image
-Image.open('preview0.ppm').save('preview0.png')
-\""
+Convert to PNG for viewing (no PIL/pip on-device by default — use a
+throwaway container):
+```
+docker run --rm -v "$PWD":/work -w /work python:3.11-slim bash -c "
+  pip install --quiet pillow >/dev/null 2>&1
+  python3 -c \"from PIL import Image; Image.open('preview0.ppm').save('preview0.png')\"
+"
 ```
 
-This has caught real layout bugs (text clipping off-canvas, label/knob
-overlap) before ever touching the device — cheap, fast, zero live risk.
-Port your new addon's `build_tab()`-equivalent layout logic into
-`render_preview.c` first (mirroring one of the existing
-`page_voice()`/`page_wavefolder_filter()`/`page_mod_random_mix()`
-functions), verify it visually, *then* port the verified layout into
-`force_shadow.c` and register it in `addon_table[]`.
+This catches real layout bugs — text clipping off-canvas, label/knob
+overlap — before ever touching the device. Port your new add-on's
+layout logic into `render_preview.c` first (mirroring one of the
+existing page functions), verify it visually, *then* port the verified
+layout into `force_shadow.c` (or your `.conf` file) for real.
 
-Once it looks right offline, follow this project's own established
-staged live-test sequence (every incident in `DESIGN.md` that skipped a
-stage cost more time than the stage would have) — see `DESIGN.md`'s
-"Confirmed, live on real hardware" section and any "Live load test #N"
-entry for the exact protocol: pass-through check, then static toggle-on
-with nothing interactive, then interactive testing, confirming
-screen/pads/touch/audio normal at every step and after every revert.
+Once it looks right offline, stage the live test in the same order
+every time: pass-through check with nothing active, then static
+toggle-on with nothing interactive yet, then interactive testing —
+confirming screen, pads, touch, and audio are all normal at every step
+and after every revert.
 
-## Checklist for a new addon page
+## Checklist
 
-1. Read the target addon's own `module.json` (`ui_hierarchy`/
-   `chain_params`) for every param's key/range/enum options.
-2. Read that addon's own `*_host.cpp` `handle_ctrl_line()` for the real
-   value convention per key — don't assume uniformity, and don't assume
-   it matches Maze Voice's `mix.enabled` quirk or any other addon's.
-3. Write the layout in `tools/render_preview.c` first, verify visually.
-4. Write the verified layout as that addon's own `shadow_page.conf`
-   ("The page file format" above), deployed to its own AddOns folder —
-   `ctrl_sock`, `display_name`, tabs and widgets, plus the four
-   `engine_*` fields copied verbatim from that addon's own
-   `NSMODULE.json` if it should get an on/off button. That's the entire
-   integration — `discover_data_driven_addons()`, `poll_toggle()`,
-   `render_shadow_page()`, and `send_ctrl_set()` all pick it up
-   automatically, no `force_shadow.c` edit needed at all. (Only reach
-   for a real `build_<addon>_tab()` C function + `addon_table[]`
-   initializer if the layout genuinely needs code — a loop over a
-   params array, say.)
-5. If this addon currently uses `SHIFT+SCENE-N` to start/stop its engine
-   directly, rebind that line in `midiloop.config` to point at the same
-   `SCRIPT-N` its `KNOBS+SCENE-N` page-toggle already uses — see "The
-   hardware combo" section above for the careful, by-hand process (this
-   is editing an *already-bound* combo, not an empty slot).
-6. Stage the live test: pass-through, static toggle-on, interactive
-   (including the engine button, both directions — check the actual
-   process in `ps`, not just the button's own visual state), the combo
-   rebind — confirm physically at every step.
-7. Update `DESIGN.md` with what you built and what you found (this
-   project's own convention — every non-obvious constant here exists
-   because a past mistake is documented next to it).
-
-
-## Draggable envelope graphs (`env`)
-
-Both `env` forms are interactive: drag one of the four handles (L1, L2, L3, release end) -- x sets that
-segment's rate/time, y its level. The eight sibling knobs must be on the same tab (DX7: visible; JV: add
-`hidden=1` to a `knob` line so it is read back and kept in sync but not drawn or touchable). The graph
-uses a fixed time scale so a drag never rescales the other points. While dragging, the readback worker
-does not overwrite knob values; the exact integer values are sent with the normal throttle, and the
-final value unconditionally on release. Keys used with `tkey`/`lkey` must be at most 47 characters.
+- [ ] Read the target add-on's own `module.json`
+      (`ui_hierarchy`/`chain_params`) for every parameter's key, range,
+      and enum options.
+- [ ] Read that add-on's own `*_host.cpp` `handle_ctrl_line()` for the
+      real value convention per key — don't assume uniformity across
+      keys or across add-ons.
+- [ ] Write the layout in `tools/render_preview.c` first and verify it
+      visually.
+- [ ] Write the verified layout as that add-on's own
+      `shadow_page.conf` (see [The page file format](#the-page-file-format)),
+      deployed alongside its own install — `ctrl_sock`, `display_name`,
+      tabs, and widgets, plus the four `engine_*` fields copied
+      verbatim from its own `NSMODULE.json` if it should get an on/off
+      button. That's the entire integration — no Force Shadow source
+      change needed at all.
+- [ ] If this add-on currently uses `SHIFT+SCENE-N` to start/stop its
+      engine directly, rebind that line in `midiloop.config` (see
+      [The hardware combo](#the-hardware-combo) above) — this is
+      editing an already-bound combo, not an empty slot.
+- [ ] Stage the live test: pass-through, static toggle-on, interactive
+      (including the engine button, both directions — check the actual
+      process list, not just the button's own visual state), then the
+      combo rebind — confirm physically at every step.
