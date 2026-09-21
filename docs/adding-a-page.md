@@ -26,6 +26,7 @@ reading alongside this guide:
 - [The widget system](#the-widget-system)
 - [Finding your add-on's own parameters and control protocol](#finding-your-add-ons-own-parameters-and-control-protocol)
 - [The hardware combo](#the-hardware-combo)
+- [Add-on launcher (tool add-ons)](#add-on-launcher-tool-add-ons)
 - [Engine on/off button](#engine-onoff-button)
 - [Layout constants](#layout-constants)
 - [Test offline first, then stage on the device](#test-offline-first-then-stage-on-the-device)
@@ -90,7 +91,8 @@ nothing on-device actually needs.
 
 ```
 # comments and blank lines are ignored
-page=<1-7, must match a SHIFT+SCENE-N slot>
+page=<1-7 for a hardware SHIFT+SCENE-N/KNOBS+SCENE-N slot, or 8+ for a
+      launcher-only page -- see "Add-on launcher (tool add-ons)" below>
 ctrl_sock=<path>
 display_name=<shown in the top bar; quote it if it has a space>
 
@@ -295,6 +297,32 @@ hand and carefully:
 
 The old engine-toggle script doesn't need deleting — it simply becomes
 unbound, and stays callable by ID again later if ever needed.
+
+## Add-on launcher (tool add-ons)
+
+Only seven `SHIFT+SCENE-N`/`KNOBS+SCENE-N` combos physically exist. If
+your add-on is a low-frequency "tool" that doesn't need one-tap access
+— you'd open it occasionally, not every session — give it `page=8` or
+higher instead of `1`–`7`. A slot in that range is never bound to any
+combo; it's reached by opening the launcher page (one add-on's own
+`shadow_page.conf` has `launcher=1` — force-shadow's own, at
+`addon/shadow_page.conf`, page `7`) and tapping your add-on's button
+there.
+
+You don't do anything else to register with the launcher — it's built
+by `build_launcher_tab()` (`src/force_shadow.c`), which walks every
+populated `addon_table[]` slot *at the moment the launcher page is
+opened* and draws one button per add-on it finds, labelled with that
+add-on's own `display_name`. Ship your `shadow_page.conf` with
+`page=8` (or the next free number ≥ 8) and it appears automatically the
+next time Force Shadow restarts and the launcher is opened — nothing to
+edit in the launcher's own conf, and nothing in `bind_midiloop.sh`
+either (that script only ever touches slots `1`–`7`).
+
+Everything else — the `[tab ...]`/widget syntax, the control-socket
+protocol, the engine on/off button — works exactly the same on a
+launcher-only page as on a combo-bound one; `page=8+` only changes how
+the page is *reached*, not how it's built.
 
 ## Engine on/off button
 

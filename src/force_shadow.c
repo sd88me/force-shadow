@@ -224,7 +224,19 @@ static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 #define ADDON_ACID_SEQ   5
 #define ADDON_EUCLIDIER  6
 #define ADDON_RIFFMAKER  7
-#define NUM_ADDON_SLOTS  8
+/* Slots 1-7 are the only ones a physical KNOBS+SCENE-N/SHIFT+SCENE-N
+ * combo can reach (seven scene buttons -- a hardware limit). Slots 8+
+ * (2026-09-21, "add-on launcher") exist only so a `launcher=1` page
+ * (see parse_shadow_page_conf()/build_launcher_tab() below) has
+ * somewhere to send an add-on that would rather not spend one of those
+ * seven scarce combos on itself: still a real addon_table[] entry, same
+ * shadow_page.conf format, just never bound to any combo -- reachable
+ * only by tapping it on the launcher page (which writes its slot number
+ * into SHADOW_PAGE_FILE, exactly like a combo would). Raised well past
+ * any number of add-ons this project expects any time soon; the actual
+ * per-slot cost is static (mostly-unused, zero-paged until touched)
+ * BSS, not something scanned or iterated at any real cost. */
+#define NUM_ADDON_SLOTS  40
 #define SHADOW_PAGE_FILE "/tmp/force_shadow_page"
 #define SHADOW_TOGGLE_CHECK_EVERY 30  /* ~2/sec at observed active commit rates */
 
@@ -901,6 +913,10 @@ typedef struct {
     int numbered;             /* stepper/list: prefix text with the 1-based index */
     int goto_tab;             /* readout: tapping it switches to this tab (-1 = not tappable) */
     int clean;                /* readout: strip ".syx", _/- -> space */
+    /* button only, launcher page: >0 = tapping this button writes this
+     * addon_table[] slot number into SHADOW_PAGE_FILE instead of sending
+     * a ctrl_sock SET (0 = ordinary button; see build_launcher_tab()). */
+    int goto_addon;
     /* list only: geometry + which list_stores[] slot holds its data */
     int list_id, cols, rows, tile_h, gap, jump, colmajor;
     float tscale;             /* list tile text scale */
@@ -989,6 +1005,13 @@ typedef struct {
      * (DX7), so knobs send a rounded "%d", toggles 1/0 and enums their
      * option index -- instead of "%.2f" / "on"/"off" / option text. */
     int int_values;
+
+    /* launcher=1 in the conf: this slot is the add-on launcher page --
+     * build_tab is build_launcher_tab() instead of the usual
+     * generic_data_driven_build_tab(), and no [tab] sections are needed
+     * (its tabs are generated at runtime from whatever other slots are
+     * populated). See build_launcher_tab() below. */
+    int launcher;
 } addon_descriptor_t;
 
 /* One entry per KNOBS+SCENE-N slot already reserved in USER-SCRIPTS.sh/
@@ -1213,6 +1236,98 @@ static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *ti
     ui_frame_t *f = &page_frames[n_page_frames++];
     f->x = x; f->y = y; f->w = w; f->h = h;
     strncpy(f->title, title, sizeof(f->title)-1);
+}
+
+/* ---- Add-on launcher page (2026-09-21) ----
+ *
+ * A `launcher=1` addon_table[] slot (see parse_shadow_page_conf()) is
+ * built by this function instead of generic_data_driven_build_tab():
+ * rather than replaying a fixed set of widgets recorded from a [tab]
+ * section, it walks addon_table[] itself, live, and draws one button
+ * per other populated slot -- so a new addon's shadow_page.conf showing
+ * up on disk (or disappearing) is reflected the next time this page is
+ * opened, with nothing to hand-maintain in the launcher's own conf.
+ * Each button writes its target's slot number into SHADOW_PAGE_FILE
+ * (see the W_BUTTON case in update_touch_state() below) -- the exact
+ * file a KNOBS+SCENE-N combo already writes, so poll_toggle() picks up
+ * the switch on its next ~50ms tick exactly as if a combo had been
+ * pressed. This is the intended way to give a low-frequency "tool"
+ * add-on its own shadow page without spending one of the seven scarce
+ * hardware combo slots on it: give it a page= slot 8 or above (never
+ * bound to any combo in bind_midiloop.sh) and let this page be how
+ * it's reached. */
+#define LAUNCHER_COLS 3
+#define LAUNCHER_ROWS 4
+#define LAUNCHER_PER_TAB (LAUNCHER_COLS * LAUNCHER_ROWS)
+
+static void write_shadow_page_file(int slot) {
+    FILE *f = fopen(SHADOW_PAGE_FILE, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", slot);
+    fclose(f);
+}
+
+static int add_goto_button(int32_t cx, int32_t cy, const char *label, int target_slot) {
+    int bi = add_button(cx, cy, label, "");
+    page_widgets[bi].goto_addon = target_slot;
+    return bi;
+}
+
+static void build_launcher_tab(int tab) {
+    n_page_widgets = 0;
+    n_page_frames = 0;
+
+    int own_slot = active_addon;
+    int targets[NUM_ADDON_SLOTS];
+    int n_targets = 0;
+    for (int s = ADDON_NONE + 1; s < NUM_ADDON_SLOTS; s++) {
+        if (s == own_slot || addon_table[s].build_tab == NULL ||
+            addon_table[s].build_tab == build_launcher_tab)
+            continue;
+        targets[n_targets++] = s;
+    }
+
+    /* num_tabs/tab_names are normally fixed at parse time; the launcher
+     * recomputes its own each time it's opened instead, since its
+     * content depends on which other slots are populated right now, not
+     * on anything in its own conf file. */
+    int n_tabs = (n_targets + LAUNCHER_PER_TAB - 1) / LAUNCHER_PER_TAB;
+    if (n_tabs < 1) n_tabs = 1;
+    if (n_tabs > MAX_TABS) n_tabs = MAX_TABS; /* extra add-ons past this many simply don't fit -- raise LAUNCHER_COLS/ROWS or MAX_TABS if it's ever hit */
+    addon_descriptor_t *self = &addon_table[own_slot];
+    self->num_tabs = n_tabs;
+    for (int t = 0; t < n_tabs; t++) {
+        if (n_tabs == 1) strncpy(self->tab_names[t], "ADD-ONS", sizeof(self->tab_names[t]) - 1);
+        else snprintf(self->tab_names[t], sizeof(self->tab_names[t]), "ADD-ONS %d", t + 1);
+    }
+    if (tab >= n_tabs) tab = n_tabs - 1;
+
+    add_frame(36, 88, LAND_W - 72, CONTENT_H, "ADD-ONS");
+
+    if (n_targets == 0) {
+        int ri = add_readout(LAND_W / 2, LAND_H / 2, 600, 60, "", "");
+        strncpy(page_widgets[ri].text, "NO ADD-ONS FOUND", sizeof(page_widgets[ri].text) - 1);
+        return;
+    }
+
+    int32_t x0 = 120, x1 = LAND_W - 120;
+    int32_t y0 = 170, y1 = LAND_H - TABBAR_H - 60;
+    int32_t colw = (x1 - x0) / LAUNCHER_COLS;
+    int32_t rowh = (y1 - y0) / LAUNCHER_ROWS;
+
+    int start = tab * LAUNCHER_PER_TAB;
+    int end = start + LAUNCHER_PER_TAB;
+    if (end > n_targets) end = n_targets;
+    for (int i = start; i < end; i++) {
+        int idx = i - start;
+        int col = idx % LAUNCHER_COLS;
+        int row = idx / LAUNCHER_COLS;
+        int32_t cx = x0 + colw * col + colw / 2;
+        int32_t cy = y0 + rowh * row + rowh / 2;
+        int slot = targets[i];
+        const char *label = addon_table[slot].display_name[0] ? addon_table[slot].display_name : "ADD-ON";
+        add_goto_button(cx, cy, label, slot);
+    }
 }
 
 /* ---- Per-addon data-driven pages (2026-09-19) ----
@@ -1468,6 +1583,7 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             else if (strcmp(k, "frame_style") == 0) parsed.theme.plain_frames = (strcmp(v, "plain") == 0);
             else if (strcmp(k, "topbar_style") == 0) parsed.theme.dsp = (strcmp(v, "display") == 0);
             else if (strcmp(k, "int_values") == 0) parsed.int_values = atoi(v);
+            else if (strcmp(k, "launcher") == 0) parsed.launcher = atoi(v);
             else if (strncmp(k, "theme_", 6) == 0) {
                 /* theme_<name>=RRGGBB (no '#': the tokenizer treats a
                  * leading '#' as a comment). */
@@ -1615,11 +1731,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
         memcpy(snap->frames, page_frames, sizeof(ui_frame_t) * (size_t)n_page_frames);
     }
 
-    if (slot < 0 || parsed.num_tabs == 0) {
+    if (slot < 0 || (parsed.num_tabs == 0 && !parsed.launcher)) {
         logline("shadow_page[%s]: no valid page= line or no tabs found -- ignoring file", path);
         return;
     }
-    parsed.build_tab = generic_data_driven_build_tab;
+    parsed.build_tab = parsed.launcher ? build_launcher_tab : generic_data_driven_build_tab;
     addon_table[slot] = parsed;
     logline("shadow_page[%s]: loaded addon slot %d ('%s'), %d tab(s)",
              path, slot, parsed.display_name, parsed.num_tabs);
@@ -3130,6 +3246,10 @@ static void update_touch_state(const struct input_event *ev) {
      * separate from send_idx/send_snapshot above since it's not a
      * page_widgets[] entry and goes to a different function entirely. */
     int engine_toggle_addon = -1, engine_toggle_want = 0;
+    /* Launcher button tap: deferred the same way as the two above -- a
+     * tmpfs file write is fast, but this thread's own rule (see comment
+     * above) is to do it outside touch_mu regardless. */
+    int launcher_goto_slot = -1;
 
     pthread_mutex_lock(&touch_mu);
     if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
@@ -3209,7 +3329,15 @@ static void update_touch_state(const struct input_event *ev) {
                     send_idx = i; send_force = 1; send_snapshot = *w;
                     break;
                 case W_BUTTON:
-                    send_idx = i; send_force = 1; send_snapshot = *w;
+                    if (w->goto_addon > 0) {
+                        /* Launcher button: switch add-ons the same way a
+                         * KNOBS+SCENE-N combo does (see poll_toggle()),
+                         * not a ctrl_sock SET -- this widget has no
+                         * param_key/engine to send one to. */
+                        launcher_goto_slot = w->goto_addon;
+                    } else {
+                        send_idx = i; send_force = 1; send_snapshot = *w;
+                    }
                     break;
                 case W_STEPPER: {
                     /* left third = previous, right third = next, middle = nothing */
@@ -3348,6 +3476,9 @@ static void update_touch_state(const struct input_event *ev) {
     }
     if (engine_toggle_addon >= 0) {
         send_engine_toggle(engine_toggle_addon, engine_toggle_want);
+    }
+    if (launcher_goto_slot > 0) {
+        write_shadow_page_file(launcher_goto_slot);
     }
 }
 

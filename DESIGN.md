@@ -145,6 +145,24 @@ window in which a partially-rendered frame could reach the display.
 Only one add-on's page can be active at a time; switching pages rebuilds
 the new add-on's first tab and resets tab position to the first tab.
 
+- **Add-on launcher (2026-09-21):** since only seven `KNOBS+SCENE-N`
+  combos physically exist, a page can also be reached with no combo of
+  its own. One `addon_table[]` slot is marked `launcher=1` in its own
+  `shadow_page.conf`; `build_launcher_tab()` (`src/force_shadow.c`)
+  builds that slot's page by walking every *other* populated
+  `addon_table[]` slot at open time and drawing one button per add-on
+  found — tapping a button writes that add-on's slot number into the
+  same state file a hardware combo would, so switching to it goes
+  through the exact same `poll_toggle()` path either way. This is meant
+  for a "tool" add-on used rarely enough that reaching it in two taps
+  (the launcher's own combo, then its button) instead of one is an
+  acceptable trade for not spending one of the seven scarce combo slots
+  on it: such an add-on ships `page=8` or higher (never bound to any
+  combo in `bind_midiloop.sh`) and appears on the launcher automatically
+  — no launcher-side config to hand-maintain. See
+  [docs/adding-a-page.md](docs/adding-a-page.md)'s "Add-on launcher
+  (tool add-ons)" section.
+
 ## Rendering engine
 
 - **Software rasterizer, no `libm`.** Every draw call (filled rects,
@@ -303,11 +321,15 @@ Adding a control page for a new add-on is **purely additive** — it
 never requires changing Force Shadow's own dispatch, rendering, or
 control-socket code:
 
-1. Pick a free hardware combo slot (1–7).
+1. Pick a free hardware combo slot (1–7) — or, for a low-frequency tool
+   add-on that doesn't need one-tap access, `page=8` or higher instead
+   (reached through the add-on launcher's own page, not a combo; see
+   "Add-on launcher" above).
 2. Write that add-on's own `shadow_page.conf` (widgets, layout, theme,
    optional engine block) and ship it inside the add-on's own install.
-3. Bind `SHIFT+SCENE-N`/`KNOBS+SCENE-N` for that slot via
-   `bind_midiloop.sh`.
+3. For a `1`–`7` slot, bind `SHIFT+SCENE-N`/`KNOBS+SCENE-N` via
+   `bind_midiloop.sh`. A `page=8+` slot needs no binding at all — it
+   appears on the launcher automatically.
 
 See [docs/adding-a-page.md](docs/adding-a-page.md) for the full widget
 reference, the control-socket protocol an engine needs to implement,

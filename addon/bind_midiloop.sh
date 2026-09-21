@@ -4,8 +4,19 @@
 # shadow-mode page (matching PAGE_NAMES[]/SHADOW_PAGE_FILE in
 # src/force_shadow.c: page 1=DX7, 2=JV-880, 3=Maze Voice (the only page
 # actually built today), 4=Maze Sequencer, 5=Acid Sequencer,
-# 6=Euclidier, 7=Riffmaker -- pressing the same combo again hides it,
-# a different KNOBS+SCENE-M switches directly).
+# 6=Euclidier, 7=Add-on Launcher -- pressing the same combo again hides
+# it, a different KNOBS+SCENE-M switches directly).
+#
+# Slot 7 (2026-09-21) is force-shadow's own add-on launcher page
+# (addon/shadow_page.conf, launcher=1) rather than a per-add-on page --
+# the "Riffmaker" name previously reserved for slot 7 was never actually
+# built, so no real add-on lost its combo. Any *future* add-on that
+# would rather not spend one of these seven scarce combos on itself
+# (used rarely enough that a couple of extra taps through the launcher
+# is fine) should ship its own
+# shadow_page.conf with page=8 or higher instead -- never bound to a
+# combo here, reachable only via the launcher. See
+# docs/adding-a-page.md's "Add-on launcher (tool add-ons)" section.
 #
 # Run this manually, once, after `manage.sh ENABLE`:
 #   sh bind_midiloop.sh
@@ -94,7 +105,7 @@ echo "  $SCRIPTS.bak-force-shadow-$ts"
 
 # ── Append 7 new SCRIPT-N blocks ──────────────────────────────
 i=0
-for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Euclidier" "Riffmaker"; do
+for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Euclidier" "Add-on Launcher"; do
     i=$((i + 1))
     sid=$((start + i - 1))
     page=$i
@@ -119,7 +130,7 @@ done
 
 # ── Patch the 7 KNOBS+SCENE-N lines in midiloop.config ────────
 i=0
-for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Euclidier" "Riffmaker"; do
+for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Euclidier" "Add-on Launcher"; do
     i=$((i + 1))
     sid=$((start + i - 1))
     sed -i -E "s|^(KNOBS\+SCENE-$i[[:space:]]*=)[[:space:]]*-.*|\1 SCRIPT-$sid $MARKER $name page|" "$CONFIG"
