@@ -71,9 +71,7 @@ at all.
   knob updates itself correctly after you load a different patch, for
   example).
 - **Multi-tab pages.** Each add-on's control surface can span several
-  tabs (Maze Voice ships 3, JV-880 ships 7 — DX7's page is a single,
-  intentionally minimal tab for now, see below), navigated with a
-  bottom tab bar.
+  tabs, navigated with a bottom tab bar.
 - **One button to open, the same button to close.** No separate "start
   the engine" and "show its screen" combos to remember — see
   [Using Force Shadow](#using-force-shadow) below.
@@ -89,7 +87,7 @@ at all.
   these automatically — adding, tweaking, or re-theming an add-on's page
   never requires rebuilding or redeploying Force Shadow itself.
 - **Per-add-on visual themes.** Colour palette and widget style (flat
-  panel, engraved LCD look, or a TB-303-style chassis) are set per page,
+  panel, engraved LCD look, etc) are set per page,
   so each add-on can look like its own instrument rather than a generic
   shared skin.
 - **Fails safe, always.** If anything about the setup can't be confirmed
@@ -101,17 +99,6 @@ at all.
   links against exactly `libc`/`libpthread`/`libdl` — nothing else to
   install on-device.
 
-## Control pages included in this release
-
-| Add-on | Tabs | What it controls |
-|---|---|---|
-| **Maze Voice** | 3 | Full parameter set of the Labyrinth-inspired synth voice: oscillators/EG, wavefolder/filter, mod/random/output mix |
-| **DX7 (Dexed) emulator** | minimal today | Output level, algorithm, feedback, transpose — proves the page format; a full multi-operator page is planned |
-| **JV-880 emulator** | 7 | Play/patch controls, four tone pages, and a paged bank/patch browser with a dot-matrix-style top bar |
-
-All three pages ship inside their own add-on's install (as a
-`shadow_page.conf` file), not inside Force Shadow itself — Force Shadow
-only provides the engine that reads and renders them.
 
 ## Part of a bigger family
 
@@ -301,10 +288,6 @@ KNOBS) needs to be **pressed and held**, the SCENE pad **tapped while
 still held**, then both released — pressing them at exactly the same
 instant, or releasing the modifier first, won't register.
 
-**A little screen tearing during a drag.** A small amount of cosmetic
-tearing can appear while actively dragging a knob or envelope point —
-this is a known, low-priority visual artifact of how frames are
-composited and doesn't affect control accuracy or engine behaviour.
 
 **Shadow Mode won't turn off / the screen looks stuck.** The manual
 override always works as a fallback:
