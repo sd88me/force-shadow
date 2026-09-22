@@ -925,6 +925,7 @@ typedef struct {
     /* euclid only: get_key reply "steps|b,b,..|play|loop|enabled|selected"; env_mode 1=strip 2=ring */
     char eu_bits[72];         /* '0'/'1' per step */
     int eu_loop, eu_en, eu_sel;
+    int eu_tap;                /* strip only: cell index tapped this touch, -1 = none */
 } ui_widget_t;
 
 typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
@@ -1202,7 +1203,7 @@ static int add_euclid(int32_t cx, int32_t cy, int32_t bw, int32_t bh, int mode,
     strncpy(w->param_key, key, sizeof(w->param_key)-1);
     strncpy(w->text, val, sizeof(w->text)-1);
     strncpy(w->get_key, get_key, sizeof(w->get_key)-1);
-    w->ival = -1; w->imax = 16; w->eu_en = 1;
+    w->ival = -1; w->imax = 16; w->eu_en = 1; w->eu_tap = -1;
     return n_page_widgets++;
 }
 /* Display-only DX7 envelope graph; param_key is the prefix shared by the
@@ -3118,6 +3119,15 @@ static void send_widget_param(const ui_widget_t *w, int force) {
     }
     case W_EUCLID:
         send_ctrl_set(w->param_key, w->text[0] ? w->text : "go");
+        if (w->eu_tap >= 0) {
+            /* Strip cell tap: also toggle that step on the row's own lane.
+             * The row's lane index rides in w->text (e.g. key="sel" val="3"
+             * selects lane 4, whose engine key is "l4_toggle"). */
+            char key[32], val[8];
+            snprintf(key, sizeof(key), "l%d_toggle", atoi(w->text) + 1);
+            snprintf(val, sizeof(val), "%d", w->eu_tap);
+            send_ctrl_set(key, val);
+        }
         break;
     case W_READOUT:
     case W_ENV:
@@ -3352,10 +3362,24 @@ static void update_touch_state(const struct input_event *ev) {
                     }
                     break;
                 }
-                case W_EUCLID:
+                case W_EUCLID: {
+                    w->eu_tap = -1;
+                    if (w->env_mode == 1) { /* strip: work out which cell was tapped */
+                        int n = w->imax; if (n < 1) n = 1; if (n > 64) n = 64;
+                        int rows = n > 32 ? 2 : 1, per = (n + rows - 1) / rows;
+                        int32_t gap = n > 32 ? 2 : 4, rgap = 6;
+                        int32_t x0 = w->cx - w->w/2, y0 = w->cy - w->h/2;
+                        int32_t cw = (w->w - gap * (per - 1)) / per; if (cw < 2) cw = 2;
+                        int32_t ch = (w->h - rgap * (rows - 1)) / rows;
+                        int col = (lpx - x0) / (cw + gap); if (col < 0) col = 0; if (col >= per) col = per - 1;
+                        int row = (lpy - y0) / (ch + rgap); if (row < 0) row = 0; if (row >= rows) row = rows - 1;
+                        int k = row * per + col;
+                        if (k < n) w->eu_tap = k;
+                    }
                     send_idx = i; send_force = 1; send_snapshot = *w;
                     refresh_request = 1;
                     break;
+                }
                 case W_BITS: {
                     int32_t gap = 8, cell = (w->w - 7 * gap) / 8;
                     int k = (lpx - (w->cx - w->w/2)) / (cell + gap);
