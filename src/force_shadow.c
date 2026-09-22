@@ -624,6 +624,16 @@ typedef struct {
      * always defaulted to, so an existing page that never sets
      * theme_knob_dot renders identically to before this field existed. */
     uint32_t knob_dot;
+    /* Selected tab's label color - independent of `btn_text` (the active
+     * tab used to reuse BTN_TEXT, the "light text for a filled widget"
+     * token, since Acid's own red-button/dark-tab-pill palette happened
+     * to want light text in both places; a page whose buttons are dark
+     * text on a light background but whose tab pill is dark had no way
+     * to keep a dark pill with a legible, differently-colored label
+     * without also recoloring every button). Defaults to btn_text's own
+     * default so an existing page that never sets theme_tab_on_tx renders
+     * identically to before this field existed. */
+    uint32_t tab_on_tx;
 } ui_theme_t;
 
 static const ui_theme_t THEME_DEFAULT = {
@@ -633,10 +643,13 @@ static const ui_theme_t THEME_DEFAULT = {
     0xFF050403u, 0xFF4C473Du, 0xFF1A120Du, 0xFF050403u,
     0,
     /* Remaining fields (plain_frames..tabs_bg) stay implicit-zero, same
-     * as before this field existed; .knob_dot is a designated
-     * initializer specifically so it lands on the right field regardless
-     * of how many implicit-zero fields sit between lcd and it. */
-    .knob_dot = 0xFFC1552Fu
+     * as before this field existed; .knob_dot/.tab_on_tx are designated
+     * initializers specifically so they land on the right fields
+     * regardless of how many implicit-zero fields sit between lcd and
+     * them. .tab_on_tx matches btn_text's own default above (0xFFFDF3EAu)
+     * so a page that never sets theme_tab_on_tx is unaffected. */
+    .knob_dot = 0xFFC1552Fu,
+    .tab_on_tx = 0xFFFDF3EAu
 };
 static ui_theme_t th;  /* active theme; render_shadow_page() sets it per addon */
 
@@ -881,6 +894,7 @@ static void dot_cell_fit(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y
 #define SEG_INACTIVE  (th.seg_inactive)
 #define SEG_ACTIVE_TX (th.seg_active_tx)
 #define BTN_TEXT      (th.btn_text)
+#define TAB_ON_TX     (th.tab_on_tx)
 
 #define TOPBAR_H 72
 #define TABBAR_H 72
@@ -1688,6 +1702,7 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 else if (!strcmp(n, "well"))        t->well = c;
                 else if (!strcmp(n, "knob_off"))    t->knob_off = c;
                 else if (!strcmp(n, "tab_on"))      t->tab_on_bg = c;
+                else if (!strcmp(n, "tab_on_tx"))    t->tab_on_tx = c;
                 else if (!strcmp(n, "lcd"))         t->lcd_bg = c;
                 else if (!strcmp(n, "box"))         t->box = c;
                 else if (!strcmp(n, "btn_bg"))      t->btn_bg = c;
@@ -2507,10 +2522,15 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
              * at all and just became low-contrast text on a same-toned
              * pill. BTN_TEXT (already the "light text for a filled/
              * highlighted widget" token used by buttons and list/enum
-             * selection) is the correct pairing for tab_on_bg specifically,
-             * regardless of what accent happens to be. */
+             * selection) was then used as tab_on_bg's pairing -- until a
+             * page wanted a dark tab_on_bg with light body text but dark
+             * BTN_TEXT (light buttons, dark labels), which put dark text
+             * back on a dark pill. TAB_ON_TX decouples the two: it
+             * defaults to BTN_TEXT's own default, so an existing page is
+             * unaffected, but a page can now pick its own active-tab
+             * label color independent of its button text. */
             draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 4, ad->tab_names[i], 2,
-                              i == page ? BTN_TEXT : th.chrome_ink);
+                              i == page ? TAB_ON_TX : th.chrome_ink);
         }
     } else if (ad->num_tabs > 0) {
         int32_t tw = LAND_W / ad->num_tabs;
