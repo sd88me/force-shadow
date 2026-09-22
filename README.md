@@ -98,6 +98,13 @@ at all.
 - **No extra runtime dependencies on the Force.** The whole interposer
   links against exactly `libc`/`libpthread`/`libdl` — nothing else to
   install on-device.
+- **Add-on launcher.** Only seven hardware combos exist; a low-frequency
+  "tool" add-on that doesn't need one-tap access can skip claiming one
+  and instead be reached through a dedicated launcher page that lists
+  every installed add-on automatically (colour-coded red/green by
+  whether that add-on's own engine is currently running), plus a single
+  "KILL ALL ENGINES" button to stop everything at once. See
+  [Building a page for your own add-on](#building-a-page-for-your-own-add-on).
 
 
 ## Part of a bigger family
@@ -163,9 +170,22 @@ or different in normal use until you open a shadow page (see below).
 
 **Opening a page:** press and hold the button combo for the add-on you
 want (e.g. **SHIFT + SCENE-3** or **KNOBS + SCENE-3** for Maze Voice —
-either combo works and does the same thing). Hold the modifier down,
-tap the SCENE pad, then release both — pressing and releasing
-simultaneously doesn't register, they need to be a proper hold-then-tap.
+either combo works and does the same thing, except slot 7's
+**SHIFT + SCENE-7**, which is reserved for the add-on launcher — see
+below). Hold the modifier down, tap the SCENE pad, then release both —
+pressing and releasing simultaneously doesn't register, they need to be
+a proper hold-then-tap.
+
+**Opening the add-on launcher:** **SHIFT + SCENE-7** opens a page
+listing every other installed add-on as a button — tap one to jump
+straight to its own page, exactly as if you'd pressed its combo
+directly. Each button is red or green depending on whether that
+add-on's own engine is currently running, and a **KILL ALL ENGINES**
+button in the bottom-right corner stops every running engine across
+every add-on in one tap. Meant for tool add-ons used rarely enough that
+the extra tap through the launcher is an acceptable trade for not
+spending one of the seven scarce hardware combos on a dedicated
+shortcut.
 
 **Closing a page:** press the same combo again, or press almost any of
 the Force's own mode buttons (MENU, LOAD, SAVE, MATRIX, CLIP, MIXER,
@@ -315,12 +335,16 @@ Force Shadow's control pages are entirely data-driven: an add-on ships
 a small `shadow_page.conf` text file (widgets, layout, colours, and the
 control-socket path to talk to) alongside its own install, and Force
 Shadow discovers and loads it automatically at boot — no changes to
-Force Shadow's own code are needed to add a new add-on's page. See
+Force Shadow's own code are needed to add a new add-on's page. Give it
+`page=1`-`7` for a dedicated hardware combo, or `page=8` or higher for
+a low-frequency "tool" add-on that would rather be reached through the
+[add-on launcher](#features) instead of spending one of the seven
+scarce combo slots. See
 **[docs/adding-a-page.md](docs/adding-a-page.md)** for the full guide
-(widget types, the config file format, wiring up a control socket, and
-an offline preview tool for checking a new layout before ever touching
-the device), and [DESIGN.md](DESIGN.md) for how the rendering/control
-pipeline works underneath.
+(widget types, the config file format, wiring up a control socket, the
+launcher, and an offline preview tool for checking a new layout before
+ever touching the device), and [DESIGN.md](DESIGN.md) for how the
+rendering/control pipeline works underneath.
 
 ## Project layout
 

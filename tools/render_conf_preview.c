@@ -1,0 +1,662 @@
+/* render_preview.c -- host-side preview tool for Maze Voice's shadow-mode
+ * pages. Shares the same drawing primitives/widget logic that gets
+ * ported into force_shadow.c's real renderer, but outputs a plain PPM
+ * image instead of writing into a DRM dumb buffer -- lets UI layout be
+ * iterated and checked visually on a dev machine, without a live device
+ * round-trip for every tweak. Builds and runs natively (no cross-compile,
+ * no QEMU): `gcc -O2 -o render_preview render_preview.c -lm && ./render_preview`.
+ *
+ * Deliberately skips the portrait buffer transform live load test #6
+ * established (see DESIGN.md) -- this renders straight into a landscape
+ * RGB canvas, since that transform is already proven separately and
+ * isn't what's being checked here (page layout, widget legibility,
+ * knob/label positioning). The real force_shadow.c build still goes
+ * through put_px_land()'s transform as always.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include "../src/font8x8.h"
+
+#define LAND_W 1280
+#define LAND_H 800
+
+static uint8_t canvas[LAND_H][LAND_W][3];
+
+typedef struct { uint8_t r, g, b; } rgb_t;
+static rgb_t rgb(uint32_t hex) {
+    rgb_t c = { (hex >> 16) & 0xff, (hex >> 8) & 0xff, hex & 0xff };
+    return c;
+}
+
+/* ---- palette (Maze Voice web GUI default; overridable per-page by
+ * theme_<name>=RRGGBB / style= top-level .conf keys -- see load_conf()'s
+ * top-level key handling and force_shadow.c's own THEME_DEFAULT/theme_
+ * parsing, which this mirrors field-for-field). Not `const` any more
+ * since a page can override them at load time. ---- */
+static uint32_t PLATE      = 0x131211;
+static uint32_t PLATE_HI   = 0x1c1a17;
+static uint32_t PLATE_LINE = 0x2a2823;
+static uint32_t INK        = 0xefe9d8;
+static uint32_t INK_DIM    = 0x8f8878;
+static uint32_t INK_FAINT  = 0x5c584c;
+static uint32_t ACCENT     = 0xc1552f;
+static uint32_t ACCENT_HI  = 0xe2793f;
+static uint32_t KNOB_FACE  = 0xefe9d8;
+static uint32_t KNOB_RING  = 0x2a2823;
+static uint32_t BAR_BG     = 0x0d0c0a;
+static uint32_t TAB_ON_BG  = 0x1a120d;   /* theme_tab_on */
+static uint32_t SEG_ACTIVE    = 0xf2f1ee;   /* theme_seg_active */
+static uint32_t SEG_INACTIVE  = 0x050403;   /* theme_seg_inactive */
+static uint32_t SEG_ACTIVE_TX = 0x1c1a17;   /* theme_seg_active_tx */
+static uint32_t LCD_BG        = 0x1a120d;   /* theme_lcd */
+static uint32_t BTN_TEXT      = 0x050403;   /* theme_btn_text */
+static uint32_t KNOB_DOT_COLOR = 0xc1552f;  /* theme_knob_dot -- defaults to ACCENT's own
+                                                default, mirroring force_shadow.c's
+                                                THEME_DEFAULT.knob_dot */
+
+/* style=td3 ("Acid") -- light chassis, charcoal boxes, red buttons, pill
+ * engine button and tab highlight. See force_shadow.c's own ui_theme_t
+ * comment ("style=td3 (Acid): light chassis, charcoal boxes, red
+ * buttons, pill engine button") -- this preview mirrors that branch, not
+ * an approximation of it. */
+static int      G_TD3      = 0;
+static uint32_t TD3_BOX        = 0x1f1f1f;
+static uint32_t TD3_BTN_BG     = 0xe8341c;
+static uint32_t TD3_CHROME_INK = 0x0a0a0a;
+static uint32_t TD3_GO_ON      = 0x35d07f;
+static uint32_t TD3_GO_OFF     = 0xe8341c;
+static uint32_t TD3_TABS_BG    = 0xd9ac00;
+
+/* ---- primitives ---- */
+static void put_px(int x, int y, uint32_t color) {
+    if (x < 0 || x >= LAND_W || y < 0 || y >= LAND_H) return;
+    rgb_t c = rgb(color);
+    canvas[y][x][0] = c.r; canvas[y][x][1] = c.g; canvas[y][x][2] = c.b;
+}
+static void fill_rect(int x0, int y0, int w, int h, uint32_t color) {
+    for (int y = y0; y < y0 + h; y++)
+        for (int x = x0; x < x0 + w; x++)
+            put_px(x, y, color);
+}
+/* Mirrors force_shadow.c's own put_px_blend_land/circle_edge_coverage
+ * (see that file's own comments for why: no sqrt, an integer
+ * approximation of (r-dist) good enough for a ~1px AA band) so this
+ * preview stays a faithful reference for the real anti-aliased edges. */
+static void put_px_blend(int x, int y, uint32_t color, int alpha) {
+    if (alpha <= 0) return;
+    if (alpha >= 255) { put_px(x, y, color); return; }
+    if (x < 0 || x >= LAND_W || y < 0 || y >= LAND_H) return;
+    rgb_t bg_c = { canvas[y][x][0], canvas[y][x][1], canvas[y][x][2] };
+    rgb_t fg_c = rgb(color);
+    canvas[y][x][0] = (uint8_t)((fg_c.r * alpha + bg_c.r * (255 - alpha)) / 255);
+    canvas[y][x][1] = (uint8_t)((fg_c.g * alpha + bg_c.g * (255 - alpha)) / 255);
+    canvas[y][x][2] = (uint8_t)((fg_c.b * alpha + bg_c.b * (255 - alpha)) / 255);
+}
+static int circle_edge_coverage(int d2, int r) {
+    if (r <= 0) return 0;
+    int cov = 128 + ((r * r - d2) * 128) / (2 * r);
+    if (cov < 0) cov = 0;
+    if (cov > 255) cov = 255;
+    return cov;
+}
+static void fill_circle(int cx, int cy, int r, uint32_t color) {
+    for (int y = -r - 1; y <= r + 1; y++)
+        for (int x = -r - 1; x <= r + 1; x++) {
+            int cov = circle_edge_coverage(x*x + y*y, r);
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px(cx + x, cy + y, color);
+            else put_px_blend(cx + x, cy + y, color, cov);
+        }
+}
+static void draw_ring(int cx, int cy, int r, int thick, uint32_t color) {
+    int r_in = r - thick;
+    for (int y = -r - 1; y <= r + 1; y++)
+        for (int x = -r - 1; x <= r + 1; x++) {
+            int d2 = x*x + y*y;
+            int outer_cov = circle_edge_coverage(d2, r);
+            int inner_cov = 255 - circle_edge_coverage(d2, r_in);
+            int cov = outer_cov < inner_cov ? outer_cov : inner_cov;
+            if (cov <= 0) continue;
+            if (cov >= 255) put_px(cx + x, cy + y, color);
+            else put_px_blend(cx + x, cy + y, color, cov);
+        }
+}
+static void draw_hline(int x0, int y, int w, uint32_t color) { fill_rect(x0, y, w, 1, color); }
+static void draw_vline(int x, int y0, int h, uint32_t color) { fill_rect(x, y0, 1, h, color); }
+
+/* Proper rounded rect (corner insets from the circle equation), ported
+ * verbatim from force_shadow.c's own fill_rr_land() -- used for style=td3
+ * frames/buttons/tab pills/engine button. */
+static void fill_rr(int x, int y, int w, int h, int r, uint32_t color) {
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    for (int j = 0; j < h; j++) {
+        int dy = j < r ? r - j - 1 : (j >= h - r ? j - (h - r) : -1);
+        int inset = 0;
+        if (dy >= 0) {
+            while (inset < r && (r - inset - 1) * (r - inset - 1) + dy * dy >= r * r) inset++;
+        }
+        fill_rect(x + inset, y + j, w - 2 * inset, 1, color);
+    }
+}
+/* Small filled triangle arrow, ported from force_shadow.c's draw_arrow_land()
+ * intent (stepper's prev/next glyphs) -- not byte-identical geometry, but
+ * the same recognizable shape at the same scale. dir: -1 left, 1 right. */
+static void draw_arrow(int cx, int cy, int size, int dir, uint32_t color) {
+    int base_x = cx - dir * size;   /* flat side */
+    for (int c = 0; c <= size; c++) {
+        int half = size - c;        /* full height at the base, tapers to the tip */
+        fill_rect(base_x + dir * c, cy - half, 1, half * 2 + 1, color);
+    }
+}
+
+/* ---- text (font8x8.h) ---- */
+#define GLYPH_CELL 9
+static int font_glyph_index(char ch) {
+    for (size_t i = 0; i < strlen(font_chars); i++)
+        if (font_chars[i] == ch) return (int)i;
+    return 0; /* space */
+}
+/* `scale` is a float here too, mirroring force_shadow.c's own fractional-
+ * scale support (2026-09-19) -- nearest-neighbor destination-pixel
+ * upscale of the coverage bitmap, so a specific widget (knob label/value)
+ * can use e.g. 1.5x without every integer-scaled caller changing too. */
+static void draw_char(int x, int y, char ch, float scale, uint32_t color) {
+    const uint8_t *g = font8x8[font_glyph_index(ch)];
+    int out_cell = (int)(GLYPH_CELL * scale + 0.5f);
+    for (int dy = 0; dy < out_cell; dy++) {
+        int row = (int)((float)dy / scale);
+        if (row >= GLYPH_CELL) row = GLYPH_CELL - 1;
+        for (int dx = 0; dx < out_cell; dx++) {
+            int col = (int)((float)dx / scale);
+            if (col >= GLYPH_CELL) col = GLYPH_CELL - 1;
+            int cov = g[row * GLYPH_CELL + col];
+            if (cov <= 0) continue;
+            put_px_blend(x + dx, y + dy, color, cov);
+        }
+    }
+}
+static int text_width(const char *s, float scale) { return (int)((float)strlen(s) * (GLYPH_CELL + 1) * scale - scale); }
+static void draw_text(int x, int y, const char *s, float scale, uint32_t color) {
+    int cx = x;
+    for (const char *p = s; *p; p++) { draw_char(cx, y, *p, scale, color); cx += (int)((GLYPH_CELL + 1)*scale); }
+}
+static void draw_text_c(int cx, int y, const char *s, float scale, uint32_t color) {
+    draw_text(cx - text_width(s, scale)/2, y, s, scale, color);
+}
+
+/* ---- knob pointer angle (libm ok here -- host tool only) ---- */
+static void knob_dot(int cx, int cy, int r, int pct, int *dx, int *dy) {
+    double angle = (-135.0 + 270.0 * pct / 100.0) * M_PI / 180.0;
+    int dist = (int)(r * 0.72);
+    *dx = cx + (int)(dist * sin(angle));
+    *dy = cy - (int)(dist * cos(angle));
+}
+
+/* ---- widgets ---- */
+static void widget_knob(int cx, int cy, int r, int pct, const char *label, const char *value) {
+    draw_ring(cx, cy, r + 3, 3, KNOB_RING);
+    fill_circle(cx, cy, r, KNOB_FACE);
+    int dx, dy; knob_dot(cx, cy, r, pct, &dx, &dy);
+    fill_circle(dx, dy, r/7 + 2, KNOB_DOT_COLOR);
+    /* Mirrors force_shadow.c's render_widget() -- full 1.5x on both label
+     * and value now (2026-09-19: "increase everything by 50%"). */
+    draw_text_c(cx, cy + r + 12, label, 1.5f, INK);
+    draw_text_c(cx, cy + r + 29, value, 1.5f, INK_FAINT);
+}
+static void widget_toggle(int cx, int cy, const char *label, int on) {
+    int pw = 51, ph = 27;
+    fill_rect(cx - pw/2, cy - ph/2, pw, ph, 0x050403);
+    draw_ring(cx - pw/2 + ph/2, cy, ph/2 - 2, 1, PLATE_LINE);
+    int lx = on ? (cx + pw/2 - ph/2) : (cx - pw/2 + ph/2);
+    fill_circle(lx, cy, ph/2 - 4, on ? ACCENT_HI : 0x4c473d);
+    draw_text_c(cx, cy + ph/2 + 10, label, 1.5f, INK);
+}
+/* color_override: 0 = use theme.btn_bg (TD3_BTN_BG/ACCENT) as before;
+ * mirrors force_shadow.c's own ui_widget_t.btn_color/has_btn_color
+ * (`color=` on a `button` line) -- one button (e.g. SEARCH) can stand
+ * out from the page's usual button color without a second theme. */
+static void widget_button(int cx, int cy, const char *label, uint32_t color_override) {
+    int w = text_width(label, 1.5f) + 36, h = 39;
+    if (G_TD3) {
+        w += 24; h = 48;
+        uint32_t bg = color_override ? color_override : TD3_BTN_BG;
+        fill_rr(cx - w/2 - 2, cy - h/2 - 2, w + 4, h + 4, 10, PLATE_LINE);
+        fill_rr(cx - w/2, cy - h/2, w, h, 8, bg);
+        draw_text_c(cx, cy - 7, label, 1.5f, BTN_TEXT);
+        return;
+    }
+    fill_rect(cx - w/2, cy - h/2, w, h, color_override ? color_override : ACCENT);
+    draw_text_c(cx, cy - 5, label, 1.5f, 0xfdf3ea);
+}
+static void widget_enum_h(int cx, int cy, const char *label, const char **opts, int n, int active, int sw_override) {
+    int seg_w = sw_override > 0 ? sw_override : 117, seg_h = 33, gap = 2;
+    draw_text_c(cx, cy - seg_h/2 - 22, label, 1.5f, INK);
+    int total = n * seg_w + (n-1)*gap;
+    int x0 = cx - total/2;
+    for (int i = 0; i < n; i++) {
+        int x = x0 + i*(seg_w+gap);
+        fill_rect(x, cy - seg_h/2, seg_w, seg_h, i == active ? SEG_ACTIVE : SEG_INACTIVE);
+        draw_text_c(x + seg_w/2, cy - seg_h/2 + seg_h/2 - 6, opts[i], 1.5f, i == active ? SEG_ACTIVE_TX : INK_DIM);
+    }
+}
+static void widget_enum_v(int cx, int cy, const char *label, const char **opts, int n, int active) {
+    int seg_w = 135, seg_h = 30, gap = 2;
+    int hit_hh = (n*(seg_h+gap))/2;
+    draw_text_c(cx, cy - hit_hh - 24, label, 1.5f, ACCENT_HI);
+    int y0 = cy - hit_hh;
+    for (int i = 0; i < n; i++) {
+        int y = y0 + i*(seg_h+gap);
+        fill_rect(cx - seg_w/2, y, seg_w, seg_h, i == active ? SEG_ACTIVE : SEG_INACTIVE);
+        draw_text_c(cx, y + seg_h/2 - 6, opts[i], 1.5f, i == active ? SEG_ACTIVE_TX : INK_DIM);
+    }
+}
+static void frame_box(int x, int y, int w, int h, const char *title) {
+    if (G_TD3) {
+        fill_rr(x, y, w, h, 10, PLATE_LINE);
+        fill_rr(x + 2, y + 2, w - 4, h - 4, 9, TD3_BOX);
+        draw_text(x + 20, y + 14, title, 1.5f, ACCENT);
+        fill_rect(x + 18, y + 38, w - 36, 1, INK_FAINT);
+        return;
+    }
+    draw_ring(0,0,0,0,0); /* no-op, keeps signature symmetry */
+    fill_rect(x, y, w, 1, PLATE_LINE);
+    fill_rect(x, y, 1, h, PLATE_LINE);
+    fill_rect(x+w-1, y, 1, h, PLATE_LINE);
+    fill_rect(x, y+h-1, w, 1, PLATE_LINE);
+    draw_text(x + 18, y + 14, title, 1.5f, ACCENT_HI);
+    fill_rect(x + 18, y + 36, w - 36, 1, PLATE_LINE);
+}
+
+/* ---- chrome: top bar + tab bar ---- */
+#define TOPBAR_H 72
+#define TABBAR_H 72
+/* Was briefly pulled up to a 720px "TOUCHABLE_H" (2026-09-18/19) on the
+ * mistaken belief the touch digitizer can't sense the bottom 80px of the
+ * real 800px screen. Live testing (2026-09-19) found the real bug was
+ * force_shadow.c's touch_to_landscape() py scale topping out at 720
+ * instead of 800 -- fixed there, so the tab bar belongs flush against
+ * LAND_H again. Kept in sync with force_shadow.c so this preview stays a
+ * faithful reference for future pages. */
+static const char *TABS[] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MIX" };
+
+/* Top-bar engine on/off button (2026-09-19) -- replaces the old static
+ * "LIVE" text. Geometry kept in sync with force_shadow.c's own
+ * ENGINE_BTN_X/Y/W/H. */
+#define ENGINE_BTN_W 220
+#define ENGINE_BTN_H 40
+#define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
+#define ENGINE_BTN_Y 16
+
+
+/* ---- generic .conf-driven rendering (force-webstream preview) ----
+ * Not the real parse_shadow_page_conf() from force_shadow.c (that one is
+ * entangled with live polling/socket/addon_table state not needed here) -
+ * this is a small purpose-built parser for exactly the widget kinds our
+ * page uses (frame/button/readout/knob/enum_h/toggle/list), driving the
+ * SAME widget_* draw calls above plus two new ones (widget_readout,
+ * widget_list) ported from force_shadow.c's render_widget() W_READOUT/
+ * W_LIST cases (see that function, ~line 2001) so the visual output
+ * matches the real renderer, not an approximation. */
+
+static void widget_readout(int cx, int cy, int w, int h, const char *label, const char *text) {
+    int x0 = cx - w/2, y0 = cy - h/2;
+    if (label[0]) draw_text(x0, y0 - 22, label, 1.5f, INK_DIM);
+    fill_rect(x0, y0, w, h, LCD_BG);
+    fill_rect(x0, y0, w, 1, PLATE_LINE);
+    fill_rect(x0, y0 + h - 1, w, 1, PLATE_LINE);
+    float sc = 2.0f;
+    char tb[64]; snprintf(tb, sizeof(tb), "%s", text);
+    while (strlen(tb) > 1 && text_width(tb, sc) > w - 16) tb[strlen(tb) - 1] = 0;
+    draw_text_c(cx, cy - (int)(4.5f * sc), tb, sc, ACCENT);
+}
+
+/* `<  text  >` index control, ported from force_shadow.c's render_widget()
+ * W_STEPPER case (~line 2052): square rounded end buttons with an arrow
+ * glyph flank a centre LCD box showing the current text. */
+static void widget_stepper(int cx, int cy, int w, int h, const char *label, const char *text) {
+    int x0 = cx - w/2, y0 = cy - h/2;
+    if (label[0]) draw_text(x0, y0 - 22, label, 1.5f, INK_DIM);
+    fill_rr(x0, y0, h, h, 5, PLATE_LINE);
+    fill_rr(x0 + w - h, y0, h, h, 5, PLATE_LINE);
+    draw_arrow(x0 + h/2, cy, h/4, -1, ACCENT_HI);
+    draw_arrow(x0 + w - h/2, cy, h/4, 1, ACCENT_HI);
+    int bx = x0 + h + 3, bw = w - 2*h - 6;
+    fill_rect(bx, y0, bw, h, LCD_BG);
+    fill_rect(bx, y0, bw, 1, PLATE_LINE);
+    fill_rect(bx, y0 + h - 1, bw, 1, PLATE_LINE);
+    char tb[48]; snprintf(tb, sizeof(tb), "%s", text);
+    while (strlen(tb) > 1 && text_width(tb, 1.5f) > bw - 16) tb[strlen(tb) - 1] = 0;
+    draw_text_c(bx + bw/2, cy - 7, tb, 1.5f, ACCENT);
+}
+
+/* x,y = TOP-LEFT (matches shadow_page.conf's `list` spec, unlike every
+ * other widget here which takes a centre) */
+static void widget_list(int x, int y, int w, int h, const char **items, int n,
+                         int sel, int cols, int rows, int tile_h, int gap, int numbered) {
+    int tw = (w - (cols - 1) * gap) / cols;
+    int pp = cols * rows;
+    for (int p = 0; p < pp && p < n; p++) {
+        int col = p % cols, row = p / cols;
+        int tx = x + col * (tw + gap);
+        int ty = y + row * (tile_h + gap);
+        int is_sel = (p == sel);
+        fill_rect(tx, ty, tw, tile_h, is_sel ? ACCENT : LCD_BG);
+        if (!is_sel) {
+            fill_rect(tx, ty, tw, 1, PLATE_LINE);
+            fill_rect(tx, ty + tile_h - 1, tw, 1, PLATE_LINE);
+        }
+        char tb[64];
+        if (numbered) snprintf(tb, sizeof(tb), "%02d %s", p + 1, items[p]);
+        else snprintf(tb, sizeof(tb), "%s", items[p]);
+        while (strlen(tb) > 1 && text_width(tb, 1.5f) > tw - 20) tb[strlen(tb) - 1] = 0;
+        draw_text(tx + 10, ty + tile_h/2 - 7, tb, 1.5f, is_sel ? BTN_TEXT : ACCENT);
+    }
+    int grid_h = rows * tile_h + (rows - 1) * gap;
+    if (grid_h > h)
+        fprintf(stderr, "WARNING: list grid_h=%d exceeds declared h=%d (cols=%d rows=%d th=%d gap=%d)\n",
+                grid_h, h, cols, rows, tile_h, gap);
+}
+
+static void draw_chrome_named(const char *title, const char **tabs, int ntabs, int active_tab, int engine_on) {
+    fill_rect(0, 0, LAND_W, LAND_H, PLATE);
+    fill_rect(0, 0, LAND_W, TOPBAR_H, PLATE_HI);
+    draw_hline(0, TOPBAR_H, LAND_W, PLATE_LINE);
+    draw_text(40, G_TD3 ? 20 : 28, title, G_TD3 ? 3 : 2, G_TD3 ? TD3_CHROME_INK : INK);
+
+    if (G_TD3) {
+        /* black pill: lit dot + START (red) when stopped, RUNNING (green) when up */
+        uint32_t c = engine_on ? TD3_GO_ON : TD3_GO_OFF;
+        fill_rr(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, ENGINE_BTN_H/2, PLATE_LINE);
+        fill_circle(ENGINE_BTN_X + 26, ENGINE_BTN_Y + ENGINE_BTN_H/2, 8, c);
+        draw_text_c(ENGINE_BTN_X + ENGINE_BTN_W/2 + 14, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
+                    engine_on ? "RUNNING" : "START", 2, c);
+    } else {
+        uint32_t bbg = engine_on ? ACCENT : PLATE_LINE;
+        uint32_t bfg = engine_on ? INK : INK_FAINT;
+        fill_rect(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bbg);
+        draw_text_c(ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
+                    engine_on ? "ENGINE ON" : "ENGINE OFF", 2, bfg);
+    }
+
+    int tabbar_y = LAND_H - TABBAR_H;
+    fill_rect(0, tabbar_y, LAND_W, TABBAR_H, G_TD3 ? TD3_TABS_BG : BAR_BG);
+    draw_hline(0, tabbar_y, LAND_W, G_TD3 ? TD3_BOX : PLATE_LINE);
+    int tw = LAND_W / ntabs;
+    for (int i = 0; i < ntabs; i++) {
+        if (G_TD3) {
+            if (i == active_tab) fill_rr(i*tw + 10, tabbar_y + 10, tw - 20, TABBAR_H - 14, 8, TAB_ON_BG);
+            /* BTN_TEXT (light text for a filled/highlighted widget, same
+             * pairing buttons/selected-list-rows use), not ACCENT -- see
+             * force_shadow.c's own comment on this same line. */
+            draw_text_c(i*tw + tw/2, tabbar_y + TABBAR_H/2 - 4, tabs[i], 2,
+                        i == active_tab ? BTN_TEXT : TD3_CHROME_INK);
+            continue;
+        }
+        if (i == active_tab) {
+            fill_rect(i*tw, tabbar_y, tw, 3, ACCENT);
+            fill_rect(i*tw, tabbar_y, tw, TABBAR_H, TAB_ON_BG);
+        }
+        draw_text_c(i*tw + tw/2, tabbar_y + TABBAR_H/2 - 6,
+                    tabs[i], 2, i == active_tab ? INK : INK_FAINT);
+    }
+}
+
+/* ---- minimal shadow_page.conf parser: frame/button/readout/knob/enum_h/toggle/list only ---- */
+#define MAX_TABS 8
+#define MAX_LINES_PER_TAB 64
+
+typedef struct { char tab[24]; char line[512]; } conf_line_t;
+
+static conf_line_t g_lines[MAX_TABS][MAX_LINES_PER_TAB];
+static int g_line_count[MAX_TABS] = {0};
+static char g_tab_names[MAX_TABS][24];
+static int g_ntabs = 0;
+static char g_display_name[64] = "SHADOW PAGE";
+
+/* pulls a quoted "..." value or a bare token after `key=` */
+static int kv_str(const char *line, const char *key, char *out, size_t outlen) {
+    char pat[32]; snprintf(pat, sizeof(pat), "%s=", key);
+    const char *p = strstr(line, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    if (*p == '"') {
+        p++;
+        const char *end = strchr(p, '"');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n >= outlen) n = outlen - 1;
+        memcpy(out, p, n); out[n] = 0;
+    } else {
+        size_t n = 0;
+        while (p[n] && p[n] != ' ' && p[n] != '\n') n++;
+        if (n >= outlen) n = outlen - 1;
+        memcpy(out, p, n); out[n] = 0;
+    }
+    return 1;
+}
+static int kv_int(const char *line, const char *key, int def) {
+    char buf[32];
+    if (!kv_str(line, key, buf, sizeof(buf))) return def;
+    return atoi(buf);
+}
+static float kv_float(const char *line, const char *key, float def) {
+    char buf[32];
+    if (!kv_str(line, key, buf, sizeof(buf))) return def;
+    return (float)atof(buf);
+}
+
+static void load_conf(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    char line[1024];
+    int cur_tab = -1;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *s = line; while (*s == ' ' || *s == '\t') s++;
+        if (!*s || *s == '#') continue;
+        if (!strncmp(s, "display_name=", 13)) { kv_str(s, "display_name", g_display_name, sizeof(g_display_name)); continue; }
+        if (!strncmp(s, "style=", 6)) { G_TD3 = !strcmp(s + 6, "td3"); continue; }
+        if (!strncmp(s, "theme_", 6)) {
+            /* theme_<name>=RRGGBB (no '#') -- mirrors force_shadow.c's own
+             * theme_ parsing (parse_shadow_page_conf()) field-for-field. */
+            char key[32] = {0}, val[16] = {0};
+            const char *eq = strchr(s, '=');
+            if (eq) {
+                size_t klen = (size_t)(eq - (s + 6));
+                if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+                memcpy(key, s + 6, klen); key[klen] = 0;
+                snprintf(val, sizeof(val), "%s", eq + 1);
+                uint32_t c = (uint32_t)strtoul(val, NULL, 16);
+                if      (!strcmp(key, "bg"))          PLATE = c;
+                else if (!strcmp(key, "panel"))       PLATE_HI = c;
+                else if (!strcmp(key, "line"))        PLATE_LINE = c;
+                else if (!strcmp(key, "ink"))         INK = c;
+                else if (!strcmp(key, "ink_dim"))     INK_DIM = c;
+                else if (!strcmp(key, "ink_faint"))   INK_FAINT = c;
+                else if (!strcmp(key, "accent"))      ACCENT = c;
+                else if (!strcmp(key, "accent_hi"))   ACCENT_HI = c;
+                else if (!strcmp(key, "knob_face"))   KNOB_FACE = c;
+                else if (!strcmp(key, "knob_ring"))   KNOB_RING = c;
+                else if (!strcmp(key, "bar"))         BAR_BG = c;
+                else if (!strcmp(key, "btn_text"))    BTN_TEXT = c;
+                else if (!strcmp(key, "tab_on"))      TAB_ON_BG = c;
+                else if (!strcmp(key, "lcd"))         LCD_BG = c;
+                else if (!strcmp(key, "seg_active"))  SEG_ACTIVE = c;
+                else if (!strcmp(key, "seg_inactive")) SEG_INACTIVE = c;
+                else if (!strcmp(key, "seg_active_tx")) SEG_ACTIVE_TX = c;
+                else if (!strcmp(key, "box"))         TD3_BOX = c;
+                else if (!strcmp(key, "btn_bg"))      TD3_BTN_BG = c;
+                else if (!strcmp(key, "chrome_ink"))  TD3_CHROME_INK = c;
+                else if (!strcmp(key, "go_on"))       TD3_GO_ON = c;
+                else if (!strcmp(key, "go_off"))      TD3_GO_OFF = c;
+                else if (!strcmp(key, "tabs"))        TD3_TABS_BG = c;
+                else if (!strcmp(key, "knob_dot"))    KNOB_DOT_COLOR = c;
+                /* well/knob_off not used by any widget kind our own page
+                 * needs yet -- add when a page that does comes along. */
+            }
+            continue;
+        }
+        if (s[0] == '[') {
+            char name[24] = {0};
+            sscanf(s, "[tab %23[^]]]", name);
+            /* strip trailing space before ] if any (sscanf %[^]] keeps it) */
+            size_t n = strlen(name); while (n > 0 && name[n-1] == ' ') name[--n] = 0;
+            if (g_ntabs < MAX_TABS) {
+                snprintf(g_tab_names[g_ntabs], sizeof(g_tab_names[0]), "%s", name);
+                cur_tab = g_ntabs;
+                g_ntabs++;
+            }
+            continue;
+        }
+        if (cur_tab < 0) continue; /* top-level keys we don't care about for preview */
+        if (g_line_count[cur_tab] < MAX_LINES_PER_TAB) {
+            snprintf(g_lines[cur_tab][g_line_count[cur_tab]].line,
+                     sizeof(g_lines[0][0].line), "%s", s);
+            g_line_count[cur_tab]++;
+        }
+    }
+    fclose(f);
+}
+
+static void render_tab(int tab_idx) {
+    const char *tab_ptrs[MAX_TABS];
+    for (int i = 0; i < g_ntabs; i++) tab_ptrs[i] = g_tab_names[i];
+    draw_chrome_named(g_display_name, tab_ptrs, g_ntabs, tab_idx, 1);
+    for (int i = 0; i < g_line_count[tab_idx]; i++) {
+        const char *ln = g_lines[tab_idx][i].line;
+        char kind[16] = {0};
+        sscanf(ln, "%15s", kind);
+
+        if (!strcmp(kind, "frame")) {
+            int x = kv_int(ln, "x", 0), y = kv_int(ln, "y", 0);
+            int w = kv_int(ln, "w", 100), h = kv_int(ln, "h", 100);
+            char title[64] = {0}; kv_str(ln, "title", title, sizeof(title));
+            frame_box(x, y, w, h, title);
+
+        } else if (!strcmp(kind, "button")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            char colstr[16] = {0}; kv_str(ln, "color", colstr, sizeof(colstr));
+            uint32_t color = colstr[0] ? (uint32_t)strtoul(colstr, NULL, 16) : 0;
+            widget_button(cx, cy, label, color);
+
+        } else if (!strcmp(kind, "toggle")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            int on = kv_int(ln, "on", 0);
+            widget_toggle(cx, cy, label, on);
+
+        } else if (!strcmp(kind, "knob")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0), r = kv_int(ln, "r", 40);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            int pct = kv_int(ln, "pct", 50);
+            float min = kv_float(ln, "min", 0), max = kv_float(ln, "max", 100);
+            float val = min + (max - min) * pct / 100.0f;
+            char valbuf[24]; snprintf(valbuf, sizeof(valbuf), "%.2f", val);
+            widget_knob(cx, cy, r, pct, label, valbuf);
+
+        } else if (!strcmp(kind, "enum_h")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            char optstr[128] = {0}; kv_str(ln, "options", optstr, sizeof(optstr));
+            int active = kv_int(ln, "active", 0);
+            const char *opts[8]; int n = 0;
+            char *tok = strtok(optstr, ",");
+            while (tok && n < 8) { opts[n++] = tok; tok = strtok(NULL, ","); }
+            int sw = kv_int(ln, "sw", 0);   /* 0 = widget_enum_h's own 117px default */
+            widget_enum_h(cx, cy, label, opts, n, active, sw);
+
+        } else if (!strcmp(kind, "readout")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0);
+            int w = kv_int(ln, "w", 200), h = kv_int(ln, "h", 44);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            char get[64] = {0}; kv_str(ln, "get", get, sizeof(get));
+            /* stand-in sample values, since no live engine is running.
+             * force-webstream's *_shadow GET keys run real values through
+             * shadow_font_safe() (upper-case, font_chars-only) before the
+             * device ever sees them, so these samples are pre-sanitized
+             * the same way for a faithful preview -- see that project's
+             * addon/shadow_page.conf and src/webstream_host.cpp. */
+            const char *sample = "STREAMING";
+            if (!strcmp(get, "playback_time")) sample = "2:47";
+            /* Real values (yt_stream_plugin.c's set_search_status() calls):
+             * "searching"/"idle"/"done"/"no_results"/"error"/"queued" --
+             * always one word, never a result count appended (that's the
+             * separate search_count field, see search_results_*_json). */
+            else if (!strcmp(get, "search_status_shadow") || !strcmp(get, "search_status")) sample = "DONE";
+            else if (!strcmp(get, "stream_status_shadow") || !strcmp(get, "stream_status")) sample = "STREAMING";
+            else if (!strcmp(get, "cratedig_decade_text")) sample = "1990S";
+            widget_readout(cx, cy, w, h, label, sample);
+
+        } else if (!strcmp(kind, "stepper")) {
+            int cx = kv_int(ln, "cx", 0), cy = kv_int(ln, "cy", 0);
+            int w = kv_int(ln, "w", 300), h = kv_int(ln, "h", 56);
+            char label[64] = {0}; kv_str(ln, "label", label, sizeof(label));
+            char get[64] = {0}; kv_str(ln, "get", get, sizeof(get));
+            const char *sample = "ANY";
+            if (!strcmp(get, "cratedig_genre_text")) sample = "ELECTRONIC";
+            else if (!strcmp(get, "cratedig_style_text")) sample = "ACID HOUSE";
+            else if (!strcmp(get, "cratedig_decade_text")) sample = "1990S";
+            else if (!strcmp(get, "cratedig_region_text")) sample = "EUROPE";
+            else if (!strcmp(get, "cratedig_country_text")) sample = "GERMANY";
+            widget_stepper(cx, cy, w, h, label, sample);
+
+        } else if (!strcmp(kind, "list")) {
+            int x = kv_int(ln, "x", 0), y = kv_int(ln, "y", 0);
+            int w = kv_int(ln, "w", 400), h = kv_int(ln, "h", 300);
+            int cols = kv_int(ln, "cols", 1), rows = kv_int(ln, "rows", 4);
+            int th = kv_int(ln, "th", 56), gap = kv_int(ln, "gap", 4);
+            int numbered = kv_int(ln, "numbered", 0);
+            /* Pre-sanitized the same way shadow_font_safe() would leave
+             * them (upper-case, only font_chars' set survives) -- these
+             * are what search_results_shadow_json actually sends, not
+             * the natural-case titles search_results_json sends the web
+             * GUI. No provider prefix (cratedigger_host.cpp's own build_
+             * search_results_json_locked() dropped that once this addon
+             * became crate-dig-only -- every result resolves via YouTube
+             * internally regardless, so it was never informative); the
+             * Discogs release year takes that slot instead. See that
+             * function's own comment. */
+            static const char *result_items[8] = {
+                "APHEX TWIN - XTAL OFFICIAL VIDEO 1993",
+                "BOARDS OF CANADA - ROYGBIV 1995",
+                "BURIAL - ARCHANGEL 2007",
+                "VARIOUS - WARP10+3 WARP RECORDS 1999",
+                "AUTECHRE - GANTZ GRAF 2002",
+                "LIVE AT THE BLUE NOTE 1987",
+            };
+            widget_list(x, y, w, h, result_items, 6, 2, cols, rows, th, gap, numbered);
+        }
+    }
+}
+
+/* ---- PPM output ---- */
+static void write_ppm(const char *path) {
+    FILE *f = fopen(path, "wb");
+    fprintf(f, "P6\n%d %d\n255\n", LAND_W, LAND_H);
+    fwrite(canvas, 1, sizeof(canvas), f);
+    fclose(f);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <shadow_page.conf> <out-dir>\n", argv[0]);
+        return 2;
+    }
+    load_conf(argv[1]);
+    const char *out_dir = argv[2];
+    fprintf(stderr, "loaded %d tab(s): ", g_ntabs);
+    for (int i = 0; i < g_ntabs; i++) fprintf(stderr, "[%s] ", g_tab_names[i]);
+    fprintf(stderr, "\n");
+    for (int i = 0; i < g_ntabs; i++) {
+        render_tab(i);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/tab_%d.ppm", out_dir, i);
+        write_ppm(path);
+        fprintf(stderr, "wrote %s (tab %d: %s)\n", path, i, g_tab_names[i]);
+    }
+    return 0;
+}

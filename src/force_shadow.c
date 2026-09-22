@@ -615,6 +615,15 @@ typedef struct {
     /* style=td3 (Acid): light chassis, charcoal boxes, red buttons, pill engine button */
     int td3;
     uint32_t box, btn_bg, chrome_ink, go_on, go_off, tabs_bg;
+    /* Knob pointer dot - independent of `accent` (which also colors
+     * frame titles/readout text/etc.) so a page can pick one accent for
+     * "interactive highlight" widgets (knob dot, engine on/off, active
+     * tab, selected segment - the last two via tab_on_bg/seg_active,
+     * the button case via a per-widget `color=` instead) without
+     * recoloring its body text too. Defaults to the same value `accent`
+     * always defaulted to, so an existing page that never sets
+     * theme_knob_dot renders identically to before this field existed. */
+    uint32_t knob_dot;
 } ui_theme_t;
 
 static const ui_theme_t THEME_DEFAULT = {
@@ -622,7 +631,12 @@ static const ui_theme_t THEME_DEFAULT = {
     0xFFC1552Fu, 0xFFE2793Fu, 0xFFEFE9D8u, 0xFF2A2823u, 0xFF0D0C0Au,
     0xFFF2F1EEu, 0xFF050403u, 0xFF1C1A17u, 0xFFFDF3EAu,
     0xFF050403u, 0xFF4C473Du, 0xFF1A120Du, 0xFF050403u,
-    0
+    0,
+    /* Remaining fields (plain_frames..tabs_bg) stay implicit-zero, same
+     * as before this field existed; .knob_dot is a designated
+     * initializer specifically so it lands on the right field regardless
+     * of how many implicit-zero fields sit between lcd and it. */
+    .knob_dot = 0xFFC1552Fu
 };
 static ui_theme_t th;  /* active theme; render_shadow_page() sets it per addon */
 
@@ -861,6 +875,7 @@ static void dot_cell_fit(uint32_t *map, uint32_t stride_px, int32_t x, int32_t y
 #define UI_ACCENT_HI  (th.accent_hi)
 #define KNOB_FACE     (th.knob_face)
 #define KNOB_RING     (th.knob_ring)
+#define UI_KNOB_DOT   (th.knob_dot)
 #define BAR_BG        (th.bar_bg)
 #define SEG_ACTIVE    (th.seg_active)
 #define SEG_INACTIVE  (th.seg_inactive)
@@ -917,6 +932,17 @@ typedef struct {
      * addon_table[] slot number into SHADOW_PAGE_FILE instead of sending
      * a ctrl_sock SET (0 = ordinary button; see build_launcher_tab()). */
     int goto_addon;
+    /* button only: optional per-widget fill color override (`color=` in
+     * the .conf, RRGGBB no '#') so one button can stand out from the
+     * page's th.btn_bg default (e.g. a search/confirm action among
+     * several same-colored transport buttons) without a second theme. */
+    uint32_t btn_color;
+    int has_btn_color;
+    /* button only: >0 = draw at this exact width instead of sizing to
+     * the label (0 = auto, unchanged default) -- lets a caller building
+     * several buttons at once (build_launcher_tab()) give them all a
+     * uniform size regardless of label length. */
+    int32_t btn_w;
     /* list only: geometry + which list_stores[] slot holds its data */
     int list_id, cols, rows, tile_h, gap, jump, colmajor;
     float tscale;             /* list tile text scale */
@@ -1261,6 +1287,12 @@ static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *ti
 #define LAUNCHER_ROWS 4
 #define LAUNCHER_PER_TAB (LAUNCHER_COLS * LAUNCHER_ROWS)
 
+/* Forward-declared: real definition lives with send_engine_toggle()
+ * much further down, but build_launcher_tab() below (used from
+ * parse_shadow_page_conf(), earlier still) needs it to color-code each
+ * button by whether that add-on's own engine is currently running. */
+static int is_process_running(const char *name);
+
 static void write_shadow_page_file(int slot) {
     FILE *f = fopen(SHADOW_PAGE_FILE, "w");
     if (!f) return;
@@ -1268,9 +1300,14 @@ static void write_shadow_page_file(int slot) {
     fclose(f);
 }
 
-static int add_goto_button(int32_t cx, int32_t cy, const char *label, int target_slot) {
+static int add_goto_button(int32_t cx, int32_t cy, const char *label, int target_slot,
+                            int32_t btn_w, uint32_t color) {
     int bi = add_button(cx, cy, label, "");
     page_widgets[bi].goto_addon = target_slot;
+    page_widgets[bi].btn_w = btn_w;
+    page_widgets[bi].hit_hw = btn_w / 2;
+    page_widgets[bi].has_btn_color = 1;
+    page_widgets[bi].btn_color = color;
     return bi;
 }
 
@@ -1279,14 +1316,29 @@ static void build_launcher_tab(int tab) {
     n_page_frames = 0;
 
     int own_slot = active_addon;
+    addon_descriptor_t *self = &addon_table[own_slot];
+    int32_t x0 = 120, x1 = LAND_W - 120;
+    int32_t colw = (x1 - x0) / LAUNCHER_COLS;
+
     int targets[NUM_ADDON_SLOTS];
     int n_targets = 0;
+    int32_t max_label_w = 0;
     for (int s = ADDON_NONE + 1; s < NUM_ADDON_SLOTS; s++) {
         if (s == own_slot || addon_table[s].build_tab == NULL ||
             addon_table[s].build_tab == build_launcher_tab)
             continue;
         targets[n_targets++] = s;
+        const char *label = addon_table[s].display_name[0] ? addon_table[s].display_name : "ADD-ON";
+        int32_t w = text_width_land(label, 1.5f) + 36 + 24; /* matches W_BUTTON's own td3 sizing */
+        if (w > max_label_w) max_label_w = w;
     }
+    /* One uniform width for every button on this page, computed from the
+     * longest label among *all* of them (not just this tab's slice) so
+     * it stays the same size across a tab switch -- capped so it can
+     * never exceed a grid cell regardless of how long a future add-on's
+     * display_name is. */
+    int32_t btn_w = max_label_w;
+    if (btn_w > colw - 40) btn_w = colw - 40;
 
     /* num_tabs/tab_names are normally fixed at parse time; the launcher
      * recomputes its own each time it's opened instead, since its
@@ -1295,7 +1347,6 @@ static void build_launcher_tab(int tab) {
     int n_tabs = (n_targets + LAUNCHER_PER_TAB - 1) / LAUNCHER_PER_TAB;
     if (n_tabs < 1) n_tabs = 1;
     if (n_tabs > MAX_TABS) n_tabs = MAX_TABS; /* extra add-ons past this many simply don't fit -- raise LAUNCHER_COLS/ROWS or MAX_TABS if it's ever hit */
-    addon_descriptor_t *self = &addon_table[own_slot];
     self->num_tabs = n_tabs;
     for (int t = 0; t < n_tabs; t++) {
         if (n_tabs == 1) strncpy(self->tab_names[t], "ADD-ONS", sizeof(self->tab_names[t]) - 1);
@@ -1311,9 +1362,7 @@ static void build_launcher_tab(int tab) {
         return;
     }
 
-    int32_t x0 = 120, x1 = LAND_W - 120;
     int32_t y0 = 170, y1 = LAND_H - TABBAR_H - 60;
-    int32_t colw = (x1 - x0) / LAUNCHER_COLS;
     int32_t rowh = (y1 - y0) / LAUNCHER_ROWS;
 
     int start = tab * LAUNCHER_PER_TAB;
@@ -1326,8 +1375,17 @@ static void build_launcher_tab(int tab) {
         int32_t cx = x0 + colw * col + colw / 2;
         int32_t cy = y0 + rowh * row + rowh / 2;
         int slot = targets[i];
-        const char *label = addon_table[slot].display_name[0] ? addon_table[slot].display_name : "ADD-ON";
-        add_goto_button(cx, cy, label, slot);
+        const addon_descriptor_t *tgt = &addon_table[slot];
+        const char *label = tgt->display_name[0] ? tgt->display_name : "ADD-ON";
+        /* Engine running state, not this addon's own theme (it may not
+         * even have one drawn yet) -- red/green against the launcher's
+         * own go_off/go_on colors, same pair its "ENGINE ON/OFF" pill
+         * would use on that addon's own page. An addon with no engine
+         * at all (engine_process_name empty) reads as "off": there's
+         * nothing to turn on. */
+        int running = tgt->engine_process_name[0] && is_process_running(tgt->engine_process_name);
+        uint32_t color = running ? self->theme.go_on : self->theme.go_off;
+        add_goto_button(cx, cy, label, slot, btn_w, color);
     }
 }
 
@@ -1616,6 +1674,7 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 else if (!strcmp(n, "go_on"))       t->go_on = c;
                 else if (!strcmp(n, "go_off"))      t->go_off = c;
                 else if (!strcmp(n, "tabs"))        t->tabs_bg = c;
+                else if (!strcmp(n, "knob_dot"))    t->knob_dot = c;
                 else if (!strcmp(n, "display_bg"))    t->dsp_bg = c;
                 else if (!strcmp(n, "display_cell"))  t->dsp_cell = c;
                 else if (!strcmp(n, "display_ink"))   t->dsp_ink = c;
@@ -1660,6 +1719,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
         } else if (strcmp(type, "button") == 0) {
             int bi = add_button(cx, cy, label, key);
             strncpy(page_widgets[bi].text, shadow_page_kv_get(kv, nkv, "val"), sizeof(page_widgets[bi].text) - 1);
+            const char *col = shadow_page_kv_get(kv, nkv, "color");
+            if (col[0]) {
+                page_widgets[bi].btn_color = 0xFF000000u | (uint32_t)strtoul(col, NULL, 16);
+                page_widgets[bi].has_btn_color = 1;
+            }
         } else if (strcmp(type, "readout") == 0) {
             int ri = add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label,
@@ -2222,7 +2286,7 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         int32_t dot_dist = (w->radius * 72) / 100;
         int32_t dx = w->cx + (int32_t)(dot_dist * sin_deg(angle_deg));
         int32_t dy = w->cy - (int32_t)(dot_dist * cos_deg(angle_deg));
-        fill_circle_land(map, stride_px, dx, dy, w->radius/7 + 2, UI_ACCENT);
+        fill_circle_land(map, stride_px, dx, dy, w->radius/7 + 2, UI_KNOB_DOT);
         float real = w->pmin + (w->pmax - w->pmin) * (w->state / 100.0f);
         snprintf(valbuf, sizeof(valbuf), "%.0f", real);
         /* Label/value text at the full 1.5x the user asked for (2026-09-19:
@@ -2246,15 +2310,22 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
         break;
     }
     case W_BUTTON: {
-        int32_t bw = text_width_land(w->label, 1.5f) + 36, bh = 39;
+        int32_t bw, bh;
+        if (w->btn_w > 0) {
+            bw = w->btn_w; bh = th.td3 ? 48 : 39;
+        } else {
+            bw = text_width_land(w->label, 1.5f) + 36; bh = 39;
+            if (th.td3) bw += 24;
+        }
+        uint32_t bg = w->has_btn_color ? w->btn_color : (th.td3 ? th.btn_bg : UI_ACCENT);
         if (th.td3) {
-            bw += 24; bh = 48;
+            bh = 48;
             fill_rr_land(map, stride_px, w->cx - bw/2 - 2, w->cy - bh/2 - 2, bw + 4, bh + 4, 10, PLATE_LINE);
-            fill_rr_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, 8, th.btn_bg);
+            fill_rr_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, 8, bg);
             draw_text_land_c(map, stride_px, w->cx, w->cy - 7, w->label, 1.5f, BTN_TEXT);
             break;
         }
-        fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, UI_ACCENT);
+        fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, bg);
         draw_text_land_c(map, stride_px, w->cx, w->cy - 5, w->label, 1.5f, BTN_TEXT);
         break;
     }
@@ -2298,6 +2369,19 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
 #define ENGINE_BTN_X (LAND_W - ENGINE_BTN_W - 20)
 #define ENGINE_BTN_Y 16
 
+/* Launcher-only "KILL ALL ENGINES" panic button (2026-09-22), drawn in
+ * the tab bar's own right edge rather than as a page_widgets[] entry --
+ * like ENGINE_BTN above, it must stay put across every tab of the
+ * launcher, not get rebuilt/repositioned by build_launcher_tab()'s own
+ * per-tab widget list. Sized to comfortably fit a single tab's centered
+ * label (short "ADD-ONS"/"ADD-ONS N" names) without overlap; a launcher
+ * with enough add-ons to need several tabs is an untested edge case
+ * this button's placement doesn't specifically account for. */
+#define KILLALL_BTN_W 280
+#define KILLALL_BTN_H 40
+#define KILLALL_BTN_X (LAND_W - KILLALL_BTN_W - 20)
+#define KILLALL_BTN_Y (LAND_H - TABBAR_H + (TABBAR_H - KILLALL_BTN_H) / 2)
+
 static void render_shadow_page(uint32_t *map, uint32_t stride_px,
                                 const ui_widget_t *widgets, int n_widgets,
                                 const ui_frame_t *frames, int n_frames,
@@ -2331,8 +2415,20 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         draw_text_land(map, stride_px, 48, 24, title, 2.5f, UI_ACCENT_HI);
         fill_rect_land(map, stride_px, 0, TOPBAR_H - 2, LAND_W, 2, UI_ACCENT);
     } else if (th.td3) {
-        snprintf(title, sizeof(title), "%s", ad->display_name);
-        draw_text_land(map, stride_px, 40, 20, title, 3, th.chrome_ink);
+        if (ad->launcher) {
+            /* Special-cased two-tone title (2026-09-22, by request) --
+             * every other td3 page just shows its own display_name in
+             * one color; the launcher isn't "about" one add-on, so it
+             * gets its own fixed brand mark instead: "FORCE SHADOW" in
+             * ink_dim (grey), "LAUNCHER" in chrome_ink (black), the same
+             * two theme colors any td3 page already carries. */
+            draw_text_land(map, stride_px, 40, 20, "FORCE SHADOW ", 3, th.ink_dim);
+            draw_text_land(map, stride_px, 40 + text_width_land("FORCE SHADOW ", 3), 20,
+                            "LAUNCHER", 3, th.chrome_ink);
+        } else {
+            snprintf(title, sizeof(title), "%s", ad->display_name);
+            draw_text_land(map, stride_px, 40, 20, title, 3, th.chrome_ink);
+        }
     } else {
         snprintf(title, sizeof(title), "FORCE SHADOW - %s", ad->display_name);
         draw_text_land(map, stride_px, 40, 28, title, 2, UI_INK);
@@ -2382,8 +2478,18 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         int32_t tw = LAND_W / ad->num_tabs;
         for (int i = 0; i < ad->num_tabs; i++) {
             if (i == page) fill_rr_land(map, stride_px, i*tw + 10, tabbar_y + 10, tw - 20, TABBAR_H - 14, 8, th.tab_on_bg);
+            /* Active tab's text was UI_ACCENT (the page's general text/
+             * highlight color) until a page set theme_tab_on to the same
+             * saturated color as theme_accent's own "interactive
+             * highlight" reuse (e.g. force-cratedigger's navy) - at that
+             * point accent-on-tab_on stopped being a text/background pair
+             * at all and just became low-contrast text on a same-toned
+             * pill. BTN_TEXT (already the "light text for a filled/
+             * highlighted widget" token used by buttons and list/enum
+             * selection) is the correct pairing for tab_on_bg specifically,
+             * regardless of what accent happens to be. */
             draw_text_land_c(map, stride_px, i*tw + tw/2, tabbar_y + TABBAR_H/2 - 4, ad->tab_names[i], 2,
-                              i == page ? UI_ACCENT : th.chrome_ink);
+                              i == page ? BTN_TEXT : th.chrome_ink);
         }
     } else if (ad->num_tabs > 0) {
         int32_t tw = LAND_W / ad->num_tabs;
@@ -2397,6 +2503,14 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
                               i == page ? (th.lcd ? UI_ACCENT_HI : UI_INK) : UI_INK_FAINT);
             if (th.lcd && i > 0) fill_rect_land(map, stride_px, i*tw, tabbar_y + 10, 1, TABBAR_H - 20, PLATE_LINE);
         }
+    }
+
+    if (ad->launcher) {
+        fill_rr_land(map, stride_px, KILLALL_BTN_X - 2, KILLALL_BTN_Y - 2,
+                      KILLALL_BTN_W + 4, KILLALL_BTN_H + 4, 10, PLATE_LINE);
+        fill_rr_land(map, stride_px, KILLALL_BTN_X, KILLALL_BTN_Y, KILLALL_BTN_W, KILLALL_BTN_H, 8, th.go_off);
+        draw_text_land_c(map, stride_px, KILLALL_BTN_X + KILLALL_BTN_W/2, KILLALL_BTN_Y + KILLALL_BTN_H/2 - 6,
+                          "KILL ALL ENGINES", 1.5f, BTN_TEXT);
     }
 }
 
@@ -3075,6 +3189,26 @@ static void send_engine_toggle(int addon_id, int want_running) {
     close(fd);
 }
 
+/* Launcher-only "KILL ALL ENGINES" panic button (2026-09-22): stops
+ * every currently-running engine across every addon_table[] slot, not
+ * just whichever add-ons this tab of the launcher happens to be
+ * showing -- one send_engine_toggle(i, 0) per addon that actually has
+ * an engine configured and is currently running, skipping the rest
+ * (nothing to stop). Same fire-and-forget semantics as a single engine
+ * toggle; worst case here is N sequential bounded (50ms-timeout) socket
+ * calls instead of one, still bounded and still off the touch thread's
+ * lock (see the deferred kill_all_requested flag in
+ * update_touch_state()). */
+static void send_kill_all_engines(void) {
+    for (int i = ADDON_NONE + 1; i < NUM_ADDON_SLOTS; i++) {
+        const addon_descriptor_t *ad = &addon_table[i];
+        if (ad->engine_process_name[0] && ad->engine_nsmodule_path[0] &&
+            is_process_running(ad->engine_process_name)) {
+            send_engine_toggle(i, 0);
+        }
+    }
+}
+
 /* Dispatches by widget kind: knob sends its scaled real-world numeric
  * value (throttled during a drag, forced on release -- same reasoning
  * as the original single-page build); toggle sends "on"/"off"; enum
@@ -3260,6 +3394,10 @@ static void update_touch_state(const struct input_event *ev) {
      * tmpfs file write is fast, but this thread's own rule (see comment
      * above) is to do it outside touch_mu regardless. */
     int launcher_goto_slot = -1;
+    /* Launcher "KILL ALL ENGINES" tap: deferred for the same reason --
+     * send_kill_all_engines() makes one bounded socket call per running
+     * engine, real I/O that has no business happening under touch_mu. */
+    int kill_all_requested = 0;
 
     pthread_mutex_lock(&touch_mu);
     if (ev->type == EV_ABS && (ev->code == ABS_MT_POSITION_X || ev->code == ABS_X)) {
@@ -3299,6 +3437,14 @@ static void update_touch_state(const struct input_event *ev) {
             shadow_redraw_needed = 1;
             engine_toggle_addon = active_addon;
             engine_toggle_want = engine_on;
+        } else if (ad_active->launcher &&
+                   lpx >= KILLALL_BTN_X && lpx <= KILLALL_BTN_X + KILLALL_BTN_W &&
+                   lpy >= KILLALL_BTN_Y && lpy <= KILLALL_BTN_Y + KILLALL_BTN_H) {
+            /* Checked before the generic tab-bar-tap branch below since
+             * this button lives inside the tab bar's own y-range --
+             * otherwise a tap here would be consumed as a (usually
+             * no-op, single-tab) tab switch instead. */
+            kill_all_requested = 1;
         } else if (lpy >= tabbar_y && num_tabs > 0) {
             int32_t tw = LAND_W / num_tabs;
             int new_page = lpx / tw;
@@ -3503,6 +3649,9 @@ static void update_touch_state(const struct input_event *ev) {
     }
     if (launcher_goto_slot > 0) {
         write_shadow_page_file(launcher_goto_slot);
+    }
+    if (kill_all_requested) {
+        send_kill_all_engines();
     }
 }
 

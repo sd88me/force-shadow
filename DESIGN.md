@@ -159,9 +159,33 @@ the new add-on's first tab and resets tab position to the first tab.
   acceptable trade for not spending one of the seven scarce combo slots
   on it: such an add-on ships `page=8` or higher (never bound to any
   combo in `bind_midiloop.sh`) and appears on the launcher automatically
-  — no launcher-side config to hand-maintain. See
+  — no launcher-side config to hand-maintain. On this project's own
+  device the launcher itself is bound to `SHIFT+SCENE-7`, not
+  `KNOBS+SCENE-7` (2026-09-22): that slot's `KNOBS` combo was already a
+  real, pre-existing, unrelated RiffMaker4T engine start/stop shortcut,
+  so the two were swapped by hand on the live `midiloop.config` rather
+  than displacing it. See
   [docs/adding-a-page.md](docs/adding-a-page.md)'s "Add-on launcher
   (tool add-ons)" section.
+  - **Button styling (2026-09-22):** every launcher button is drawn at
+    one uniform width -- the longest `display_name` among every add-on
+    currently listed (across all of the launcher's own tabs, not just
+    the one on screen, so the size doesn't jump on a tab switch),
+    capped so it can never exceed a grid cell. Each button's fill color
+    reflects that add-on's own engine state (`th.go_on`/`th.go_off` --
+    the same red/green pair its own page's ENGINE ON/OFF pill uses),
+    checked fresh via `is_process_running()` every time the launcher
+    page opens or its tab changes; an add-on with no `engine_process_name`
+    at all reads as "off" (nothing to turn on). The top bar shows a
+    fixed two-tone "FORCE SHADOW LAUNCHER" mark (grey + black) instead
+    of a `display_name`, since the launcher isn't "about" any one
+    add-on. A **KILL ALL ENGINES** button lives in the tab bar's own
+    right edge (drawn/hit-tested in chrome, like the per-page
+    `ENGINE_BTN`, not as a `page_widgets[]` entry, so it survives a tab
+    switch) and calls `send_kill_all_engines()`, which walks every
+    `addon_table[]` slot and stops whichever engines are actually
+    running -- not just the ones the launcher's current tab happens to
+    show.
 
 ## Rendering engine
 

@@ -1,11 +1,11 @@
 #!/bin/sh
 ############################################################
-# force-shadow: bind KNOBS+SCENE-1..7 to show/hide each addon's
-# shadow-mode page (matching PAGE_NAMES[]/SHADOW_PAGE_FILE in
-# src/force_shadow.c: page 1=DX7, 2=JV-880, 3=Maze Voice (the only page
-# actually built today), 4=Maze Sequencer, 5=Acid Sequencer,
+# force-shadow: bind KNOBS+SCENE-1..6 and SHIFT+SCENE-7 to show/hide
+# each addon's shadow-mode page (matching PAGE_NAMES[]/SHADOW_PAGE_FILE
+# in src/force_shadow.c: page 1=DX7, 2=JV-880, 3=Maze Voice (the only
+# page actually built today), 4=Maze Sequencer, 5=Acid Sequencer,
 # 6=Euclidier, 7=Add-on Launcher -- pressing the same combo again hides
-# it, a different KNOBS+SCENE-M switches directly).
+# it, a different slot's combo switches directly).
 #
 # Slot 7 (2026-09-21) is force-shadow's own add-on launcher page
 # (addon/shadow_page.conf, launcher=1) rather than a per-add-on page --
@@ -13,10 +13,22 @@
 # built, so no real add-on lost its combo. Any *future* add-on that
 # would rather not spend one of these seven scarce combos on itself
 # (used rarely enough that a couple of extra taps through the launcher
-# is fine) should ship its own
-# shadow_page.conf with page=8 or higher instead -- never bound to a
-# combo here, reachable only via the launcher. See
-# docs/adding-a-page.md's "Add-on launcher (tool add-ons)" section.
+# is fine) should ship its own shadow_page.conf with page=8 or higher
+# instead -- never bound to a combo here, reachable only via the
+# launcher. See docs/adding-a-page.md's "Add-on launcher (tool
+# add-ons)" section.
+#
+# Slot 7 uses SHIFT+SCENE-7, not KNOBS+SCENE-7 like slots 1-6
+# (2026-09-22, by request) -- matching this modifier for consistency
+# with how the launcher is meant to feel like "just another add-on
+# page" combo, not a special case. On the device this script was
+# actually developed against, SHIFT+SCENE-7 was already bound to a
+# pre-existing, unrelated RiffMaker4T engine start/stop shortcut
+# (SCRIPT-4, no #force-shadow: marker) -- that's a real, working
+# binding this script's own safety checks correctly refuse to disturb
+# automatically (see below); resolving that conflict (by hand, moving
+# RiffMaker4T's own toggle to the now-free KNOBS+SCENE-7) is a one-time
+# manual step, not something this generic script attempts for you.
 #
 # Run this manually, once, after `manage.sh ENABLE`:
 #   sh bind_midiloop.sh
@@ -33,12 +45,13 @@
 #
 # Idempotent: safe to re-run. Always backs up both files first
 # (timestamped, never overwritten). Refuses and changes nothing if any
-# target KNOBS+SCENE-1..7 slot is already bound to something that isn't
-# one of this script's own previous bindings -- never overwrites a real
-# binding blind. If ALL 7 slots are already force-shadow-bound, this is
-# a clean no-op (prints status, exits 0). A partial state (some bound by
-# us, some not, or some overlapping with something else) is refused
-# rather than guessed at -- check midiloop.config by hand in that case.
+# target combo slot (KNOBS+SCENE-1..6, SHIFT+SCENE-7) is already bound
+# to something that isn't one of this script's own previous bindings --
+# never overwrites a real binding blind. If all 7 slots are already
+# force-shadow-bound, this is a clean no-op (prints status, exits 0). A
+# partial state (some bound by us, some not, or some overlapping with
+# something else) is refused rather than guessed at -- check
+# midiloop.config by hand in that case.
 ############################################################
 
 set -e
@@ -57,29 +70,40 @@ fi
 
 MARKER="#force-shadow:"
 
+# Slot 7 (the launcher) uses SHIFT, slots 1-6 use KNOBS -- see header
+# comment for why slot 7 is the odd one out.
+combo_mod() {
+    case "$1" in
+        7) echo "SHIFT" ;;
+        *) echo "KNOBS" ;;
+    esac
+}
+
 # ── Check current state of the 7 target combo slots ─────────
 bound_by_us=0
 bound_by_other=0
 for i in 1 2 3 4 5 6 7; do
-    line=$(grep -E "^KNOBS\+SCENE-$i[[:space:]]*=" "$CONFIG" || true)
+    mod=$(combo_mod "$i")
+    line=$(grep -E "^$mod\+SCENE-$i[[:space:]]*=" "$CONFIG" || true)
     val=$(echo "$line" | sed -E 's/^[^=]*=[[:space:]]*//')
     case "$val" in
         "-"*) ;;  # unbound, fine
         *"$MARKER"*) bound_by_us=$((bound_by_us + 1)) ;;
-        "") echo "KNOBS+SCENE-$i not found in $CONFIG -- unexpected file format, refusing."; exit 1 ;;
-        *) echo "KNOBS+SCENE-$i is already bound to: $val"; bound_by_other=$((bound_by_other + 1)) ;;
+        "") echo "$mod+SCENE-$i not found in $CONFIG -- unexpected file format, refusing."; exit 1 ;;
+        *) echo "$mod+SCENE-$i is already bound to: $val"; bound_by_other=$((bound_by_other + 1)) ;;
     esac
 done
 
 if [ "$bound_by_other" -gt 0 ]; then
-    echo "Refusing: $bound_by_other of the 7 target slots (KNOBS+SCENE-1..7) are"
-    echo "already bound to something else (listed above). Free them manually in"
-    echo "$CONFIG first, or pick different combos and adapt this script."
+    echo "Refusing: $bound_by_other of the 7 target slots (KNOBS+SCENE-1..6,"
+    echo "SHIFT+SCENE-7) are already bound to something else (listed above)."
+    echo "Free them manually in $CONFIG first, or pick different combos and"
+    echo "adapt this script."
     exit 1
 fi
 
 if [ "$bound_by_us" -eq 7 ]; then
-    echo "All 7 KNOBS+SCENE-1..7 slots are already force-shadow-bound. Nothing to do."
+    echo "All 7 target slots are already force-shadow-bound. Nothing to do."
     exit 0
 fi
 
@@ -128,12 +152,13 @@ for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Eucli
     } >> "$SCRIPTS"
 done
 
-# ── Patch the 7 KNOBS+SCENE-N lines in midiloop.config ────────
+# ── Patch the 7 KNOBS/SHIFT+SCENE-N lines in midiloop.config ──
 i=0
 for name in "DX7" "JV-880" "Maze Voice" "Maze Sequencer" "Acid Sequencer" "Euclidier" "Add-on Launcher"; do
     i=$((i + 1))
     sid=$((start + i - 1))
-    sed -i -E "s|^(KNOBS\+SCENE-$i[[:space:]]*=)[[:space:]]*-.*|\1 SCRIPT-$sid $MARKER $name page|" "$CONFIG"
+    mod=$(combo_mod "$i")
+    sed -i -E "s|^($mod\+SCENE-$i[[:space:]]*=)[[:space:]]*-.*|\1 SCRIPT-$sid $MARKER $name page|" "$CONFIG"
 done
 
 echo ""
@@ -162,7 +187,7 @@ sleep 0.5
 "$mmPath/AddOns/run_midiloop.sh"
 
 echo ""
-echo "Done. KNOBS+SCENE-1..7 now show/hide each addon's shadow-mode page"
-echo "(only page 3, Maze Voice, is actually built today -- the rest are"
-echo "safe no-ops until those pages exist). Press-and-hold KNOBS, tap"
-echo "SCENE-3 while still held, then release, to test."
+echo "Done. KNOBS+SCENE-1..6 and SHIFT+SCENE-7 now show/hide each addon's"
+echo "shadow-mode page (only page 3, Maze Voice, is actually built today --"
+echo "the rest are safe no-ops until those pages exist). Press-and-hold"
+echo "KNOBS, tap SCENE-3 while still held, then release, to test."

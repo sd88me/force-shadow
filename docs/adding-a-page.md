@@ -324,6 +324,24 @@ protocol, the engine on/off button — works exactly the same on a
 launcher-only page as on a combo-bound one; `page=8+` only changes how
 the page is *reached*, not how it's built.
 
+The launcher button it gets is colour-coded automatically from your
+add-on's own `engine_process_name` (red = not running, green =
+running, checked fresh every time the launcher opens) — nothing to set
+in your own `shadow_page.conf` for this; an add-on with no
+`engine_process_name` at all just always shows red. The launcher's own
+top bar reads "FORCE SHADOW LAUNCHER" rather than any one add-on's
+`display_name`, and its tab bar carries a permanent **KILL ALL
+ENGINES** button that stops every currently-running engine across
+every add-on, launcher-listed or combo-bound — a full panic stop, not
+scoped to whatever the launcher happens to be showing.
+
+On force-shadow's own device, the launcher itself is bound to
+`SHIFT+SCENE-7` rather than `KNOBS+SCENE-7` — see `bind_midiloop.sh`'s
+own header comment if you're setting this up somewhere `KNOBS+SCENE-7`
+is already free and would rather use that combo instead; either
+modifier works identically, this project's own choice was just to work
+around a pre-existing binding on that one slot.
+
 ## Engine on/off button
 
 A real button is drawn in the top-right of the top bar whenever
