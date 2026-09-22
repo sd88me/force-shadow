@@ -115,6 +115,16 @@ Repeat `[tab ...]` for each tab, in display order. Values containing a
 space (labels, titles, options lists, a multi-word `display_name`) take
 double quotes; everything else is a bare token.
 
+**Write every piece of text uppercase.** The baked font has no
+lowercase glyphs -- a lowercase letter doesn't fall back to anything,
+it silently renders as blank space while still taking up its full
+width, so `"Kit Builder"` comes out `"K   B"` with three gaps where the
+lowercase letters should be. This applies to `display_name`, every
+widget's `label=`/`title=`, and `enum_h`/`enum_v`'s `options=` list --
+anything your own conf supplies as literal text, rendered as-is. (Text
+your own engine supplies live, e.g. `readout`'s `get=`, is a different
+case: `clean_name()` upper-cases that on the way in.)
+
 ### Optional top-level keys
 
 | Key | Effect |
@@ -333,7 +343,12 @@ top bar reads "FORCE SHADOW LAUNCHER" rather than any one add-on's
 `display_name`, and its tab bar carries a permanent **KILL ALL
 ENGINES** button that stops every currently-running engine across
 every add-on, launcher-listed or combo-bound — a full panic stop, not
-scoped to whatever the launcher happens to be showing.
+scoped to whatever the launcher happens to be showing. The launcher
+also upper-cases your `display_name` for you before drawing its
+button (caught live: a mixed-case one otherwise renders with gaps —
+see the uppercase note above) — this is a launcher-only safety net,
+though — everywhere else in a shadow page, write your own text
+uppercase to begin with.
 
 On force-shadow's own device, the launcher itself is bound to
 `SHIFT+SCENE-7` rather than `KNOBS+SCENE-7` — see `bind_midiloop.sh`'s
@@ -426,6 +441,22 @@ layout logic into `render_preview.c` first (mirroring one of the
 existing page functions), verify it visually, *then* port the verified
 layout into `force_shadow.c` (or your `.conf` file) for real.
 
+**For a `.conf`-driven page (the normal case), `render_conf_preview.c`
+is the faster route** — it parses a real `shadow_page.conf` file
+directly (widgets, `theme_` overrides, `style=td3`, all of it) instead
+of needing your layout hand-ported into C first:
+```
+cd tools
+gcc -O2 -Wall -o render_conf_preview render_conf_preview.c -lm
+mkdir -p /tmp/preview
+./render_conf_preview /path/to/your/shadow_page.conf /tmp/preview
+```
+writes one `tab_<N>.ppm` per `[tab ...]` section, named/ordered to
+match. Convert to PNG the same way as above. `render_preview.c` is
+still the one to reach for if you're writing a genuinely hand-tuned
+compile-time page (real per-row loops, not something `.conf` can
+express) rather than a `shadow_page.conf`.
+
 Once it looks right offline, stage the live test in the same order
 every time: pass-through check with nothing active, then static
 toggle-on with nothing interactive yet, then interactive testing —
@@ -449,6 +480,10 @@ and after every revert.
       verbatim from its own `NSMODULE.json` if it should get an on/off
       button. That's the entire integration — no Force Shadow source
       change needed at all.
+- [ ] Every piece of text is uppercase — `display_name`, every
+      `label=`/`title=`, every `options=` entry (the font has no
+      lowercase glyphs; a lowercase letter renders as blank space, not
+      a fallback — see [The page file format](#the-page-file-format)).
 - [ ] If this add-on currently uses `SHIFT+SCENE-N` to start/stop its
       engine directly, rebind that line in `midiloop.config` (see
       [The hardware combo](#the-hardware-combo) above) — this is

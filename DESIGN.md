@@ -199,7 +199,18 @@ the new add-on's first tab and resets tab position to the first tab.
 - **Text** is rendered from a set of pre-baked, hinted glyph bitmaps at
   fixed scales (1×, 1.5×, 2×, 2.5×, 3×) generated offline from a
   monospace font, blended per-pixel by coverage rather than a hard 1-bit
-  stencil.
+  stencil. **Uppercase only** (`font_chars` in `font8x8.h`: space,
+  `A`-`Z`, `0`-`9`, and `.-/>%+:`) -- a lowercase letter isn't drawn as
+  a missing/fallback glyph, it silently renders as blank space while
+  still eating its full advance width (caught live, 2026-09-22: a
+  third-party add-on's mixed-case `display_name` rendered as gapped
+  nonsense on the launcher). Any conf-supplied text a widget draws
+  as-is (`display_name`, a `label=`/`title=` value, `enum_h`/`enum_v`
+  `options=`) needs to already be uppercase; `clean_name()` upper-cases
+  and cleans up engine-supplied text (patch/bank names) for the same
+  reason, and `build_launcher_tab()`'s own labels are upper-cased for
+  it automatically since it doesn't control what a listed add-on's own
+  conf puts in `display_name`.
 - **Per-add-on theming.** Colour palette and overall widget style
   (a flat cream panel, a dark "engraved LCD" look with dotted value
   arcs, or a light TB-303-style chassis) are properties of the active
