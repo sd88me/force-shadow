@@ -1311,6 +1311,24 @@ static int add_goto_button(int32_t cx, int32_t cy, const char *label, int target
     return bi;
 }
 
+/* The baked font (font_hi.h/font_chars) has uppercase glyphs only --
+ * every add-on in this project's own family already ships an uppercase
+ * display_name, so this was never an issue until a third-party add-on's
+ * conf didn't ("Kit Builder" rendered as "K   B", the lowercase letters
+ * silently falling through font_glyph_index()'s "not found" -> space
+ * fallback while still eating their full advance width -- caught live,
+ * 2026-09-22). Unlike clean_name() elsewhere, this does NOT turn '-'
+ * into a space: display_name values like "JV-880" already rely on the
+ * hyphen surviving as-is. */
+static void launcher_upper(char *dst, size_t n, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < n; i++) {
+        char c = src[i];
+        dst[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    dst[i] = 0;
+}
+
 static void build_launcher_tab(int tab) {
     n_page_widgets = 0;
     n_page_frames = 0;
@@ -1328,7 +1346,9 @@ static void build_launcher_tab(int tab) {
             addon_table[s].build_tab == build_launcher_tab)
             continue;
         targets[n_targets++] = s;
-        const char *label = addon_table[s].display_name[0] ? addon_table[s].display_name : "ADD-ON";
+        char label[24];
+        launcher_upper(label, sizeof(label),
+                       addon_table[s].display_name[0] ? addon_table[s].display_name : "ADD-ON");
         int32_t w = text_width_land(label, 1.5f) + 36 + 24; /* matches W_BUTTON's own td3 sizing */
         if (w > max_label_w) max_label_w = w;
     }
@@ -1376,7 +1396,8 @@ static void build_launcher_tab(int tab) {
         int32_t cy = y0 + rowh * row + rowh / 2;
         int slot = targets[i];
         const addon_descriptor_t *tgt = &addon_table[slot];
-        const char *label = tgt->display_name[0] ? tgt->display_name : "ADD-ON";
+        char label[24];
+        launcher_upper(label, sizeof(label), tgt->display_name[0] ? tgt->display_name : "ADD-ON");
         /* Engine running state, not this addon's own theme (it may not
          * even have one drawn yet) -- red/green against the launcher's
          * own go_off/go_on colors, same pair its "ENGINE ON/OFF" pill
