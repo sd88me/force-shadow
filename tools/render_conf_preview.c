@@ -48,6 +48,7 @@ static uint32_t KNOB_FACE  = 0xefe9d8;
 static uint32_t KNOB_RING  = 0x2a2823;
 static uint32_t BAR_BG     = 0x0d0c0a;
 static uint32_t TAB_ON_BG  = 0x1a120d;   /* theme_tab_on */
+static uint32_t TAB_ON_TX  = 0xfdf3ea;   /* theme_tab_on_tx (default matches BTN_TEXT's own) */
 static uint32_t SEG_ACTIVE    = 0xf2f1ee;   /* theme_seg_active */
 static uint32_t SEG_INACTIVE  = 0x050403;   /* theme_seg_inactive */
 static uint32_t SEG_ACTIVE_TX = 0x1c1a17;   /* theme_seg_active_tx */
@@ -389,11 +390,12 @@ static void draw_chrome_named(const char *title, const char **tabs, int ntabs, i
     for (int i = 0; i < ntabs; i++) {
         if (G_TD3) {
             if (i == active_tab) fill_rr(i*tw + 10, tabbar_y + 10, tw - 20, TABBAR_H - 14, 8, TAB_ON_BG);
-            /* BTN_TEXT (light text for a filled/highlighted widget, same
-             * pairing buttons/selected-list-rows use), not ACCENT -- see
-             * force_shadow.c's own comment on this same line. */
+            /* TAB_ON_TX, decoupled from both ACCENT and BTN_TEXT (a real
+             * bug force-cratedigger's own page hit first: BTN_TEXT and a
+             * dark tab_on_bg happened to work for Acid's palette but not
+             * generally) -- see force_shadow.c's own comment. */
             draw_text_c(i*tw + tw/2, tabbar_y + TABBAR_H/2 - 4, tabs[i], 2,
-                        i == active_tab ? BTN_TEXT : TD3_CHROME_INK);
+                        i == active_tab ? TAB_ON_TX : TD3_CHROME_INK);
             continue;
         }
         if (i == active_tab) {
@@ -483,6 +485,7 @@ static void load_conf(const char *path) {
                 else if (!strcmp(key, "bar"))         BAR_BG = c;
                 else if (!strcmp(key, "btn_text"))    BTN_TEXT = c;
                 else if (!strcmp(key, "tab_on"))      TAB_ON_BG = c;
+                else if (!strcmp(key, "tab_on_tx"))   TAB_ON_TX = c;
                 else if (!strcmp(key, "lcd"))         LCD_BG = c;
                 else if (!strcmp(key, "seg_active"))  SEG_ACTIVE = c;
                 else if (!strcmp(key, "seg_inactive")) SEG_INACTIVE = c;
@@ -521,16 +524,32 @@ static void load_conf(const char *path) {
     fclose(f);
 }
 
+/* Mirrors force_shadow.c's own MAX_FRAMES - that real cap is enforced
+ * silently there (`if (n_page_frames >= MAX_FRAMES) return;`, no error),
+ * which is exactly how a 16-frame PADS page rendered fine in this tool
+ * (which never tracked a frame count at all) while only the first 6
+ * frames ever showed on the real device. Tracked and warned about here
+ * now, the same way the list-widget overflow check already warns. */
+#define PREVIEW_MAX_FRAMES 20
+
 static void render_tab(int tab_idx) {
     const char *tab_ptrs[MAX_TABS];
     for (int i = 0; i < g_ntabs; i++) tab_ptrs[i] = g_tab_names[i];
     draw_chrome_named(g_display_name, tab_ptrs, g_ntabs, tab_idx, 1);
+    int n_frames_drawn = 0;
     for (int i = 0; i < g_line_count[tab_idx]; i++) {
         const char *ln = g_lines[tab_idx][i].line;
         char kind[16] = {0};
         sscanf(ln, "%15s", kind);
 
         if (!strcmp(kind, "frame")) {
+            if (n_frames_drawn >= PREVIEW_MAX_FRAMES) {
+                fprintf(stderr, "WARNING: tab %d exceeds MAX_FRAMES=%d - this frame "
+                        "would not render on the real device (silently dropped)\n",
+                        tab_idx, PREVIEW_MAX_FRAMES);
+                continue;
+            }
+            n_frames_drawn++;
             int x = kv_int(ln, "x", 0), y = kv_int(ln, "y", 0);
             int w = kv_int(ln, "w", 100), h = kv_int(ln, "h", 100);
             char title[64] = {0}; kv_str(ln, "title", title, sizeof(title));

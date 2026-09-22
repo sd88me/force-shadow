@@ -324,6 +324,24 @@ risk class as an ordinary parameter `SET`.
 
 ## Known limitations
 
+- **Per-tab widget/frame caps.** `MAX_WIDGETS` (64, non-`frame` widgets)
+  and `MAX_FRAMES` (20, raised from 6 on 2026-09-23 for
+  `force-kit-builder`'s 16-pad page — see that repo's `DESIGN.md` "v4.2"
+  section for the full story) are two **separate** compile-time caps,
+  both enforced silently — past either limit, `add_*()`/`add_frame()`
+  simply returns without storing the widget/frame, no error, no log.
+  `tools/render_conf_preview.c` (the offline preview tool) doesn't
+  enforce `MAX_FRAMES` at all, so a page over that limit renders fine
+  offline and silently loses frames only on the real device — verify
+  frame *and* widget counts by hand (or against these constants
+  directly) for any page with many repeated per-item boxes, not just by
+  eyeballing the preview render. Raising either constant is safe from a
+  memory standpoint even though both arrays are duplicated per-tab across
+  every addon slot (`tab_snapshot_t`'s `data_addon_tabs[NUM_ADDON_SLOTS]
+  [MAX_TABS]`, 40×8 = 320 copies) — `MAX_WIDGETS` already costs ~11MB
+  total, so even a generous bump to `MAX_FRAMES` costs only tens of KB
+  more; check the real numbers before assuming "small `#define`, must be
+  fine" either way, don't just guess it's negligible.
 - **Screen tearing:** a small amount of cosmetic tearing is possible
   during an active knob/envelope drag. Back-buffer compositing
   (described above) substantially reduces this; eliminating it entirely

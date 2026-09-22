@@ -1002,7 +1002,17 @@ static void clean_name(char *dst, size_t n, const char *src) {
 
 
 #define MAX_WIDGETS 64
-#define MAX_FRAMES 6
+/* Was 6 - raised to accommodate force-kit-builder's PADS page, which
+ * wants a frame around each of 16 pads on one tab. Checked before
+ * raising, not just bumped blind: page_frames/frames/frames_snap are
+ * duplicated per-tab in tab_snapshot_t's data_addon_tabs[NUM_ADDON_SLOTS]
+ * [MAX_TABS] table (see that struct's own comment) - at 40 slots x 8
+ * tabs, this adds (20-6)*sizeof(ui_frame_t)*320 =~ 125KB total, negligible
+ * next to that same table's MAX_WIDGETS-driven allocation (already ~11MB
+ * for the widgets array alone). 20 gives a real addon room (16 pads) plus
+ * some headroom rather than the exact number one addon happens to need
+ * right now. */
+#define MAX_FRAMES 20
 static ui_widget_t page_widgets[MAX_WIDGETS];
 static int n_page_widgets = 0;
 static ui_frame_t page_frames[MAX_FRAMES];
