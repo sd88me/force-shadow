@@ -94,6 +94,23 @@ if [ "$mode" = "ENABLE" ]; then
     echo "$appTitle enabled (visual + audio interposers armed at boot, shadow mode off, zero voices)."
     echo "Restarting the Force app."
     systemctl restart acvs
+
+    BIND_SCRIPT="$installroot/bind_midiloop.sh"
+    if [ -t 0 ] && [ -x "$BIND_SCRIPT" ]; then
+        echo
+        printf "Bind the hardware button combo now (SHIFT+SCENE-1, KNOBS+SCENE-2..7)? "
+        printf "This edits MidiLoop's own shared config -- see bind_midiloop.sh's header "
+        printf "comment. It backs up first and refuses to touch anything already bound "
+        printf "to something else. [y/N] "
+        read ans
+        case "$ans" in
+            [Yy]*) sh "$BIND_SCRIPT" ;;
+            *) echo "Skipped. Run 'sh $BIND_SCRIPT' later to bind it." ;;
+        esac
+    else
+        echo "Run 'sh $BIND_SCRIPT' to bind the hardware button combo (one-time step,"
+        echo "not run automatically -- see its header comment for why)."
+    fi
     exit 0
 fi
 
@@ -102,8 +119,9 @@ echo
 echo "Status:"
 [ -f "$runScript" ] && echo "  autostart: ENABLED (interposer arms at boot, shadow mode off)" || echo "  autostart: disabled"
 [ -f /tmp/force_shadow_on ] || [ -f /tmp/force_shadow_page ] && echo "  shadow mode: currently ON" || echo "  shadow mode: currently off"
-echo "  toggle shadow mode from the device: KNOBS+SCENE-1..7 (see README.md"
-echo "  for binding these — a one-time step, run addon/bind_midiloop.sh)."
+echo "  toggle shadow mode from the device: SHIFT+SCENE-1, KNOBS+SCENE-2..7"
+echo "  (see README.md — a one-time bind, offered on ENABLE, or run"
+echo "  addon/bind_midiloop.sh yourself)."
 ps 2>/dev/null | grep -q "[i]njectTone" && echo "  injectTone (test tone): RUNNING" || echo "  injectTone (test tone): stopped"
 ps 2>/dev/null | grep -q "[s]kipbackHost" && echo "  skipbackHost: RUNNING" || echo "  skipbackHost: stopped"
 echo "  logs: /tmp/force_shadow.log (visual), /tmp/forceAudioJack.log (audio)"

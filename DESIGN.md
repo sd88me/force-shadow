@@ -164,7 +164,10 @@ the new add-on's first tab and resets tab position to the first tab.
   `KNOBS+SCENE-7` (2026-09-22): that slot's `KNOBS` combo was already a
   real, pre-existing, unrelated RiffMaker4T engine start/stop shortcut,
   so the two were swapped by hand on the live `midiloop.config` rather
-  than displacing it. See
+  than displacing it. Renumbered again (2026-09-23): the launcher moved
+  from slot 7 to slot 1 (still `SHIFT`, not `KNOBS`), with every
+  per-add-on slot shifting down by one to make room — DX7 2, JV-880 3,
+  Maze Voice 4, Maze Sequencer 5, Acid Sequencer 6, Euclidier 7. See
   [docs/adding-a-page.md](docs/adding-a-page.md)'s "Add-on launcher
   (tool add-ons)" section.
   - **Button styling (2026-09-22):** every launcher button is drawn at

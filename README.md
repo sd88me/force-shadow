@@ -27,6 +27,7 @@ and the technical design, see [DESIGN.md](DESIGN.md).
 ## Table of contents
 
 - [What is Shadow Mode?](#what-is-shadow-mode)
+- [Think of add-on engines as outboard gear](#think-of-add-on-engines-as-outboard-gear)
 - [Features](#features)
 - [Control pages included in this release](#control-pages-included-in-this-release)
 - [Part of a bigger family](#part-of-a-bigger-family)
@@ -69,6 +70,66 @@ open — substitutes its own picture for the screen and grabs the
 touchscreen. The moment Shadow Mode is off, MPC owns the display and
 touch input completely, and behaves as if Force Shadow weren't installed
 at all.
+
+The name and the underlying idea — a UI layer that steps in front of the
+stock app to give an add-on process its own screen, then steps back out
+again — is directly inspired by [Schwung](https://github.com/charlesvestal/schwung),
+which does the same thing for Ableton Move under the same name, "Shadow
+UI". Force Shadow is an independent implementation built for the Force's
+own display stack (Schwung's own Shadow UI code doesn't run here, and
+wasn't ported) — but the concept, and the choice to keep the name, are a
+direct nod to it.
+
+## Think of add-on engines as outboard gear
+
+Every add-on this family gives a control page to — Maze Voice, Maze
+Sequencer, the ACID Sequencer, the DX7/JV-880 emulators, Kit Builder's
+preview, and so on — is a **separate background process that runs
+entirely outside MPC, outside the Akai OS's own application**. None of
+them are plugins in the sense MPC has plugins; MPC never loads them,
+calls into them, or even knows they exist as anything other than another
+process on the same Linux box. The most useful mental model isn't
+"software instrument" at all — it's a **virtual piece of outboard gear**,
+sitting next to the Force the way a real hardware synth would sit next
+to a mixer:
+
+- **They need to be turned on and off**, explicitly, the same way you'd
+  flip the power switch on an external synth — nothing about installing
+  one makes it live. Most either start from the nodeServer Modules page
+  or (with Force Shadow installed) from the ENGINE button on their own
+  shadow page, same action either way. Turning one off doesn't affect
+  MPC at all, exactly like unplugging a hardware synth's power doesn't
+  affect the mixer it was plugged into.
+- **They patch in over virtual cables, not integration.** A virtual MIDI
+  port stands in for a real MIDI cable — you still have to route a track
+  to it, on every project, the same way you'd patch a real synth's MIDI
+  In. The shared audio-injection tap (this repo's own audio layer, or
+  its DSP-side counterpart) stands in for a real audio cable into a
+  mixer channel — you still need an Audio-In track pointed at the right
+  input, on every project, the same way you'd plug a real synth's
+  outputs into a physical input and bring up that channel's fader.
+  Nothing auto-connects, because nothing about a real external device
+  would auto-connect either.
+- **This is also where the real limitations come from.** No native
+  automation lanes reaching into the engine beyond whatever MIDI CC it
+  exposes; no sample-accurate plugin-style latency compensation; no
+  built-in mixer channel strip beyond what the audio tap gives you —
+  because, architecturally, there genuinely isn't a plugin there for the
+  Force to integrate. It's exactly as integrated as a real hardware
+  synth is, no more and no less.
+- **Hard rules like "don't restart `acvs` while a voice is attached"
+  exist for the same underlying reason you don't hot-swap a live patch
+  cable on real gear**: the connection point (`LD_PRELOAD`'d into MPC,
+  or a live shared-memory ring) is being torn down and rebuilt mid-signal,
+  and the failure modes when that happens mid-connection are just as real
+  as the pop a hot-swapped cable would put through a speaker — worse, in
+  this case, some of the confirmed failure modes have taken the Force's
+  own pads and WiFi down with it. Powering the "device" off first, the
+  same way you'd mute or unplug real gear before touching its cabling,
+  avoids it entirely.
+
+Every add-on's own README documents its specific ports, hard rules, and
+setup steps — this is the shared mental model underneath all of them.
 
 ## Features
 
@@ -122,11 +183,20 @@ Force Shadow is a **prerequisite, not a destination** — it has no sound
 engine of its own. It exists to give the following add-ons (shipping
 alongside or after it) a proper on-screen control surface:
 
-- **Maze Voice** — a Moog Labyrinth-inspired synth voice *(page shipped in this release)*
-- **Maze Sequencer** — a companion step sequencer for the Maze voice engine *(coming soon)*
-- **ACID Sequencer** — a TB-303-style bassline sequencer *(coming soon)*
-- **JV-880 emulator** *(page shipped in this release)*
-- **DX7 / Dexed emulator** *(minimal page shipped in this release; full page planned)*
+- **[Maze Voice](https://github.com/sd88me/force-maze)** — a Moog
+  Labyrinth-inspired synth voice
+- **[Maze Sequencer](https://github.com/sd88me/force-maze)** — a
+  companion generative step sequencer for the Maze voice engine
+- **[ACID Sequencer](https://github.com/sd88me/force-acid)** — a
+  TB-303-style bassline sequencer
+- **[JV-880 emulator](https://github.com/sd88me/force-jv880)**
+- **[DX7 / Dexed emulator](https://github.com/sd88me/force-dx7)**
+- **[Euclidier](https://github.com/sd88me/force-euclidier)** — an 8-lane
+  Euclidean rhythm sequencer
+- **[Crate Digger](https://github.com/sd88me/force-cratedigger)** —
+  Discogs-powered random music discovery, played as a voice
+- **[Kit Builder](https://github.com/sd88me/force-kit-builder)** — a
+  16-pad drum-kit builder, with an audible pad-preview voice
 
 Install Force Shadow first, then install whichever of the above add-ons
 you want — each one brings its own control page along with it.
@@ -163,7 +233,13 @@ you want — each one brings its own control page along with it.
    injected until a voice add-on is started.
 3. **Bind the hardware button combo** (one-time step — this is kept
    separate from step 2 because it edits MidiLoop's own shared config
-   file, so it's deliberately not automatic):
+   file, so it's deliberately not automatic). `manage.sh ENABLE` offers
+   to do this for you with a y/N prompt right after it restarts acvs,
+   but only over a real terminal — a plain `ssh host 'sh manage.sh
+   ENABLE'` (as in step 2 above) has no tty, so it just prints the
+   hint instead of prompting. Either answer the prompt (`ssh -t
+   root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh
+   ENABLE'`) or run the binder directly:
    ```
    ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/bind_midiloop.sh'
    ```
@@ -185,14 +261,14 @@ or different in normal use until you open a shadow page (see below).
 ## Using Force Shadow
 
 **Opening a page:** press and hold the button combo for the add-on you
-want (e.g. **SHIFT + SCENE-3** or **KNOBS + SCENE-3** for Maze Voice —
-either combo works and does the same thing, except slot 7's
-**SHIFT + SCENE-7**, which is reserved for the add-on launcher — see
+want (e.g. **SHIFT + SCENE-4** or **KNOBS + SCENE-4** for Maze Voice —
+either combo works and does the same thing, except slot 1's
+**SHIFT + SCENE-1**, which is reserved for the add-on launcher — see
 below). Hold the modifier down, tap the SCENE pad, then release both —
 pressing and releasing simultaneously doesn't register, they need to be
 a proper hold-then-tap.
 
-**Opening the add-on launcher:** **SHIFT + SCENE-7** opens a page
+**Opening the add-on launcher:** **SHIFT + SCENE-1** opens a page
 listing every other installed add-on as a button — tap one to jump
 straight to its own page, exactly as if you'd pressed its combo
 directly. Each button is red or green depending on whether that
@@ -399,13 +475,25 @@ Built by [sd88me](https://github.com/sd88me).
   firmware add-on framework for the Akai Force that Force Shadow is
   built to run on top of, and a prerequisite for installing it (see
   [Requirements](#requirements)).
-- **[force-audioin](https://github.com/sd88me/force-audioin)** — the
-  audio equivalent of this project, already shipped, and the design
-  precedent Force Shadow's own safety model builds on.
-- **[force-maze](https://github.com/sd88me/force-maze)** — Maze Voice,
-  the first control page shipped alongside this release.
+- **[Schwung](https://github.com/charlesvestal/schwung)** by Charles
+  Vestal — the Ableton Move framework whose own "Shadow UI" overlay
+  concept, and the name, directly inspired this project. See
+  [What is Shadow Mode?](#what-is-shadow-mode) above; no Schwung code
+  runs here, this is an independent implementation for the Force.
+- **force-audio-jack** — this repo's own bundled audio layer (`audio/`)
+  is a merge of the formerly-separate force-audio-jack add-on
+  (itself originally force-audioin); see [audio/README.md](audio/README.md).
+- **[force-maze](https://github.com/sd88me/force-maze)** — Maze Voice
+  and Maze Sequencer.
 - **[force-acid](https://github.com/sd88me/force-acid)** — the ACID
-  Sequencer family of add-ons.
+  Sequencer.
+- **[force-dx7](https://github.com/sd88me/force-dx7)**,
+  **[force-jv880](https://github.com/sd88me/force-jv880)** — the
+  DX7/Dexed and JV-880 emulators.
+- **[force-euclidier](https://github.com/sd88me/force-euclidier)**,
+  **[force-cratedigger](https://github.com/sd88me/force-cratedigger)**,
+  **[force-kit-builder](https://github.com/sd88me/force-kit-builder)**
+  — further add-ons with a control page in this family.
 
 ## License
 

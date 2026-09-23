@@ -316,7 +316,7 @@ your add-on is a low-frequency "tool" that doesn't need one-tap access
 higher instead of `1`–`7`. A slot in that range is never bound to any
 combo; it's reached by opening the launcher page (one add-on's own
 `shadow_page.conf` has `launcher=1` — force-shadow's own, at
-`addon/shadow_page.conf`, page `7`) and tapping your add-on's button
+`addon/shadow_page.conf`, page `1`) and tapping your add-on's button
 there.
 
 You don't do anything else to register with the launcher — it's built
@@ -351,11 +351,13 @@ though — everywhere else in a shadow page, write your own text
 uppercase to begin with.
 
 On force-shadow's own device, the launcher itself is bound to
-`SHIFT+SCENE-7` rather than `KNOBS+SCENE-7` — see `bind_midiloop.sh`'s
-own header comment if you're setting this up somewhere `KNOBS+SCENE-7`
-is already free and would rather use that combo instead; either
-modifier works identically, this project's own choice was just to work
-around a pre-existing binding on that one slot.
+`SHIFT+SCENE-1` rather than `KNOBS+SCENE-1` (moved there from slot 7 on
+2026-09-23, with every per-add-on slot shifting down by one — see
+`bind_midiloop.sh`'s own header comment) — see that header comment if
+you're setting this up somewhere `KNOBS+SCENE-1` is already free and
+would rather use that combo instead; either modifier works identically,
+this project's own choice was just to work around a pre-existing
+binding on that one slot.
 
 ## Engine on/off button
 
