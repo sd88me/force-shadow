@@ -1,8 +1,8 @@
 {
-  "NAME": "Force Audio Jack - Test Tone",
-  "DESCRIPTION": "Minimal stand-in producer (a fixed sine wave) that proves the ForceAudioJack injection tap works end to end, on either bus. Toggling RUNNING here only starts/stops injectTone itself - it does not arm forceAudioJack.so or restart acvs, so it only reaches an Audio-In (bus=in) or Out 3/4 (bus=out) track if ForceAudioJack's own manage.sh ENABLE has already been run (it arms the tap once, persistently, at every boot). See README.md.",
+  "NAME": "Force Shadow - Test Tone",
+  "DESCRIPTION": "Minimal stand-in producer (a fixed sine wave) that proves the ForceAudioJack injection tap works end to end, on either bus. Toggling RUNNING here only starts/stops injectTone itself - it does not arm forceAudioJack.so or restart acvs, so it only reaches an Audio-In (bus=in) or Out 3/4 (bus=out) track if ForceShadow's own manage.sh ENABLE has already been run (it arms the tap once, persistently, at every boot). See README.md.",
   "PROCESSNAME": "injectTone",
-  "DIRNAME": "ForceAudioJack",
+  "DIRNAME": "ForceShadowTestTone",
   "FILENAME": "injectTone",
   "BACKGROUND": true,
   "AUTOLAUNCHABLE": false,

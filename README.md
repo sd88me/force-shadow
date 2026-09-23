@@ -1,13 +1,22 @@
 # Force Shadow
 
-**Custom on-screen control surfaces for background add-ons on the Akai Force.**
+**The shadow layer for MockbaMod: on-screen control pages and audio I/O for add-ons on the Akai Force.**
 
 Force Shadow lets a companion add-on take over the Force's own physical
 screen and touchscreen — on demand, with a button press — to show its own
 purpose-built control page (knobs, toggles, envelope graphs, patch/bank
 lists, and more), then hand the display back to MPC exactly as it was.
-It is the shared visualisation/control layer this whole family of add-ons
-is built on top of; it makes no sound and sequences nothing by itself.
+It is the shared layer this whole family of add-ons is built on, and it has
+two halves, installed together as one add-on:
+
+- **Visual layer** (`force_shadow.so`) takes over the screen and touchscreen
+  on demand.
+- **Audio layer** (`forceAudioJack.so`, formerly the separate Force Audio
+  Jack add-on) lets add-on sound engines play into the Force's Audio-In
+  tracks or Out 3/4, and lets tools like Skipback capture the main mix.
+  See [audio/README.md](audio/README.md).
+
+It makes no sound and sequences nothing by itself.
 
 **Status: v1.0 — stable release**, running on real Force hardware. This
 document is the install/usage manual. For internals, extension points,
@@ -133,18 +142,25 @@ you want — each one brings its own control page along with it.
 
 ## Installation
 
-1. **Copy the add-on onto the device**, replacing any previous copy:
+1. **Download `ForceShadow-<version>.zip`** from the Releases page and
+   copy its `AddOns/` contents onto the device, replacing any previous copy:
    ```
    ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceShadow'
-   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceShadow
+   scp -r AddOns/ForceShadow root@<force-ip>:/media/<serial>/AddOns/
    ```
+   The zip also has two optional folders. Copy them the same way if you
+   want them:
+   - `ForceShadowTestTone`: a sine-wave producer for checking that the
+     audio layer works. It gets its own toggle on the nodeServer Modules page.
+   - `ForceAudioJackSkipback`: Skipback, which saves the last N seconds of
+     the main mix retroactively.
 2. **Enable it:**
    ```
    ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh ENABLE'
    ```
-   This arms Force Shadow to load at boot. It always starts **inactive**
-   (pass-through only) — nothing changes on screen until you explicitly
-   open a shadow page.
+   This arms both layers to load at boot. Both always start **inactive**:
+   nothing changes on screen until you open a shadow page, and no audio is
+   injected until a voice add-on is started.
 3. **Bind the hardware button combo** (one-time step — this is kept
    separate from step 2 because it edits MidiLoop's own shared config
    file, so it's deliberately not automatic):
@@ -223,7 +239,7 @@ if the button binding step above hasn't been run yet.
 ```
 ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh DISABLE'
 ```
-cleanly reverts the boot-time library load, no reboot required to take
+cleanly reverts the boot-time load of both libraries, no reboot required to take
 effect on the next MPC restart. To remove the add-on entirely:
 ```
 ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh UNINSTALL'
@@ -268,6 +284,12 @@ gcc -O2 -Wall -o addon/force_shadow_exitwatch src/exit_watch.c -lasound && strip
 > `sources.list` rewrite above (pointing at `archive.debian.org` with
 > `-o Acquire::Check-Valid-Until=false`) is required for the build to
 > succeed at all.
+
+The audio layer is cross-compiled with zig instead of Docker:
+`audio/scripts/build.sh` (see its header) writes `addon/forceAudioJack.so`,
+`addon-testtone/injectTone` and `addon-skipback/skipbackHost`. Its unit
+tests run natively with `audio/tests/run.sh`. To build the release zip, run
+`scripts/package.sh v1.1.0`, which writes `dist/ForceShadow-v1.1.0.zip`.
 
 **Never `scp` a new `force_shadow.so` directly over a loaded one** on a
 live device — upload to a `.new` filename and `mv` it into place, so a
@@ -349,7 +371,12 @@ rendering/control pipeline works underneath.
 ## Project layout
 
 ```
-DESIGN.md            technical design & architecture reference
+DESIGN.md            technical design & architecture reference (visual layer)
+audio/               audio layer: forceAudioJack.so, injectTone, skipbackHost
+                       (own README/DESIGN, scripts/build.sh, tests/run.sh)
+addon-testtone/      optional AddOns/ForceShadowTestTone (injectTone)
+addon-skipback/      optional AddOns/ForceAudioJackSkipback (skipbackHost)
+scripts/package.sh   builds the release zip into dist/
 docs/
   adding-a-page.md    practical guide: building another add-on's shadow page
 src/
@@ -357,8 +384,9 @@ src/
                        the widget renderer, and DSP control wiring
   exit_watch.c         the "any other button also exits" helper process
   font8x8.h / font_hi.h  bitmap fonts used for on-screen text
-addon/                the real installable MockbaMod add-on
-                       (manage.sh, run_ForceShadow.sh, bind_midiloop.sh)
+addon/                the core installable add-on, AddOns/ForceShadow
+                       (both .so files, manage.sh, run_ForceShadow.sh,
+                       bind_midiloop.sh)
 tools/                offline diagnostic and page-preview tools
 ```
 

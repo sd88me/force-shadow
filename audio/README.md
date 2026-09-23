@@ -1,4 +1,4 @@
-# force-audio-jack
+# Force Shadow: audio layer (formerly force-audio-jack)
 
 **A shared audio tap for the Akai Force — the prerequisite add-on that
 lets a background synth or generator process appear as live signal on
@@ -137,32 +137,12 @@ the reference point this add-on's design started from.
 
 ## Installation
 
-1. **Copy the add-on onto the device**, replacing any previous copy
-   (`scp -r` copies `addon` *into* an existing destination rather than
-   replacing it, so remove any old copy first):
-   ```
-   ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceAudioJack'
-   scp -r addon root@<force-ip>:/media/<serial>/AddOns/ForceAudioJack
-   ```
-2. **Enable it:**
-   ```
-   ssh root@<force-ip> '/media/<serial>/AddOns/ForceAudioJack/manage.sh ENABLE'
-   ```
-   This arms the tap at boot with **zero voices ever attached** — it
-   does not start `injectTone` or any other producer by itself. This
-   behaviour has been proven safe across repeated restarts and a real
-   physical reboot.
-3. **Restart the Force** (or `systemctl restart acvs`) so the add-on
-   is picked up — safe to do at this point, since no voice is attached
-   yet (see [The hard rule](#the-hard-rule) below for why this matters).
-
-That's it — the tap is now armed. Nothing is audible or different in
-normal use until a voice is actually started (see below).
-
-To remove or disable the add-on later, use `manage.sh`'s own commands
-— it follows the same convention as other MockbaMod add-ons in this
-family (see `manage.sh`'s own usage output on the device for the exact
-options available).
+The audio layer is part of Force Shadow and installs with it. There's no
+separate add-on to copy. Follow the [top-level README's
+Installation](../README.md#installation) steps: `AddOns/ForceShadow/manage.sh
+ENABLE` arms this tap and the visual layer together, with **zero voices
+attached** at boot. Copy the optional `ForceShadowTestTone` folder too if
+you want the test tone described below.
 
 ## Using force-audio-jack
 
@@ -300,10 +280,9 @@ src/
   forceAudioJackExtract.h       Skipback extraction-ring layout (reversed producer/consumer roles)
   injectTone.c                  fixed-tone test producer (smoke-test only; --bus in|out)
   skipbackHost.c                Skipback consumer: rolling buffer, WAV-on-trigger
-addon/                          installable MockbaMod add-on (AddOns/ForceAudioJack)
-                                 (manage.sh, run_ForceAudioJack.sh, NSMODULE.json, forceAudioJack.so, injectTone)
-addon-skipback/                 skipbackHost's own AddOns folder (AddOns/ForceAudioJackSkipback) -
-                                 needs a separate folder for its own Modules-page toggle
+(installable output goes to the repo root: ../addon/forceAudioJack.so,
+ ../addon-testtone/ (AddOns/ForceShadowTestTone), ../addon-skipback/
+ (AddOns/ForceAudioJackSkipback))
 scripts/
   build.sh                      zig cross-build (no Docker needed)
 tests/

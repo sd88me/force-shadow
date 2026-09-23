@@ -1,76 +1,76 @@
 #!/bin/sh
 ############################################################
-# ForceShadow — autostart hook.
-# Copy this file into the AddOns FOLDER ROOT to enable.
-# MockbaMod's boot.sh runs every *.sh in AddOns/ at startup.
+# ForceShadow: autostart hook for the combined shadow layer.
+# Copy this file into the AddOns FOLDER ROOT to enable (manage.sh ENABLE
+# does it for you). MockbaMod's boot.sh runs every *.sh in AddOns/ at
+# startup.
 #
-# ARMS THE INTERPOSER ONLY, always inactive at boot. force_shadow.so is
-# LD_PRELOAD'd into MPC, but shadow mode itself only activates when
-# /tmp/force_shadow_on or /tmp/force_shadow_page exists (the real
-# hardware toggle, KNOBS+SCENE-N, or the manual SSH override write those
-# files at runtime — never at boot). Every live test of this addon has
-# started from exactly this state (armed, pass-through) with no issue;
-# see DESIGN.md's "Live load test #1"/"#8" for the two incidents that
-# happened when this wasn't respected (a never-loaded library is always
-# safe to prepend; a live process's *existing* stale state, from a long
-# same-boot restart run, is a different and unrelated risk).
+# Arms two LD_PRELOAD libraries into MPC and starts nothing else:
+#   force_shadow.so    - visual layer (DRM/KMS buffer substitution,
+#                        touchscreen grab). Always inactive at boot: shadow
+#                        mode only turns on when /tmp/force_shadow_on or
+#                        /tmp/force_shadow_page appears at runtime.
+#   forceAudioJack.so  - audio layer (snd_pcm_* tap). Zero voices attached
+#                        at boot; voice hosts attach later via their own
+#                        nodeServer Modules-page toggle (see audio/README.md).
+#
+# Uses the idempotent arming pattern (see audio/DESIGN.md, 2026-09-22):
+# write $mmLD_PRELOAD_VAR only when an entry is missing, and never touch
+# it on "kill". mockbaMagic/MidiLoop rewrite this file concurrently at
+# boot with no locking, so strip-and-re-add on every restart loses the
+# race over and over. Idempotent arming only has to win it once.
 ############################################################
 
 mmPath=$(cat /dev/shm/.mmPath)
 . $mmPath/MockbaMod/env.sh
 APPDIR="$mmPath/AddOns/ForceShadow"
-LIB="$APPDIR/force_shadow.so"
+LIBS="$APPDIR/force_shadow.so $APPDIR/forceAudioJack.so"
 
-# ── Locking around $mmLD_PRELOAD_VAR ────────────────────────
-# Same mkdir-based lock as ForceAudioIn's own run_*.sh (see that repo's
-# DESIGN.md and this project's own skill reference,
-# ~/.claude/skills/mockbamod-module-creator/references/gotchas.md, for
-# the full incident history this protects against: mockbaMagic's and
-# MidiLoop's own scripts read-modify-write this same shared file with no
-# locking at all, a confirmed lost-update race at boot). This can't fix
-# their side of it, only make ours safe. mkdir is atomic even on
-# busybox; the retry is bounded and fails OPEN (proceeds unlocked)
-# rather than risk hanging boot forever on a stale lock from a crashed
-# process.
+# mkdir is atomic even on busybox. Bounded retry that fails OPEN rather
+# than hang boot on a stale lock. The counter name must not clash with a
+# caller's variable (POSIX sh has no `local`; see audio/DESIGN.md).
 PRELOAD_LOCK="/dev/shm/.LD_PRELOAD.lock"
 lock_preload() {
-    i=0
+    _lp_tries=0
     while ! mkdir "$PRELOAD_LOCK" 2>/dev/null; do
-        i=$((i + 1))
-        [ $i -ge 50 ] && return 1   # ~5s of retries, then fail open
+        _lp_tries=$((_lp_tries + 1))
+        [ $_lp_tries -ge 50 ] && return 1   # ~5s of retries, then fail open
         sleep 0.1
     done
     return 0
 }
 unlock_preload() { rmdir "$PRELOAD_LOCK" 2>/dev/null; }
 
-# boot.sh calls addon scripts with "kill" on shutdown/restart - full teardown.
+# boot.sh calls addon scripts with "kill" on every shutdown/restart.
+# Runtime state only; LD_PRELOAD is left alone (see header).
 if [ "$1" = "kill" ]; then
     rm -f /tmp/force_shadow_on /tmp/force_shadow_page
     kill $(cat /tmp/force_shadow_exitwatch.pid 2>/dev/null) 2>/dev/null
     rm -f /tmp/force_shadow_exitwatch.pid
-    lock_preload
-    if [ -f "$mmLD_PRELOAD_VAR" ]; then
-        cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v force_shadow.so | tr "\n" " " > /tmp/.p.$$
-        mv /tmp/.p.$$ "$mmLD_PRELOAD_VAR"
-    fi
-    unlock_preload
+    for p in $(ps 2>/dev/null | grep -E "\[i\]njectTone|\[s\]kipbackHost" | awk '{print $1}'); do
+        kill -9 $p 2>/dev/null
+    done
     exit 0
 fi
 
-# ── ARM THE INTERPOSER — nothing else ───────────────────────
-lock_preload
-if [ -f "$mmLD_PRELOAD_VAR" ]; then
-    FC=$(cat "$mmLD_PRELOAD_VAR" | tr " " "\n" | grep -v force_shadow.so | tr "\n" " ")
-    echo "$LIB $FC" > "$mmLD_PRELOAD_VAR"
-else
-    echo "$LIB" > "$mmLD_PRELOAD_VAR"
+# ── ARM BOTH INTERPOSERS (only if missing) ──────────────────
+missing=0
+for lib in $LIBS; do
+    grep -qF "$lib" "$mmLD_PRELOAD_VAR" 2>/dev/null || missing=1
+done
+if [ $missing -eq 1 ]; then
+    lock_preload
+    # Drop any stale entries (ours, or leftovers from the old standalone
+    # ForceAudioJack/ForceAudioIn installs) and prepend both libs.
+    FC=$(cat "$mmLD_PRELOAD_VAR" 2>/dev/null | tr " " "\n" \
+        | grep -v -E "force_shadow\.so|forceAudioJack|forceAudioIn" | tr "\n" " ")
+    echo "$LIBS $FC" > "$mmLD_PRELOAD_VAR"
+    unlock_preload
 fi
-unlock_preload
 
 # ── Exit-on-button helper (separate process, not inside MPC) ──
 # Leaves shadow mode when MENU/LOAD/SAVE/MATRIX/CLIP/MIXER/NAVIGATE/KNOBS
-# is pressed. Harmless while shadow mode is off (just removes absent files).
+# is pressed. Harmless while shadow mode is off.
 EW="$APPDIR/force_shadow_exitwatch"
 if [ -x "$EW" ]; then
     kill $(cat /tmp/force_shadow_exitwatch.pid 2>/dev/null) 2>/dev/null
