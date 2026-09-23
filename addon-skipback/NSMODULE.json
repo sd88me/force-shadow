@@ -1,11 +1,11 @@
 {
   "NAME": "Force Shadow - Skipback",
-  "DESCRIPTION": "Continuously records the Force's real main-mix output into a rolling buffer, so a SHIFT+RECORD shortcut can save the last N seconds retroactively (Schwung's Skipback feature). Toggling RUNNING here only starts/stops skipbackHost itself - it does not arm forceAudioJack.so or restart acvs, so it only actually captures anything if ForceShadow's own manage.sh ENABLE has already been run. See docs/PROPOSAL-force-audio-jack.md.",
+  "DESCRIPTION": "Continuously records the Force's real main-mix output into a rolling buffer, so a SHIFT+RECORD shortcut (or Force Crate Digger's own SKIPBACK REC button) can save the last N seconds retroactively (Schwung's Skipback feature). Auto-launches at boot once this addon's own manage.sh ENABLE has been run (confirmed safe against a live acvs restart - see manage.sh's own comment). Requires ForceShadow's forceAudioJack.so already armed. See docs/PROPOSAL-force-audio-jack.md.",
   "PROCESSNAME": "skipbackHost",
   "DIRNAME": "ForceAudioJackSkipback",
   "FILENAME": "skipbackHost",
   "BACKGROUND": true,
-  "AUTOLAUNCHABLE": false,
+  "AUTOLAUNCHABLE": true,
   "ARGUMENTS": [
     { "NAME": "window flag", "VALUE": "--window-sec" },
     { "NAME": "rolling window seconds (max 60)", "VALUE": "30" },

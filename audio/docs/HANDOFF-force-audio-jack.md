@@ -22,6 +22,7 @@ working with clean, real audio. What's left is real but bounded — see §2.
 | MPC (`az01-launch-MPC`) | Stable, pid 19755 as of this writing, holding steady. |
 | DrmVncServer | Disabled (its own unrelated display race recurred a 3rd time mid-session; see memory note). Re-enable cautiously if wanted. |
 | Skipback trigger shortcut | **Temporary** — `KNOBS+SCENE-1`, not a permanent binding (see §2.6). |
+| `acvs` restart with Skipback attached | **Confirmed safe (2026-09-23).** Three consecutive live `systemctl restart acvs` tests with `skipbackHost` attached and continuously recording: process untouched across all three, pads/touchscreen/WiFi responsive every time, a trigger-save worked correctly after each restart. `addon-skipback` now has its own `manage.sh`/`run_skipbackHost.sh` and ships `AUTOLAUNCHABLE: true` — resolves Open Question #1 (§2.3) for Skipback specifically; Out-bus remains untested. |
 | Leftover on device | One test WAV at `/sdcard/Force Documents/Samples/Skipback/Skipback_Testw_20260923_001428.wav` (harmless, real captured 440Hz tone — safe to delete or keep as a reference sample). |
 
 Nothing is mid-flight. All test processes (`injectTone`, `skipbackHost`, `cratedigger_host`) were stopped cleanly and no diagnostic/trigger marker files are left set.
@@ -30,19 +31,22 @@ Nothing is mid-flight. All test processes (`injectTone`, `skipbackHost`, `crated
 
 ## 2. Open items, roughly in priority order
 
-### 2.1 Pads/buttons go dead when restarting `acvs` with a voice attached — not root-caused
-Restarting `acvs` while any voice (In-bus, Out-bus, or presumably Skipback) is
-attached can reliably make pads/buttons unresponsive (occasionally Wi-Fi too).
-Never observed with zero voices attached. Investigation has ruled out several
-specific mechanisms (symbol collision with MidiLoop, `mockbaMagic`'s
-address-patching, the diagnostics thread, the per-sample mix loop itself) but
-not the ring bookkeeping/atomics/backlog-trim path, nor something specific to a
-real voice host's own thread/MIDI-client behavior that a minimal test producer
-wouldn't exhibit. See DESIGN.md's "Known limitations" for the full trail.
+### 2.1 Pads/buttons go dead when restarting `acvs` with an In-bus voice attached — not root-caused
+Restarting `acvs` while an **In-bus** voice (Maze Voice, DX7, JV-880, Crate
+Digger, Kit Builder's preview) is attached can reliably make pads/buttons
+unresponsive (occasionally Wi-Fi too). Never observed with zero voices
+attached. Investigation has ruled out several specific mechanisms (symbol
+collision with MidiLoop, `mockbaMagic`'s address-patching, the diagnostics
+thread, the per-sample mix loop itself) but not the ring bookkeeping/atomics/
+backlog-trim path, nor something specific to a real voice host's own
+thread/MIDI-client behavior that a minimal test producer wouldn't exhibit.
+See DESIGN.md's "Known limitations" for the full trail. **Confirmed NOT to
+apply to Skipback** (a pure consumer of a different, extraction-only ring)
+— see the table above and §2.3.
 
 **Current operating rule (not a workaround, the permanent model until this is
-root-caused): never restart `acvs` while any voice is attached.** See DESIGN.md's
-"Boot sequence & the operational safety rule".
+root-caused): never restart `acvs` while any In-bus voice is attached.** See
+DESIGN.md's "Boot sequence & the operational safety rule".
 
 ### 2.2 Out-bus → physical Out 3/4 jacks — needs ears, not more code
 `injectTone --bus out`'s ring was confirmed via the diagnostics thread
@@ -53,10 +57,22 @@ channels 0/1 (Main mix). Nothing in software distinguishes "reaching the jacks"
 from "a cable that happens to be unplugged." Needs someone physically at the
 device with a cable into Out 3/4 (or a scope/interface) to actually confirm.
 
-### 2.3 Open Question #1 (from `docs/PROPOSAL-force-audio-jack.md`)
-Does restarting `acvs` while an **Out-bus or Skipback** ring is attached kill
-pads/buttons the same way it does for In-bus rings (§2.1)? Untested — test
-deliberately, expecting to have to recover, not during normal use.
+### 2.3 Open Question #1 (from `docs/PROPOSAL-force-audio-jack.md`) — resolved for Skipback, still open for Out-bus
+Does restarting `acvs` while an Out-bus or Skipback ring is attached kill
+pads/buttons the same way it does for In-bus rings (§2.1)?
+
+**Skipback: tested and resolved, 2026-09-23 — no, it's safe.** Three
+consecutive live `systemctl restart acvs` restarts with `skipbackHost`
+attached and continuously recording all came back clean: the process itself
+was untouched across every restart (never crashed, never needed relaunch),
+pads/touchscreen/WiFi were confirmed responsive after each one, and a
+trigger-save (`touch /tmp/forceAudioJack.skipback`) produced a correct WAV
+after every restart too. `addon-skipback` now ships `AUTOLAUNCHABLE: true`
+with its own `manage.sh`/`run_skipbackHost.sh` on the strength of this
+result — see the table in §1.
+
+**Out-bus: still untested.** Test deliberately, expecting to have to
+recover, not during normal use.
 
 ### 2.4 Ring-backlog aliasing bug — confirmed, not fixed
 `avail = (head - tail) & (AI_RING_FRAMES - 1)` can alias if the true unconsumed

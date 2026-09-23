@@ -223,7 +223,11 @@ you want — each one brings its own control page along with it.
    - `ForceShadowTestTone`: a sine-wave producer for checking that the
      audio layer works. It gets its own toggle on the nodeServer Modules page.
    - `ForceAudioJackSkipback`: Skipback, which saves the last N seconds of
-     the main mix retroactively.
+     the main mix retroactively. Has its own `manage.sh` — run
+     `sh /media/<serial>/AddOns/ForceAudioJackSkipback/manage.sh ENABLE`
+     once and it starts recording immediately, then keeps running on
+     every future boot and `acvs` restart on its own (confirmed safe,
+     unlike a voice producer — see `audio/README.md`'s "The hard rule").
 2. **Enable it:**
    ```
    ssh root@<force-ip> 'sh /media/<serial>/AddOns/ForceShadow/manage.sh ENABLE'

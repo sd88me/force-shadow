@@ -6,11 +6,13 @@ MidiLoop wiring, and the force-audioin → force-audio-jack rebrand) —
 **none of the new functionality has been deployed to the device or
 live-tested against real MPC/ALSA yet**, only unit-tested (57 checks
 against the real mixing code) and, for `skipbackHost`, smoke-tested
-natively against a synthetic producer. A live-test pass on real hardware
-(per the still-open pads/buttons risk in Open Question #1) is the
-remaining work before any of this is considered done. This doc is kept up
-to date as work lands — see `DESIGN.md` for the parts of the *original*
-force-audioin that are shipped/stable on real hardware today.
+natively against a synthetic producer. Live-tested since: In-bus→Main→Skipback
+confirmed working with clean real audio, and Open Question #1's pads/buttons
+risk is now resolved for Skipback specifically (confirmed safe across three
+live `acvs` restarts, 2026-09-23 — see `docs/HANDOFF-force-audio-jack.md`
+§2.3) — still open for Out-bus. This doc is kept up to date as work lands —
+see `DESIGN.md` for the parts of the *original* force-audioin that are
+shipped/stable on real hardware today.
 
 ## Confirmed hardware facts (live on 192.168.1.187, MPC pid 997)
 

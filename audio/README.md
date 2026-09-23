@@ -118,10 +118,16 @@ the reference point this add-on's design started from.
   instead of Audio-In 1/2 — lets a synth module choose whether its
   audio stays inside Force OS or goes out to an external
   device/mixer. See [docs/PROPOSAL-force-audio-jack.md](docs/PROPOSAL-force-audio-jack.md).
-- **Skipback (new, not yet hardware-verified).** Continuously records
-  the real main-mix output into a rolling buffer, so a `SHIFT+RECORD`
-  shortcut saves the last N seconds retroactively as a WAV, named with
-  the current project and tempo when available.
+- **Skipback (hardware-verified, auto-launches at boot).** Continuously
+  records the real main-mix output into a rolling buffer, so a
+  `SHIFT+RECORD` shortcut (or an add-on's own trigger, e.g. Force Crate
+  Digger's SKIPBACK REC button) saves the last N seconds retroactively as
+  a WAV, named with the current project and tempo when available. Enable
+  it once (`addon-skipback/manage.sh ENABLE`) and it stays running across
+  every future boot and `acvs` restart on its own — confirmed safe across
+  three consecutive live restarts (2026-09-23), unlike voice producers,
+  since it's a pure *consumer* of a separate ring, not something injecting
+  audio MPC reads from. See [The hard rule](#the-hard-rule) below.
 
 ## Requirements
 
@@ -143,6 +149,12 @@ Installation](../README.md#installation) steps: `AddOns/ForceShadow/manage.sh
 ENABLE` arms this tap and the visual layer together, with **zero voices
 attached** at boot. Copy the optional `ForceShadowTestTone` folder too if
 you want the test tone described below.
+
+For Skipback specifically, one more step (a real add-on with its own
+`manage.sh`, not covered by the step above): copy `addon-skipback/` to
+`AddOns/ForceAudioJackSkipback` and run `sh manage.sh ENABLE` — this
+starts recording immediately and keeps it running on every future boot
+and `acvs` restart, with no further action needed.
 
 ## Using force-audio-jack
 
@@ -213,6 +225,15 @@ own device-level maintenance:
 The underlying cause is not yet fully identified — see
 [DESIGN.md's Known limitations](DESIGN.md#known-limitations) for what's
 been ruled out and what's still suspected.
+
+**Exception: Skipback.** This rule is about In-bus *voice producers*
+(Maze Voice, DX7, JV-880, and friends — processes that write audio MPC
+reads from). `skipbackHost` is a pure *consumer* of a separate ring and
+is confirmed safe left running across an `acvs` restart — see
+[Skipback](#skipback-hardware-verified-auto-launches-at-boot) above and
+`docs/HANDOFF-force-audio-jack.md` §2.3 for the test that established
+this. Out-bus injection is still a producer, so the rule still applies
+to it.
 
 ## Building from source
 

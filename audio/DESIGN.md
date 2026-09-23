@@ -286,6 +286,21 @@ voice add-on's own boot script.
   [Known limitations](#known-limitations) below for the investigation
   into the root cause.
 
+**Exception: Skipback.** Everything above is specifically about **In-bus
+voice producers** — processes that write into a ring `forceAudioJack.so`'s
+`readi` hook mixes into MPC's own capture. `skipbackHost` is architecturally
+different: a pure *consumer* of a separate extraction ring, reading audio
+`forceAudioJack.so`'s `writei` hook already captured, never writing into
+anything MPC reads from. Three consecutive live `acvs` restarts with
+`skipbackHost` attached and recording (2026-09-23) all came back clean —
+process untouched, pads/touchscreen/WiFi responsive, a trigger-save still
+worked correctly every time (see `audio/docs/HANDOFF-force-audio-jack.md`
+§2.3 for the full result). On the strength of this, `addon-skipback` now
+auto-launches at boot (`AUTOLAUNCHABLE: true`, its own `manage.sh`) rather
+than requiring the Modules-page toggle every voice producer still needs.
+This exception does **not** extend to Out-bus injection, which shares the
+same producer role as In-bus and remains untested.
+
 Verified end-to-end on real hardware: enabled persistently, survived a
 real physical reboot (zero voices, pads/Wi-Fi fine), started via the
 Modules toggle (lazy-attach confirmed via `/proc/<mpc-pid>/maps`, no
@@ -523,10 +538,13 @@ either, which is the mistake that cost this project several days.
   real-time rate (`mix_out_one`'s `consumed` counter tracking `produced`
   at ~44100/s) — reaching the physical jacks themselves still needs ears,
   since Skipback deliberately only records channels 0/1 (see next point).
-  **Still open**: Open Question #1 from `docs/PROPOSAL-force-audio-jack.md`
-  — whether restarting `acvs` with an Out-bus or Skipback ring attached
-  kills pads/buttons the way it does for In-bus rings. Test deliberately,
-  expecting to have to recover.
+  **Open Question #1 from `docs/PROPOSAL-force-audio-jack.md`** — whether
+  restarting `acvs` with an Out-bus or Skipback ring attached kills
+  pads/buttons the way it does for In-bus rings — is now **resolved for
+  Skipback: confirmed safe**, three consecutive live restarts, see
+  "Boot sequence & the operational safety rule" above and
+  `docs/HANDOFF-force-audio-jack.md` §2.3. **Still open for Out-bus** —
+  test deliberately, expecting to have to recover.
 - **Skipback records channels 0/1 (Main mix) only, by design** — it will
   never see anything injected via `--bus out`, which lives on channels
   2/3 (physical Out 3/4). This isn't a bug, but it's an easy trap when
