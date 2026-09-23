@@ -1456,7 +1456,7 @@ static void build_launcher_tab(int tab) {
         launcher_upper(label, sizeof(label), tgt->display_name[0] ? tgt->display_name : "ADD-ON");
         /* Engine running state, not this addon's own theme (it may not
          * even have one drawn yet) -- red/green against the launcher's
-         * own go_off/go_on colors, same pair its "ENGINE ON/OFF" pill
+         * own go_off/go_on colors, same pair its "POWER ON/OFF" pill
          * would use on that addon's own page. An addon with no engine
          * at all (engine_process_name empty) reads as "off": there's
          * nothing to turn on. */
@@ -2533,9 +2533,9 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         /* Outlined cell always; ON = inverted (dark glass, green dots). */
         fill_rrect_land(map, stride_px, ENGINE_BTN_X - 3, 11, ENGINE_BTN_W + 6, 50, 8, th.dsp_bezel);
         if (engine_on_snap)
-            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE ON", 3, th.dsp_bezel, 0xFF1C2612u, 0xFFCDEB63u);
+            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "POWER ON", 3, th.dsp_bezel, 0xFF1C2612u, 0xFFCDEB63u);
         else
-            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "ENGINE OFF", 3, th.dsp_cell, th.dsp_off, th.dsp_ink);
+            dot_cell(map, stride_px, ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "POWER OFF", 3, th.dsp_cell, th.dsp_off, th.dsp_ink);
       } else if (th.td3) {
         /* black pill: lit dot + START (red) when stopped, RUNNING (green) when up */
         uint32_t c = engine_on_snap ? th.go_on : th.go_off;
@@ -2548,7 +2548,7 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
         uint32_t fg = engine_on_snap ? BTN_TEXT : UI_INK_FAINT;
         fill_rect_land(map, stride_px, ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bg);
         draw_text_land_c(map, stride_px, ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
-                          engine_on_snap ? "ENGINE ON" : "ENGINE OFF", 2, fg);
+                          engine_on_snap ? "POWER ON" : "POWER OFF", 2, fg);
       }
     }
 

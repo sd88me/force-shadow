@@ -196,7 +196,7 @@ operation.
 page.
 
 **Turning the add-on's engine on or off:** tap the status button in the
-top-right corner of its page (reads ENGINE ON / ENGINE OFF, or a
+top-right corner of its page (reads POWER ON / POWER OFF, or a
 lit/unlit dot depending on the page's visual style). This starts or
 stops that add-on's background process directly — no separate combo
 needed.

@@ -64,12 +64,27 @@ static uint32_t KNOB_DOT_COLOR = 0xc1552f;  /* theme_knob_dot -- defaults to ACC
  * buttons, pill engine button") -- this preview mirrors that branch, not
  * an approximation of it. */
 static int      G_TD3      = 0;
+static int      G_LCD      = 0;   /* style=lcd -- LCD nameplate title box (DX7's own style) */
 static uint32_t TD3_BOX        = 0x1f1f1f;
 static uint32_t TD3_BTN_BG     = 0xe8341c;
 static uint32_t TD3_CHROME_INK = 0x0a0a0a;
 static uint32_t TD3_GO_ON      = 0x35d07f;
 static uint32_t TD3_GO_OFF     = 0xe8341c;
 static uint32_t TD3_TABS_BG    = 0xd9ac00;
+
+/* topbar_style=display -- whole top bar is a simulated dot-matrix LCD (JV-880/
+ * DX7's own style, per their shadow_page.conf headers). Mirrors force_shadow.c's
+ * ui_theme_t.dsp/dsp_bg/dsp_cell/dsp_ink/dsp_off/dsp_bezel field-for-field --
+ * this preview used to have no idea these keys existed and fell through to
+ * the plain default topbar instead, which is why it didn't match the real
+ * device render for these two addons. Defaults match force_shadow.c's own
+ * THEME_DEFAULT fallback values. */
+static int      G_DSP       = 0;
+static uint32_t DSP_BG      = 0x1c2612;
+static uint32_t DSP_CELL    = 0x24301a;
+static uint32_t DSP_INK     = 0xcdeb63;
+static uint32_t DSP_OFF     = 0x2c3a1d;
+static uint32_t DSP_BEZEL   = 0x0d1108;
 
 /* ---- primitives ---- */
 static void put_px(int x, int y, uint32_t color) {
@@ -152,6 +167,63 @@ static void draw_arrow(int cx, int cy, int size, int dir, uint32_t color) {
         int half = size - c;        /* full height at the base, tapers to the tip */
         fill_rect(base_x + dir * c, cy - half, 1, half * 2 + 1, color);
     }
+}
+
+/* ---- Dot-matrix display (topbar_style=display), ported from
+ * force_shadow.c's own DOTFONT/dot_glyph/dot_text_width/dot_cell/
+ * dot_cell_fit (5x7 HD44780-style font, distinct from the 8x8 font below --
+ * this is what JV-880/DX7's "yellow-green LCD-backlight" topbar actually
+ * draws; without it, this preview fell back to the plain default topbar,
+ * which is why it didn't match how these two addons really look. */
+typedef struct { char c; uint8_t r[7]; } dotglyph_t;
+static const dotglyph_t DOTFONT[] = {
+ {'0',{14,17,19,21,25,17,14}},{'1',{4,12,4,4,4,4,14}},{'2',{14,17,1,2,4,8,31}},{'3',{31,2,4,2,1,17,14}},
+ {'4',{2,6,10,18,31,2,2}},{'5',{31,16,30,1,1,17,14}},{'6',{6,8,16,30,17,17,14}},{'7',{31,1,2,4,8,8,8}},
+ {'8',{14,17,17,14,17,17,14}},{'9',{14,17,17,15,1,2,12}},
+ {'A',{14,17,17,31,17,17,17}},{'B',{30,17,17,30,17,17,30}},{'C',{14,17,16,16,16,17,14}},{'D',{28,18,17,17,17,18,28}},
+ {'E',{31,16,16,30,16,16,31}},{'F',{31,16,16,30,16,16,16}},{'G',{14,17,16,23,17,17,15}},{'H',{17,17,17,31,17,17,17}},
+ {'I',{14,4,4,4,4,4,14}},{'J',{7,2,2,2,2,18,12}},{'K',{17,18,20,24,20,18,17}},{'L',{16,16,16,16,16,16,31}},
+ {'M',{17,27,21,21,17,17,17}},{'N',{17,17,25,21,19,17,17}},{'O',{14,17,17,17,17,17,14}},{'P',{30,17,17,30,16,16,16}},
+ {'Q',{14,17,17,17,21,18,13}},{'R',{30,17,17,30,20,18,17}},{'S',{15,16,16,14,1,1,30}},{'T',{31,4,4,4,4,4,4}},
+ {'U',{17,17,17,17,17,17,14}},{'V',{17,17,17,17,17,10,4}},{'W',{17,17,17,21,21,21,10}},{'X',{17,17,10,4,10,17,17}},
+ {'Y',{17,17,10,4,4,4,4}},{'Z',{31,1,2,4,8,16,31}},
+ {'-',{0,0,0,31,0,0,0}},{'.',{0,0,0,0,0,12,12}},{'/',{1,1,2,4,8,16,16}},{':',{0,12,12,0,12,12,0}},
+ {'+',{0,4,4,31,4,4,0}},{'#',{10,10,31,10,31,10,10}},{'&',{12,18,20,8,21,18,13}},{'>',{16,8,4,2,4,8,16}},
+};
+static const uint8_t *dot_glyph(char ch) {
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    for (size_t i = 0; i < sizeof(DOTFONT) / sizeof(DOTFONT[0]); i++)
+        if (DOTFONT[i].c == ch) return DOTFONT[i].r;
+    return NULL;
+}
+static int dot_text_width(const char *s, int p) { return (int)strlen(s) * 6 * p; }
+static void dot_cell(int x, int y, int w, int h, const char *s, int p,
+                      uint32_t cell_bg, uint32_t unlit, uint32_t lit) {
+    fill_rr(x, y, w, h, 5, cell_bg);
+    int ncols = s ? (int)strlen(s) * 6 - 1 : 0;
+    int gcols = (w - 8) / p, grows = (h - 6) / p;
+    int gx = x + (w - gcols * p) / 2 + (p - (p > 3 ? 3 : 2)) / 2, gy = y + (h - grows * p) / 2 + 1;
+    int du = p - 2;
+    int c0 = (gcols - ncols) / 2, r0 = (grows - 7) / 2;
+    for (int r = 0; r < grows; r++)
+        for (int c = 0; c < gcols; c++)
+            fill_rect(gx + c * p, gy + r * p, du, du, unlit);
+    for (int i = 0; s && s[i]; i++) {
+        const uint8_t *g = dot_glyph(s[i]);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 5; c++)
+                if (g[r] & (16 >> c))
+                    fill_rect(gx + (c0 + i * 6 + c) * p, gy + (r0 + r) * p, du, du, lit);
+    }
+}
+static void dot_cell_fit(int x, int y, int w, int h, const char *s,
+                          uint32_t cell_bg, uint32_t unlit, uint32_t lit) {
+    char tb[48]; snprintf(tb, sizeof(tb), "%s", s);
+    int p = 4;
+    if (dot_text_width(tb, p) > w - 20) p = 3;
+    while (strlen(tb) > 1 && dot_text_width(tb, p) > w - 20) tb[strlen(tb) - 1] = 0;
+    dot_cell(x, y, w, h, tb, p, cell_bg, unlit, lit);
 }
 
 /* ---- text (font8x8.h) ---- */
@@ -306,6 +378,14 @@ static const char *TABS[] = { "VOICE", "WAVEFOLDER / FILTER", "MOD / RANDOM / MI
 static void widget_readout(int cx, int cy, int w, int h, const char *label, const char *text) {
     int x0 = cx - w/2, y0 = cy - h/2;
     if (label[0]) draw_text(x0, y0 - 22, label, 1.5f, INK_DIM);
+    /* topbar_style=display: this readout sits in the dot-matrix LCD bar
+     * (JV-880/DX7's bank_name display) -- drawn as a dot cell, not the
+     * plain LCD-well box every other page uses. See draw_chrome_named()'s
+     * own G_DSP branch for the surrounding bezel. */
+    if (G_DSP && cy < TOPBAR_H) {
+        dot_cell_fit(x0, y0, w, h, text, DSP_CELL, DSP_OFF, DSP_INK);
+        return;
+    }
     fill_rect(x0, y0, w, h, LCD_BG);
     fill_rect(x0, y0, w, 1, PLATE_LINE);
     fill_rect(x0, y0 + h - 1, w, 1, PLATE_LINE);
@@ -321,11 +401,18 @@ static void widget_readout(int cx, int cy, int w, int h, const char *label, cons
 static void widget_stepper(int cx, int cy, int w, int h, const char *label, const char *text) {
     int x0 = cx - w/2, y0 = cy - h/2;
     if (label[0]) draw_text(x0, y0 - 22, label, 1.5f, INK_DIM);
-    fill_rr(x0, y0, h, h, 5, PLATE_LINE);
-    fill_rr(x0 + w - h, y0, h, h, 5, PLATE_LINE);
-    draw_arrow(x0 + h/2, cy, h/4, -1, ACCENT_HI);
-    draw_arrow(x0 + w - h/2, cy, h/4, 1, ACCENT_HI);
+    int topdsp = G_DSP && cy < TOPBAR_H;
+    uint32_t abg = topdsp ? DSP_BEZEL : PLATE_LINE;
+    uint32_t afg = topdsp ? DSP_BG    : ACCENT_HI;
+    fill_rr(x0, y0, h, h, 5, abg);
+    fill_rr(x0 + w - h, y0, h, h, 5, abg);
+    draw_arrow(x0 + h/2, cy, h/4, -1, afg);
+    draw_arrow(x0 + w - h/2, cy, h/4, 1, afg);
     int bx = x0 + h + 3, bw = w - 2*h - 6;
+    if (topdsp) {
+        dot_cell_fit(bx, y0, bw, h, text, DSP_CELL, DSP_OFF, DSP_INK);
+        return;
+    }
     fill_rect(bx, y0, bw, h, LCD_BG);
     fill_rect(bx, y0, bw, 1, PLATE_LINE);
     fill_rect(bx, y0 + h - 1, bw, 1, PLATE_LINE);
@@ -366,9 +453,44 @@ static void draw_chrome_named(const char *title, const char **tabs, int ntabs, i
     fill_rect(0, 0, LAND_W, LAND_H, PLATE);
     fill_rect(0, 0, LAND_W, TOPBAR_H, PLATE_HI);
     draw_hline(0, TOPBAR_H, LAND_W, PLATE_LINE);
-    draw_text(40, G_TD3 ? 20 : 28, title, G_TD3 ? 3 : 2, G_TD3 ? TD3_CHROME_INK : INK);
 
-    if (G_TD3) {
+    if (G_DSP) {
+        /* Whole bar = backlit dot-matrix LCD: dark rounded bezel, green
+         * (or whatever theme_display_* says) glass, dark dot cells for the
+         * nameplate and engine button. Ported from force_shadow.c's own
+         * G_DSP/th.dsp branch (~line 2489) -- this preview used to have no
+         * idea this style existed and fell through to the plain default
+         * title text instead, which is why JV-880/DX7 didn't match their
+         * real on-device look. */
+        fill_rr(8, 5, LAND_W - 16, TOPBAR_H - 10, 12, DSP_BEZEL);
+        fill_rr(12, 9, LAND_W - 24, TOPBAR_H - 18, 9, DSP_BG);
+        int tw_px = dot_text_width(title, 4) + 24;
+        fill_rr(17, 11, tw_px + 6, 50, 8, DSP_BEZEL);
+        dot_cell(20, 14, tw_px, 44, title, 4, DSP_BEZEL, 0x1c2612, 0xcdeb63);
+    } else if (G_LCD) {
+        /* LCD nameplate instead of the plain title (DX7's own style, ported
+         * from force_shadow.c's th.lcd branch, ~line 2498) -- this preview
+         * previously fell through to the plain title text for style=lcd
+         * too, which is the other half of why DX7 didn't match its real
+         * on-device look. */
+        int tw_px = text_width(title, 2.5f) + 48;
+        fill_rect(24, 12, tw_px, TOPBAR_H - 24, LCD_BG);
+        fill_rect(24, 12, tw_px, 1, ACCENT);
+        fill_rect(24, TOPBAR_H - 13, tw_px, 1, ACCENT);
+        draw_text(48, 24, title, 2.5f, ACCENT_HI);
+        fill_rect(0, TOPBAR_H - 2, LAND_W, 2, ACCENT);
+    } else {
+        draw_text(40, G_TD3 ? 20 : 28, title, G_TD3 ? 3 : 2, G_TD3 ? TD3_CHROME_INK : INK);
+    }
+
+    if (G_DSP) {
+        /* Outlined cell always; ON = inverted (dark glass, lit dots). */
+        fill_rr(ENGINE_BTN_X - 3, 11, ENGINE_BTN_W + 6, 50, 8, DSP_BEZEL);
+        if (engine_on)
+            dot_cell(ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "POWER ON", 3, DSP_BEZEL, 0x1c2612, 0xcdeb63);
+        else
+            dot_cell(ENGINE_BTN_X, 14, ENGINE_BTN_W, 44, "POWER OFF", 3, DSP_CELL, DSP_OFF, DSP_INK);
+    } else if (G_TD3) {
         /* black pill: lit dot + START (red) when stopped, RUNNING (green) when up */
         uint32_t c = engine_on ? TD3_GO_ON : TD3_GO_OFF;
         fill_rr(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, ENGINE_BTN_H/2, PLATE_LINE);
@@ -380,7 +502,7 @@ static void draw_chrome_named(const char *title, const char **tabs, int ntabs, i
         uint32_t bfg = engine_on ? INK : INK_FAINT;
         fill_rect(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bbg);
         draw_text_c(ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
-                    engine_on ? "ENGINE ON" : "ENGINE OFF", 2, bfg);
+                    engine_on ? "POWER ON" : "POWER OFF", 2, bfg);
     }
 
     int tabbar_y = LAND_H - TABBAR_H;
@@ -460,7 +582,8 @@ static void load_conf(const char *path) {
         char *s = line; while (*s == ' ' || *s == '\t') s++;
         if (!*s || *s == '#') continue;
         if (!strncmp(s, "display_name=", 13)) { kv_str(s, "display_name", g_display_name, sizeof(g_display_name)); continue; }
-        if (!strncmp(s, "style=", 6)) { G_TD3 = !strcmp(s + 6, "td3"); continue; }
+        if (!strncmp(s, "style=", 6)) { G_TD3 = !strcmp(s + 6, "td3"); G_LCD = !strcmp(s + 6, "lcd"); continue; }
+        if (!strncmp(s, "topbar_style=", 13)) { G_DSP = !strcmp(s + 13, "display"); continue; }
         if (!strncmp(s, "theme_", 6)) {
             /* theme_<name>=RRGGBB (no '#') -- mirrors force_shadow.c's own
              * theme_ parsing (parse_shadow_page_conf()) field-for-field. */
@@ -497,6 +620,11 @@ static void load_conf(const char *path) {
                 else if (!strcmp(key, "go_off"))      TD3_GO_OFF = c;
                 else if (!strcmp(key, "tabs"))        TD3_TABS_BG = c;
                 else if (!strcmp(key, "knob_dot"))    KNOB_DOT_COLOR = c;
+                else if (!strcmp(key, "display_bg"))     DSP_BG = c;
+                else if (!strcmp(key, "display_cell"))   DSP_CELL = c;
+                else if (!strcmp(key, "display_ink"))    DSP_INK = c;
+                else if (!strcmp(key, "display_off"))    DSP_OFF = c;
+                else if (!strcmp(key, "display_bezel"))  DSP_BEZEL = c;
                 /* well/knob_off not used by any widget kind our own page
                  * needs yet -- add when a page that does comes along. */
             }

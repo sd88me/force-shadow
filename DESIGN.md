@@ -173,7 +173,7 @@ the new add-on's first tab and resets tab position to the first tab.
     the one on screen, so the size doesn't jump on a tab switch),
     capped so it can never exceed a grid cell. Each button's fill color
     reflects that add-on's own engine state (`th.go_on`/`th.go_off` --
-    the same red/green pair its own page's ENGINE ON/OFF pill uses),
+    the same red/green pair its own page's POWER ON/OFF pill uses),
     checked fresh via `is_process_running()` every time the launcher
     page opens or its tab changes; an add-on with no `engine_process_name`
     at all reads as "off" (nothing to turn on). The top bar shows a

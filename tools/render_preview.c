@@ -230,7 +230,7 @@ static void draw_chrome(int active_tab, int engine_on) {
     uint32_t bfg = engine_on ? INK : INK_FAINT;
     fill_rect(ENGINE_BTN_X, ENGINE_BTN_Y, ENGINE_BTN_W, ENGINE_BTN_H, bbg);
     draw_text_c(ENGINE_BTN_X + ENGINE_BTN_W/2, ENGINE_BTN_Y + ENGINE_BTN_H/2 - 6,
-                engine_on ? "ENGINE ON" : "ENGINE OFF", 2, bfg);
+                engine_on ? "POWER ON" : "POWER OFF", 2, bfg);
 
     int tabbar_y = LAND_H - TABBAR_H;
     fill_rect(0, tabbar_y, LAND_W, TABBAR_H, BAR_BG);
