@@ -11,7 +11,7 @@
     { "NAME": "gain (0-1)", "VALUE": "0.2" },
     { "NAME": "channels (1|2)", "VALUE": "1" },
     { "NAME": "slot flag", "VALUE": "--slot" },
-    { "NAME": "voice slot (0-3 in / 0-1 out)", "VALUE": "1" },
+    { "NAME": "voice slot (0-7 in / 0-1 out)", "VALUE": "1" },
     { "NAME": "channel flag", "VALUE": "--channel" },
     { "NAME": "channel (L|R|LR, or Out3|Out4|both on bus=out)", "VALUE": "R" },
     { "NAME": "bus flag", "VALUE": "--bus" },

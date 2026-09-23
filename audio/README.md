@@ -163,6 +163,31 @@ controlled directly by that voice's own control socket (e.g. Maze
 Voice's own on-screen or web controls) — force-audio-jack itself has no
 separate mixer page of its own.
 
+### In-bus voice slot registry
+
+Every producer picks its own In-bus slot via `--mix-slot N` (own
+argument, own `NSMODULE.json`) — force-audio-jack doesn't allocate these
+for you, so two add-ons pointed at the same slot will silently fight
+over one shared-memory ring. `AI_MAX_VOICES` is 8 (slots 0–7,
+`audio/src/forceAudioInject.h`); this is the current known allocation,
+kept here as the one place to check before adding a new voice producer:
+
+| Slot | Add-on | Confirmed on real hardware? |
+|---|---|---|
+| 0 | [Maze Voice](https://github.com/sd88me/force-maze) (`maze_host`) | Yes |
+| 1 | [JV-880](https://github.com/sd88me/force-jv880) (`jv_host`) | Yes |
+| 2 | [DX7](https://github.com/sd88me/force-dx7) (`dx7_host`) | Yes |
+| 3 | [Kit Builder](https://github.com/sd88me/force-kit-builder) preview (`preview_host`) | **No** — chosen because 0–2 were taken, never checked live against `/dev/shm` |
+| 4 | [Crate Digger](https://github.com/sd88me/force-cratedigger) (`cratedigger_host`) | No — previously defaulted to slot 0 (colliding with Maze Voice), moved to 4 |
+| 5–7 | *(unclaimed)* | — |
+
+This add-on's own `injectTone` diagnostic tool (`addon-testtone/`)
+defaults to slot 1 for testing — that's a deliberate, temporary
+overlap with JV-880 for diagnostic use one at a time, not a real
+allocation; don't run it alongside JV-880 itself. Out-bus injection
+(`AI_MAX_OUT_VOICES`, physical Out 3/4) is a separate, smaller pool —
+currently only `injectTone` exercises it, at slot 0 or 1.
+
 ## The hard rule
 
 **Never restart `acvs` while any voice is attached.**
