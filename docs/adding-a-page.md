@@ -63,6 +63,19 @@ typedef struct {
     char engine_nsmodule_path[160];
     char engine_dirname[32];
     char engine_arguments_json[768];
+
+    /* engine_autostart=1: for a utility add-on that only does anything
+     * while its own page is open (no reason to keep it running once you
+     * leave), starts/stops the engine automatically as the page becomes
+     * active/inactive instead of requiring a manual POWER tap. Default 0:
+     * every add-on keeps the manual toggle, unchanged. */
+    int engine_autostart;
+
+    /* engine_hide_button=1: for an engine_autostart add-on, the POWER
+     * pill is redundant — hides it (and its hit box) while leaving
+     * engine_process_name/engine_autostart's own start/stop wiring
+     * untouched. Purely cosmetic. */
+    int engine_hide_button;
 } addon_descriptor_t;
 ```
 
@@ -101,6 +114,16 @@ engine_process_name=<PROCESSNAME>
 engine_nsmodule_path=<absolute path to this add-on's own NSMODULE.json>
 engine_dirname=<DIRNAME>
 engine_arguments_json=<that NSMODULE.json's ARGUMENTS array, verbatim, one line>
+
+# optional, both default 0/off if omitted:
+engine_autostart=<1: start/stop this engine automatically as the page
+      becomes active/inactive, instead of a manual POWER tap -- for a
+      utility add-on that only does anything while its own page is open
+      (e.g. an audible pad-preview producer)>
+engine_hide_button=<1: hide the POWER pill entirely -- only makes sense
+      alongside engine_autostart=1, where a manual toggle would be
+      redundant; the engine still starts/stops the same either way, this
+      only affects what's drawn>
 
 [tab <name>]
 frame   x=<n> y=<n> w=<n> h=<n> title="<text>"
@@ -480,8 +503,10 @@ and after every revert.
       deployed alongside its own install — `ctrl_sock`, `display_name`,
       tabs, and widgets, plus the four `engine_*` fields copied
       verbatim from its own `NSMODULE.json` if it should get an on/off
-      button. That's the entire integration — no Force Shadow source
-      change needed at all.
+      button (add `engine_autostart`/`engine_hide_button` too if it's a
+      utility add-on that should start/stop with the page itself rather
+      than a manual toggle). That's the entire integration — no Force
+      Shadow source change needed at all.
 - [ ] Every piece of text is uppercase — `display_name`, every
       `label=`/`title=`, every `options=` entry (the font has no
       lowercase glyphs; a lowercase letter renders as blank space, not
