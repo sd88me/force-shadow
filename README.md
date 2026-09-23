@@ -289,7 +289,7 @@ The audio layer is cross-compiled with zig instead of Docker:
 `audio/scripts/build.sh` (see its header) writes `addon/forceAudioJack.so`,
 `addon-testtone/injectTone` and `addon-skipback/skipbackHost`. Its unit
 tests run natively with `audio/tests/run.sh`. To build the release zip, run
-`scripts/package.sh v1.1.0`, which writes `dist/ForceShadow-v1.1.0.zip`.
+`scripts/package.sh v1.2.0`, which writes `dist/ForceShadow-v1.2.0.zip`.
 
 **Never `scp` a new `force_shadow.so` directly over a loaded one** on a
 live device — upload to a `.new` filename and `mv` it into place, so a
