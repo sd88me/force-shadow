@@ -35,7 +35,12 @@
 #include <stdio.h>
 
 #define AI_SHM_NAME_FMT "/forceAudioInject%u"  /* %u = voice slot, 0..AI_MAX_VOICES-1 */
-#define AI_MAX_VOICES  4              /* how many simultaneous voice hosts forceAudioJack.so will attach to */
+#define AI_MAX_VOICES  8              /* how many simultaneous voice hosts
+ * forceAudioJack.so will attach to (2026-09-24: raised 4->8 - no hard
+ * technical ceiling, each slot is one small shm struct + a few floats
+ * summed per sample in forceAudioJack.c's mix_in(); real slot usage
+ * outgrew 4 with Maze Voice/JV-880/DX7/Kit Builder Preview all wanting
+ * their own default, leaving none free for Crate Digger) */
 
 /* Out-bus (physical Out 3/4) injection - same ai_shm_t shape, a distinct
  * shm namespace so it never collides with (or is mistaken for) an In-bus

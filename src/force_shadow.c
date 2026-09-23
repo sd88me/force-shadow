@@ -1082,6 +1082,30 @@ typedef struct {
     char engine_dirname[32];         /* NSMODULE.json's DIRNAME */
     char engine_arguments_json[768]; /* NSMODULE.json's ARGUMENTS array, as literal JSON text */
 
+    /* engine_autostart=1 in the conf (2026-09-23): unlike the voice-synth
+     * addons (DX7/JV-880/Maze/Acid), whose engine must survive after you
+     * leave their shadow page -- it's what's actually making sound, kept
+     * running deliberately -- an addon like this one is just a utility
+     * that only does anything while its own page is open (Crate Digger's
+     * browse/search, Kit Builder's pad preview). Making the user find and
+     * hit its own POWER button first is a step it doesn't need: poll_toggle()
+     * starts its engine the moment this addon's page becomes active_addon,
+     * and stops it the moment you leave -- both via the same nodeServer
+     * /moduler path send_engine_toggle() already uses for the button, so
+     * this is purely "who calls it, and when", no new spawn/kill code.
+     * Default 0 (unset): every existing addon keeps requiring a manual
+     * POWER tap, exactly as before. */
+    int engine_autostart;
+
+    /* engine_hide_button=1 in the conf (2026-09-24): for an engine_autostart
+     * addon, the POWER pill is redundant -- there's nothing to manually
+     * start/stop, it's already tied to the page itself. Hides the button
+     * (and its hit box, so nothing dead-zones where it used to be) while
+     * leaving engine_process_name/engine_autostart's own wiring untouched
+     * -- the engine still starts/stops exactly the same, this only
+     * affects what's drawn. */
+    int engine_hide_button;
+
     ui_theme_t theme;    /* colours/style; THEME_DEFAULT unless the conf overrides */
     /* int_values=1 in the conf: this host parses every value with atoi()
      * (DX7), so knobs send a rounded "%d", toggles 1/0 and enums their
@@ -1715,6 +1739,8 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             else if (strcmp(k, "engine_process_name") == 0) strncpy(parsed.engine_process_name, v, sizeof(parsed.engine_process_name) - 1);
             else if (strcmp(k, "engine_nsmodule_path") == 0) strncpy(parsed.engine_nsmodule_path, v, sizeof(parsed.engine_nsmodule_path) - 1);
             else if (strcmp(k, "engine_dirname") == 0) strncpy(parsed.engine_dirname, v, sizeof(parsed.engine_dirname) - 1);
+            else if (strcmp(k, "engine_autostart") == 0) parsed.engine_autostart = atoi(v);
+            else if (strcmp(k, "engine_hide_button") == 0) parsed.engine_hide_button = atoi(v);
             else if (strcmp(k, "style") == 0) { parsed.theme.lcd = (strcmp(v, "lcd") == 0); parsed.theme.td3 = (strcmp(v, "td3") == 0); }
             else if (strcmp(k, "frame_style") == 0) parsed.theme.plain_frames = (strcmp(v, "plain") == 0);
             else if (strcmp(k, "topbar_style") == 0) parsed.theme.dsp = (strcmp(v, "display") == 0);
@@ -2528,7 +2554,7 @@ static void render_shadow_page(uint32_t *map, uint32_t stride_px,
      * dim/grey when the engine's off, lit accent when it's on, matching
      * this project's own web GUIs' toggle convention. Only drawn for an
      * addon that actually has an engine to control. */
-    if (ad->engine_process_name[0]) {
+    if (ad->engine_process_name[0] && !ad->engine_hide_button) {
       if (th.dsp) {
         /* Outlined cell always; ON = inverted (dark glass, green dots). */
         fill_rrect_land(map, stride_px, ENGINE_BTN_X - 3, 11, ENGINE_BTN_W + 6, 50, 8, th.dsp_bezel);
@@ -2936,6 +2962,7 @@ static void maybe_substitute_fb(struct drm_mode_atomic *req) {
 /* Forward-declared: defined later, next to send_engine_toggle() which
  * it's conceptually paired with. */
 static int is_process_running(const char *name);
+static void send_engine_toggle(int addon_id, int want_running);
 
 /* Decides which addon (if any) should be showing, and rebuilds its first
  * tab whenever that decision *changes* -- covers off->on, on->off, and
@@ -2976,6 +3003,7 @@ static void poll_toggle(int full) {
     }
 
     if (requested != active_addon) {
+        int leaving = active_addon;
         pthread_mutex_lock(&touch_mu);
         active_addon = requested;
         current_page = 0;
@@ -2988,6 +3016,51 @@ static void poll_toggle(int full) {
         }
         pthread_mutex_unlock(&touch_mu);
         shadow_redraw_needed = 1;
+
+        /* engine_autostart addons (see the struct field's own comment):
+         * start on arrival, stop on departure -- both bounded 50ms
+         * socket calls (send_engine_toggle()'s own CTRL_SEND_TIMEOUT_MS),
+         * safe to make inline here same as the button-tap path already
+         * does off the touch thread. Checked against is_process_running()
+         * first so re-entering a page that's still starting up (or that
+         * poll_toggle raced with a manual Modules-page toggle) doesn't
+         * fire a redundant/duplicate spawn. */
+        if (leaving != ADDON_NONE && leaving != requested &&
+            addon_table[leaving].engine_autostart &&
+            addon_table[leaving].engine_process_name[0] &&
+            is_process_running(addon_table[leaving].engine_process_name)) {
+            send_engine_toggle(leaving, 0);
+        }
+        if (requested != ADDON_NONE &&
+            addon_table[requested].engine_autostart &&
+            addon_table[requested].engine_process_name[0] &&
+            !is_process_running(addon_table[requested].engine_process_name)) {
+            send_engine_toggle(requested, 1);
+        }
+
+        /* Bug (2026-09-23, live device, DX7): engine_on used to only be
+         * refreshed by the `if (full)` block below, on the DRM-commit-
+         * cadence poll (up to ~6s apart when idle) -- NOT on a page
+         * switch itself. Leaving a page sets active_addon to something
+         * else (or NONE, on the launcher), and the *next* full poll would
+         * then compute engine_on against THAT addon (0 if NONE, since
+         * engine_process_name[0] is empty there) -- landing at 0
+         * regardless of whether the addon you just left is still running.
+         * Re-entering that same page later could read this same now-
+         * stale cached 0 for up to ~6s, showing POWER OFF for an engine
+         * that's actually still on and still making sound (confirmed
+         * live: DX7 kept playing the whole time) -- until the next full
+         * poll, or any touch that happens to force one, corrected it.
+         * Fixed by refreshing engine_on immediately, every page switch,
+         * not just on the slow cadence -- is_process_running() is cheap
+         * enough for an event this infrequent (a page switch, not a
+         * per-frame redraw). This subsumes the `if (full)` block below
+         * for the "just switched" case; that block still matters for the
+         * separate "same page, engine died/started behind our back"
+         * case. */
+        engine_on = (requested != ADDON_NONE && addon_table[requested].engine_process_name[0])
+                        ? is_process_running(addon_table[requested].engine_process_name)
+                        : 0;
     }
     shadow_on = (active_addon != ADDON_NONE);
     if (full)
@@ -3382,8 +3455,29 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         send_ctrl_set(w->param_key, w->text[0] ? w->text : "go");   /* optional val= */
         break;
     case W_ENUM_H:
-    case W_ENUM_V:
-        if (addon_table[active_addon].int_values) {
+    case W_ENUM_V: {
+        /* Bug (2026-09-24, live device, Maze Voice's DEST selector,
+         * confirmed identical in DX7/JV-880's own DEST and Crate
+         * Digger's CHANNEL): a page-wide int_values=1 is one addon's
+         * whole page choosing numeric sends over label sends -- these
+         * four DEST/CHANNEL widgets are the ONE enum on an otherwise
+         * label-driven page (maze_host's chain_params, etc. all expect
+         * option text) that needs a numeric index instead, because their
+         * key (mix.dest_idx / mix.channel_idx) is parsed with atoi() on
+         * the host side. Sending the label text there (e.g. "O3+4")
+         * silently atoi()s to 0 -- every option, since none of these
+         * labels start with a digit -- which reads as "always jumps to
+         * index 0 (IN1) no matter what you tap". A per-page flag can't
+         * fix this without breaking every *other* enum on the same page,
+         * so this key's own name is the signal instead: a "_idx" suffix
+         * is this codebase's existing naming convention for "the host
+         * wants the index, not the text" (see cratedigger's own
+         * cratedig_*_idx get= keys) -- just never actually wired up here
+         * until now. */
+        size_t klen = strlen(w->param_key);
+        int wants_index = addon_table[active_addon].int_values ||
+            (klen > 4 && strcmp(w->param_key + klen - 4, "_idx") == 0);
+        if (wants_index) {
             char buf[16];
             snprintf(buf, sizeof(buf), "%d", w->state);
             send_ctrl_set(w->param_key, buf);
@@ -3391,6 +3485,7 @@ static void send_widget_param(const ui_widget_t *w, int force) {
             send_ctrl_set(w->param_key, w->options[w->state]);
         }
         break;
+    }
     }
 }
 
@@ -3519,7 +3614,7 @@ static void update_touch_state(const struct input_event *ev) {
         const addon_descriptor_t *ad_active = &addon_table[active_addon];
         int32_t tabbar_y = LAND_H - TABBAR_H;
         int num_tabs = ad_active->num_tabs;
-        if (ad_active->engine_process_name[0] &&
+        if (ad_active->engine_process_name[0] && !ad_active->engine_hide_button &&
             lpx >= ENGINE_BTN_X && lpx <= ENGINE_BTN_X + ENGINE_BTN_W &&
             lpy >= ENGINE_BTN_Y && lpy <= ENGINE_BTN_Y + ENGINE_BTN_H) {
             /* Optimistic flip for instant visual feedback -- poll_toggle()'s
