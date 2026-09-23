@@ -67,6 +67,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
@@ -975,7 +976,19 @@ typedef struct {
     int eu_tap;                /* strip only: cell index tapped this touch, -1 = none */
 } ui_widget_t;
 
-typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
+typedef struct {
+    int32_t x, y, w, h; char title[24];
+    /* optional: GET-polled fill colour, e.g. a pad-detail frame lighting
+     * up to match its assigned category. "" = no live colour, draw the
+     * theme's normal static fill (the original, unchanged behaviour).
+     * color_key's GET reply is 6 hex digits (RRGGBB, same convention as
+     * button's static color= override) - anything else leaves has_color
+     * at whatever it last resolved to (stale-but-valid beats flashing
+     * back to the theme default on one bad poll). */
+    char color_key[48];
+    uint32_t color;
+    int has_color;
+} ui_frame_t;
 
 /* ---- Lists (banks / patches) ----
  * A list's names live outside ui_widget_t (which is copied around per
@@ -1303,6 +1316,7 @@ static int add_env(int32_t cx, int32_t cy, int32_t bw, int32_t bh, const char *p
 static void add_frame(int32_t x, int32_t y, int32_t w, int32_t h, const char *title) {
     if (n_page_frames >= MAX_FRAMES) return;
     ui_frame_t *f = &page_frames[n_page_frames++];
+    memset(f, 0, sizeof(*f));   /* color_key/has_color must not leak a previous page's frame in this slot */
     f->x = x; f->y = y; f->w = w; f->h = h;
     strncpy(f->title, title, sizeof(f->title)-1);
 }
@@ -1769,6 +1783,9 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
             add_frame(atoi(shadow_page_kv_get(kv, nkv, "x")), atoi(shadow_page_kv_get(kv, nkv, "y")),
                       atoi(shadow_page_kv_get(kv, nkv, "w")), atoi(shadow_page_kv_get(kv, nkv, "h")),
                       shadow_page_kv_get(kv, nkv, "title"));
+            const char *ck = shadow_page_kv_get(kv, nkv, "color_key");
+            if (ck[0] && n_page_frames > 0)
+                strncpy(page_frames[n_page_frames - 1].color_key, ck, sizeof(page_frames[n_page_frames - 1].color_key) - 1);
         } else if (strcmp(type, "knob") == 0) {
             int ki = add_knob(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "r")), label, key,
                      (float)atof(shadow_page_kv_get(kv, nkv, "min")),
@@ -1914,8 +1931,14 @@ static void discover_data_driven_addons(void) {
 
 static void render_frame_box(uint32_t *map, uint32_t stride_px, const ui_frame_t *f) {
     if (th.td3) {
+        /* color_key (GET-driven, e.g. a pad frame matching its assigned
+         * category) replaces the theme's static fill only -- border,
+         * title, and divider stay the theme's own colours so the title
+         * text keeps its contrast against any category colour. Not
+         * wired for the lcd/default styles below (no addon uses
+         * color_key on those yet); add there the same way if one does. */
         fill_rr_land(map, stride_px, f->x, f->y, f->w, f->h, 10, PLATE_LINE);
-        fill_rr_land(map, stride_px, f->x + 2, f->y + 2, f->w - 4, f->h - 4, 9, th.box);
+        fill_rr_land(map, stride_px, f->x + 2, f->y + 2, f->w - 4, f->h - 4, 9, f->has_color ? f->color : th.box);
         draw_text_land(map, stride_px, f->x + 20, f->y + 14, f->title, 1.5f, UI_ACCENT);
         fill_rect_land(map, stride_px, f->x + 18, f->y + 38, f->w - 36, 1, th.ink_faint);
         return;
@@ -3802,11 +3825,13 @@ static int parse_name_list(const char *json, char names[][LIST_NAME_LEN]) {
 
 static void refresh_page_from_engine(int full) {
     static ui_widget_t snap[MAX_WIDGETS];
-    int n, addon;
+    static ui_frame_t fsnap[MAX_FRAMES];
+    int n, nf, addon;
     unsigned epoch;
     pthread_mutex_lock(&touch_mu);
-    addon = active_addon; epoch = page_epoch; n = n_page_widgets;
+    addon = active_addon; epoch = page_epoch; n = n_page_widgets; nf = n_page_frames;
     memcpy(snap, page_widgets, sizeof(ui_widget_t) * (size_t)n);
+    memcpy(fsnap, page_frames, sizeof(ui_frame_t) * (size_t)nf);
     pthread_mutex_unlock(&touch_mu);
     if (addon == ADDON_NONE) return;
     const char *sock = addon_table[addon].ctrl_sock;
@@ -3906,6 +3931,28 @@ static void refresh_page_from_engine(int full) {
             if (st->per_page > 0 && st->n > 0 && st->page * st->per_page >= st->n) {
                 st->page = (st->n - 1) / st->per_page; changed = 1;
             }
+        }
+        pthread_mutex_unlock(&touch_mu);
+    }
+    /* Frame colours: same fetch-outside/apply-inside pattern as lists
+     * above. GET reply must be exactly 6 hex digits (RRGGBB, matching
+     * button's static color= convention) or it's ignored -- a transient
+     * bad/empty reply keeps whatever colour last resolved rather than
+     * flashing the frame back to the theme default. */
+    for (int i = 0; i < nf; i++) {
+        const ui_frame_t *f = &fsnap[i];
+        if (!f->color_key[0]) continue;
+        if (ctrl_get(sock, f->color_key, buf, sizeof(buf)) != 0) continue;
+        int len = 0; while (buf[len]) len++;
+        if (len != 6) continue;
+        int ok = 1;
+        for (int c = 0; c < 6; c++) if (!isxdigit((unsigned char)buf[c])) { ok = 0; break; }
+        if (!ok) continue;
+        uint32_t col = 0xFF000000u | (uint32_t)strtoul(buf, NULL, 16);
+        pthread_mutex_lock(&touch_mu);
+        if (active_addon == addon && page_epoch == epoch && n_page_frames == nf) {
+            ui_frame_t *pf = &page_frames[i];
+            if (!pf->has_color || pf->color != col) { pf->color = col; pf->has_color = 1; changed = 1; }
         }
         pthread_mutex_unlock(&touch_mu);
     }
