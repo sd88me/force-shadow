@@ -942,6 +942,13 @@ typedef struct {
     int numbered;             /* stepper/list: prefix text with the 1-based index */
     int goto_tab;             /* readout: tapping it switches to this tab (-1 = not tappable) */
     int clean;                /* readout: strip ".syx", _/- -> space */
+    /* readout only: optional val= SET on tap (param_key carries the key,
+     * reusing the same field buttons use, since a readout is otherwise
+     * display-only and never writes param_key itself). Sent before any
+     * goto_tab switch, so a pill can both select something (e.g. "which
+     * pad") and jump to its DETAIL page in one tap. "" = no SET, tab-jump
+     * only (the original goto= behaviour, unchanged). */
+    char set_val[32];
     /* button only, launcher page: >0 = tapping this button writes this
      * addon_table[] slot number into SHADOW_PAGE_FILE instead of sending
      * a ctrl_sock SET (0 = ordinary button; see build_launcher_tab()). */
@@ -978,7 +985,18 @@ typedef struct { int32_t x, y, w, h; char title[24]; } ui_frame_t;
  * many items the engine reports. */
 #define MAX_LISTS 8
 #define MAX_LIST_ITEMS 256
-#define LIST_NAME_LEN 28
+/* Was 28 (27 usable chars) -- a flat cap with no relation to any given
+ * list widget's actual on-screen width, so a wide list (e.g. Crate
+ * Digger's w=1152 results list, ~113 chars at scale=1.5) truncated
+ * labels far short of what it had room to show. render_widget()'s
+ * W_LIST case already does its own correct, per-widget, measured-pixel-
+ * width truncation (text_width_land() vs. the tile's real tw) -- this
+ * constant only needs to be large enough to not itself become the
+ * limiter before that loop runs. 160 comfortably covers every current
+ * list width up to the full landscape canvas at the smallest text
+ * scale, while staying small (list_stores is MAX_LISTS * MAX_LIST_ITEMS
+ * * LIST_NAME_LEN bytes -- 8*256*160 = 320KB, still trivial). */
+#define LIST_NAME_LEN 160
 typedef struct {
     int n, sel, page, per_page;
     char names[MAX_LIST_ITEMS][LIST_NAME_LEN];
@@ -1775,8 +1793,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label,
                         shadow_page_kv_get(kv, nkv, "get"));
             const char *gt = shadow_page_kv_get(kv, nkv, "goto");
-            if (gt[0]) {
-                page_widgets[ri].goto_tab = atoi(gt);
+            const char *val = shadow_page_kv_get(kv, nkv, "val");
+            if (key[0]) strncpy(page_widgets[ri].param_key, key, sizeof(page_widgets[ri].param_key)-1);
+            if (val[0]) strncpy(page_widgets[ri].set_val, val, sizeof(page_widgets[ri].set_val)-1);
+            if (gt[0]) page_widgets[ri].goto_tab = atoi(gt);
+            if (gt[0] || key[0]) {
                 page_widgets[ri].hit_hw = page_widgets[ri].w / 2;
                 page_widgets[ri].hit_hh = page_widgets[ri].h / 2;
             }
@@ -3315,6 +3336,8 @@ static void send_widget_param(const ui_widget_t *w, int force) {
         }
         break;
     case W_READOUT:
+        send_ctrl_set(w->param_key, w->set_val[0] ? w->set_val : "go");
+        break;
     case W_ENV:
         break;
     case W_TOGGLE:
@@ -3625,6 +3648,7 @@ static void update_touch_state(const struct input_event *ev) {
                     break;
                 }
                 case W_READOUT:
+                    if (w->param_key[0]) { send_idx = i; send_force = 1; send_snapshot = *w; }
                     if (w->goto_tab >= 0 && w->goto_tab < num_tabs && w->goto_tab != current_page) {
                         current_page = w->goto_tab;
                         addon_table[active_addon].build_tab(current_page);
