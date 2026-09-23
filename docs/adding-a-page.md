@@ -129,7 +129,7 @@ engine_hide_button=<1: hide the POWER pill entirely -- only makes sense
 frame   x=<n> y=<n> w=<n> h=<n> title="<text>"
 knob    cx=<n> cy=<n> r=<n> label="<text>" key=<name> min=<f> max=<f> pct=<0-100>
 toggle  cx=<n> cy=<n> label="<text>" key=<name> on=<0|1>
-button  cx=<n> cy=<n> label="<text>" key=<name> [val=<text>]
+button  cx=<n> cy=<n> label="<text>" key=<name> [val=<text>] [color=<RRGGBB>] [text_color=<RRGGBB>]
 enum_h  cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index> [sw=<segment px>]
 enum_v  cx=<n> cy=<n> label="<text>" key=<name> options="<a>,<b>,<c>" active=<index>
 ```
@@ -197,7 +197,11 @@ list    x=<n> y=<n> w=<n> h=<n> key=<SET key> items=<GET key -> JSON [{label|nam
   `get` expects a `<length>|b,b,...|<play head>` reply; a tap `SET`s
   `key` to the step index; the play head is polled every 200 ms.
 - **`button`**'s optional `val=` sets what's sent on press instead of
-  the default `go` (e.g. an "advance" button with `val=1`).
+  the default `go` (e.g. an "advance" button with `val=1`). `color=`
+  overrides its fill and `text_color=` its label colour (hex, no `#`) —
+  use `text_color=` whenever the fill is light, since the theme's
+  `btn_text` is light too (e.g. an inverted white primary action with
+  grey text: `color=f2f2f2 text_color=555555`).
 - **`list`** is a paged grid of engine-provided names (banks, patches):
   tapping a tile `SET`s `key` to its index; the optional A-Z row jumps
   pages; the pager bar only appears when there's more than one page.

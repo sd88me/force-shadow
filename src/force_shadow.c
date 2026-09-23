@@ -960,6 +960,11 @@ typedef struct {
      * several same-colored transport buttons) without a second theme. */
     uint32_t btn_color;
     int has_btn_color;
+    /* button only: optional label color override (`text_color=` RRGGBB),
+     * for a light fill (e.g. an inverted white primary action) where the
+     * theme's btn_text would be unreadable. */
+    uint32_t btn_text_color;
+    int has_btn_text_color;
     /* button only: >0 = draw at this exact width instead of sizing to
      * the label (0 = auto, unchanged default) -- lets a caller building
      * several buttons at once (build_launcher_tab()) give them all a
@@ -1831,6 +1836,11 @@ static void parse_shadow_page_conf(FILE *f, const char *path) {
                 page_widgets[bi].btn_color = 0xFF000000u | (uint32_t)strtoul(col, NULL, 16);
                 page_widgets[bi].has_btn_color = 1;
             }
+            const char *tcol = shadow_page_kv_get(kv, nkv, "text_color");
+            if (tcol[0]) {
+                page_widgets[bi].btn_text_color = 0xFF000000u | (uint32_t)strtoul(tcol, NULL, 16);
+                page_widgets[bi].has_btn_text_color = 1;
+            }
         } else if (strcmp(type, "readout") == 0) {
             int ri = add_readout(cx, cy, atoi(shadow_page_kv_get(kv, nkv, "w")),
                         atoi(shadow_page_kv_get(kv, nkv, "h")), label,
@@ -2434,15 +2444,16 @@ static void render_widget(uint32_t *map, uint32_t stride_px, const ui_widget_t *
             if (th.td3) bw += 24;
         }
         uint32_t bg = w->has_btn_color ? w->btn_color : (th.td3 ? th.btn_bg : UI_ACCENT);
+        uint32_t tx = w->has_btn_text_color ? w->btn_text_color : BTN_TEXT;
         if (th.td3) {
             bh = 48;
             fill_rr_land(map, stride_px, w->cx - bw/2 - 2, w->cy - bh/2 - 2, bw + 4, bh + 4, 10, PLATE_LINE);
             fill_rr_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, 8, bg);
-            draw_text_land_c(map, stride_px, w->cx, w->cy - 7, w->label, 1.5f, BTN_TEXT);
+            draw_text_land_c(map, stride_px, w->cx, w->cy - 7, w->label, 1.5f, tx);
             break;
         }
         fill_rect_land(map, stride_px, w->cx - bw/2, w->cy - bh/2, bw, bh, bg);
-        draw_text_land_c(map, stride_px, w->cx, w->cy - 5, w->label, 1.5f, BTN_TEXT);
+        draw_text_land_c(map, stride_px, w->cx, w->cy - 5, w->label, 1.5f, tx);
         break;
     }
     case W_ENUM_H:
