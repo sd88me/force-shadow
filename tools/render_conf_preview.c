@@ -233,6 +233,24 @@ static int font_glyph_index(char ch) {
         if (font_chars[i] == ch) return (int)i;
     return 0; /* space */
 }
+/* Every glyph previously advanced by a fixed (GLYPH_CELL+1) cell regardless of its actual ink
+ * width, so "i" and "M" took the same space -- a typewriter/monospace look, not the "normal
+ * typed font spacing" callers actually want (mpc-vst-plugins docs/NOTES.md, jv880 port). Advance
+ * by each glyph's real rightmost lit column instead, computed once and cached (81-cell scan is
+ * cheap, but this runs per character per draw call). Rendering itself (draw_char) is unchanged --
+ * always draws the full 9x9 box -- only the gap between characters gets tighter for narrow ones. */
+static int font_glyph_width(int idx) {
+    static int cache[128]; static char have[128];
+    if (idx >= 0 && idx < 128 && have[idx]) return cache[idx];
+    const uint8_t *g = font8x8[idx];
+    int maxcol = -1;
+    for (int row = 0; row < GLYPH_CELL; row++)
+        for (int col = 0; col < GLYPH_CELL; col++)
+            if (g[row * GLYPH_CELL + col] > 0 && col > maxcol) maxcol = col;
+    int w = maxcol < 0 ? 4 : maxcol + 2;   /* blank glyph (space): fixed narrow advance */
+    if (idx >= 0 && idx < 128) { cache[idx] = w; have[idx] = 1; }
+    return w;
+}
 /* `scale` is a float here too, mirroring force_shadow.c's own fractional-
  * scale support (2026-09-19) -- nearest-neighbor destination-pixel
  * upscale of the coverage bitmap, so a specific widget (knob label/value)
@@ -252,10 +270,18 @@ static void draw_char(int x, int y, char ch, float scale, uint32_t color) {
         }
     }
 }
-static int text_width(const char *s, float scale) { return (int)((float)strlen(s) * (GLYPH_CELL + 1) * scale - scale); }
+static int text_width(const char *s, float scale) {
+    float w = 0;
+    for (const char *p = s; *p; p++) w += (float)font_glyph_width(font_glyph_index(*p)) * scale;
+    return (int)w;
+}
 static void draw_text(int x, int y, const char *s, float scale, uint32_t color) {
     int cx = x;
-    for (const char *p = s; *p; p++) { draw_char(cx, y, *p, scale, color); cx += (int)((GLYPH_CELL + 1)*scale); }
+    for (const char *p = s; *p; p++) {
+        int idx = font_glyph_index(*p);
+        draw_char(cx, y, *p, scale, color);
+        cx += (int)((float)font_glyph_width(idx) * scale);
+    }
 }
 static void draw_text_c(int cx, int y, const char *s, float scale, uint32_t color) {
     draw_text(cx - text_width(s, scale)/2, y, s, scale, color);
@@ -293,17 +319,17 @@ static void widget_toggle(int cx, int cy, const char *label, int on) {
  * (`color=` on a `button` line) -- one button (e.g. SEARCH) can stand
  * out from the page's usual button color without a second theme. */
 static void widget_button(int cx, int cy, const char *label, uint32_t color_override) {
-    int w = text_width(label, 1.5f) + 36, h = 39;
+    int w = text_width(label, 1.15f) + 36, h = 39;   /* scale was 1.5f, see frame_box()'s comment */
     if (G_TD3) {
         w += 24; h = 48;
         uint32_t bg = color_override ? color_override : TD3_BTN_BG;
         fill_rr(cx - w/2 - 2, cy - h/2 - 2, w + 4, h + 4, 10, PLATE_LINE);
         fill_rr(cx - w/2, cy - h/2, w, h, 8, bg);
-        draw_text_c(cx, cy - 7, label, 1.5f, BTN_TEXT);
+        draw_text_c(cx, cy - 7, label, 1.15f, BTN_TEXT);
         return;
     }
     fill_rect(cx - w/2, cy - h/2, w, h, color_override ? color_override : ACCENT);
-    draw_text_c(cx, cy - 5, label, 1.5f, 0xfdf3ea);
+    draw_text_c(cx, cy - 5, label, 1.15f, 0xfdf3ea);
 }
 static void widget_enum_h(int cx, int cy, const char *label, const char **opts, int n, int active, int sw_override) {
     int seg_w = sw_override > 0 ? sw_override : 117, seg_h = 33, gap = 2;
@@ -328,10 +354,17 @@ static void widget_enum_v(int cx, int cy, const char *label, const char **opts, 
     }
 }
 static void frame_box(int x, int y, int w, int h, const char *title) {
+    /* Title scale was 1.5f: the baked font (font8x8.h) has lowercase, but at
+     * 1.5x its fixed monospace cell (10px/char * scale) read as too wide once
+     * callers moved off all-caps text -- see mpc-vst-plugins docs/NOTES.md
+     * ("No draggable/graph widgets..." entry's neighbour) for where this was
+     * first noticed (an mpc-vst-plugins skin build, which #includes this file
+     * as its production asset renderer -- force_shadow.c's own on-device
+     * renderer is a separate, hand-ported copy and is untouched by this). */
     if (G_TD3) {
         fill_rr(x, y, w, h, 10, PLATE_LINE);
         fill_rr(x + 2, y + 2, w - 4, h - 4, 9, TD3_BOX);
-        draw_text(x + 20, y + 14, title, 1.5f, ACCENT);
+        draw_text(x + 20, y + 14, title, 1.15f, ACCENT);
         fill_rect(x + 18, y + 38, w - 36, 1, INK_FAINT);
         return;
     }
@@ -340,7 +373,7 @@ static void frame_box(int x, int y, int w, int h, const char *title) {
     fill_rect(x, y, 1, h, PLATE_LINE);
     fill_rect(x+w-1, y, 1, h, PLATE_LINE);
     fill_rect(x, y+h-1, w, 1, PLATE_LINE);
-    draw_text(x + 18, y + 14, title, 1.5f, ACCENT_HI);
+    draw_text(x + 18, y + 14, title, 1.15f, ACCENT_HI);
     fill_rect(x + 18, y + 36, w - 36, 1, PLATE_LINE);
 }
 
