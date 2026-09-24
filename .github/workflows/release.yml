@@ -1,0 +1,53 @@
+# Attach the SD-card zip (scripts/package.sh) to every GitHub release.
+#
+# Publishing a release (web UI, gh, or API) builds ForceShadow-<tag>.zip from
+# that tag and uploads it as a release asset. The zip holds only AddOns/ -
+# unzip it onto the SD card root (or /media/<serial>/). GitHub still adds its
+# own "Source code" archives to every release; those can't be turned off.
+#
+# To backfill or rebuild an existing release's zip: Actions -> Release zip ->
+# Run workflow, and enter the tag.
+name: Release zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to (re)build the zip for, e.g. v1.6.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Check prebuilt binaries are armhf
+        run: |
+          for f in addon/force_shadow.so addon/forceAudioJack.so \
+                   addon/force_shadow_exitwatch addon-testtone/injectTone \
+                   addon-skipback/skipbackHost; do
+            file -b "$f" | grep -q 'ELF 32-bit LSB.*ARM' \
+              || { echo "::error::$f is not a 32-bit ARM ELF: $(file -b "$f")"; exit 1; }
+          done
+
+      - name: Build zip
+        run: scripts/package.sh "$TAG"
+
+      - name: Check zip holds only AddOns/
+        run: |
+          stray=$(python3 -c "import zipfile,sys; print('\n'.join(n for n in zipfile.ZipFile(sys.argv[1]).namelist() if not n.startswith('AddOns/')))" "dist/ForceShadow-$TAG.zip")
+          [ -z "$stray" ] || { echo "::error::unexpected entries: $stray"; exit 1; }
+
+      - name: Upload to release
+        run: gh release upload "$TAG" "dist/ForceShadow-$TAG.zip" --clobber --repo "$GITHUB_REPOSITORY"
