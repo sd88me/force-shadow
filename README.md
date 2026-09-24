@@ -212,8 +212,11 @@ you want — each one brings its own control page along with it.
 
 ## Installation
 
-1. **Download `ForceShadow-<version>.zip`** from the Releases page and
-   copy its `AddOns/` contents onto the device, replacing any previous copy:
+1. **Download `ForceShadow-<version>.zip`** from the Releases page (under
+   *Assets*; not the "Source code" archives, which are the whole repo). It
+   holds only an `AddOns/` folder, ready to drop onto the SD card root
+   (`/media/<serial>/`). Delete any previous `AddOns/ForceShadow` first, then
+   copy the new one over. You can do this with the card in a reader, or over SSH:
    ```
    ssh root@<force-ip> 'rm -rf /media/<serial>/AddOns/ForceShadow'
    scp -r AddOns/ForceShadow root@<force-ip>:/media/<serial>/AddOns/
@@ -371,6 +374,14 @@ The audio layer is cross-compiled with zig instead of Docker:
 tests run natively with `audio/tests/run.sh`. To build the release zip, run
 `scripts/package.sh v1.2.0`, which writes `dist/ForceShadow-v1.2.0.zip`.
 
+**Releasing:** commit the rebuilt binaries in `addon*/`, then publish a GitHub
+release for a new `vX.Y.Z` tag. The `Release zip` workflow
+(`.github/workflows/release.yml`) runs `scripts/package.sh` at that tag and
+attaches `ForceShadow-vX.Y.Z.zip` to the release. The zip is packed from the
+committed binaries, not rebuilt in CI, so commit the exact binaries you tested
+on-device. To rebuild or backfill an older release's zip, run the workflow by
+hand from the Actions tab and give it the tag.
+
 **Never `scp` a new `force_shadow.so` directly over a loaded one** on a
 live device — upload to a `.new` filename and `mv` it into place, so a
 currently-running MPC process keeps its old mapping cleanly until the
@@ -457,6 +468,7 @@ audio/               audio layer: forceAudioJack.so, injectTone, skipbackHost
 addon-testtone/      optional AddOns/ForceShadowTestTone (injectTone)
 addon-skipback/      optional AddOns/ForceAudioJackSkipback (skipbackHost)
 scripts/package.sh   builds the release zip into dist/
+.github/workflows/release.yml  attaches that zip to each published release
 docs/
   adding-a-page.md    practical guide: building another add-on's shadow page
 src/
