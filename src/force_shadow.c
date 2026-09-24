@@ -258,6 +258,21 @@ static uint32_t shadow_fb_id = 0;
 static volatile int shadow_ready = 0;    /* only true once setup fully succeeded */
 static volatile int shadow_on = 0;       /* live toggle state, updated by polling */
 
+/* ---- Toast notifications (any addon, e.g. Skipback) ----
+ * A brief full-screen confirmation flash, independent of the addon/page
+ * system above: any process can drop a message file at TOAST_TRIGGER_FILE
+ * and force_shadow substitutes the framebuffer with a rendered card for
+ * TOAST_MS, then hands it back automatically -- no shadow_page.conf, no
+ * addon_table slot. Deliberately left OUT of shadow_on/active_addon: a
+ * toast must not grab touch input (touch_thread_fn's grab loop keys only
+ * off shadow_on, see its own comment) and must not disturb whatever page
+ * (or no page) was already showing when it fires. poll_toast()/toast_on's
+ * definitions live further down (next to render_toast_page()), since they
+ * need logline()/shadow_redraw_needed, both declared later in the file. */
+#define TOAST_TRIGGER_FILE "/tmp/force_shadow_toast"
+#define TOAST_MS 1500
+static volatile int toast_on = 0;
+
 /* Kept mapped for the buffer's entire lifetime (process lifetime, same as
  * every other static resource here -- never explicitly torn down) so the
  * DRM commit thread can redraw on demand instead of the buffer being
@@ -2842,6 +2857,109 @@ int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioc
  * behavior if the property isn't found in a given commit or wasn't
  * resolved/created at setup (damage_clips_prop_id/damage_clips_blob_id
  * both 0 in that case, so this is simply skipped). */
+static long long toast_expire_ms = 0;
+static pthread_mutex_t toast_mu = PTHREAD_MUTEX_INITIALIZER;
+static char toast_title[64] = "";
+static char toast_file[96] = "";
+static char toast_folder[96] = "";
+static char toast_sub[64] = "";
+static time_t toast_file_seen_mtime = 0;
+
+static long long now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Called every ~50ms from refresh_thread_fn, regardless of shadow_on --
+ * a toast must fire (and expire) even while no addon page is open. Trigger
+ * file format (edge-triggered: read once, then removed): four newline-
+ * separated lines -- title, filename, folder, subtitle. Written by the
+ * triggering addon as tmpfile+rename so this never reads a half-written
+ * file mid-write. */
+static void poll_toast(void) {
+    struct stat st;
+    if (stat(TOAST_TRIGGER_FILE, &st) == 0 && st.st_mtime != toast_file_seen_mtime) {
+        toast_file_seen_mtime = st.st_mtime;
+        FILE *f = fopen(TOAST_TRIGGER_FILE, "r");
+        if (f) {
+            char l1[sizeof(toast_title)] = "", l2[sizeof(toast_file)] = "",
+                 l3[sizeof(toast_folder)] = "", l4[sizeof(toast_sub)] = "";
+            if (fgets(l1, sizeof(l1), f)) l1[strcspn(l1, "\n")] = 0;
+            if (fgets(l2, sizeof(l2), f)) l2[strcspn(l2, "\n")] = 0;
+            if (fgets(l3, sizeof(l3), f)) l3[strcspn(l3, "\n")] = 0;
+            if (fgets(l4, sizeof(l4), f)) l4[strcspn(l4, "\n")] = 0;
+            fclose(f);
+            pthread_mutex_lock(&toast_mu);
+            snprintf(toast_title, sizeof(toast_title), "%s", l1);
+            snprintf(toast_file, sizeof(toast_file), "%s", l2);
+            snprintf(toast_folder, sizeof(toast_folder), "%s", l3);
+            snprintf(toast_sub, sizeof(toast_sub), "%s", l4);
+            pthread_mutex_unlock(&toast_mu);
+            toast_on = 1;
+            toast_expire_ms = now_ms() + TOAST_MS;
+            shadow_redraw_needed = 1;
+            logline("toast: showing \"%s\" (%s)", toast_title, toast_file);
+        }
+        unlink(TOAST_TRIGGER_FILE);
+    }
+    if (toast_on && now_ms() >= toast_expire_ms) {
+        toast_on = 0;
+        logline("toast: expired, reverting");
+    }
+}
+
+/* Full-screen confirmation card for TOAST_TRIGGER_FILE (see its own
+ * comment above) -- deliberately its own render path, not a page in
+ * addon_table[], since a toast has no widgets/tabs/engine and must render
+ * the same regardless of whatever addon (if any) is otherwise active.
+ * Palette is its own too (near-black/amber), picked to read as a native
+ * MPC OS confirmation dialog rather than this project's own amber/orange
+ * "vintage synth" chassis skin used elsewhere in this file. Text tracking
+ * matches tools/gen_font_hi.py's own tight cell, not the wider historical
+ * default -- verified offline first (see tools/ mockup render) at the
+ * user's request ("can the font spacing be a bit tighter"). */
+static void render_toast_page(uint32_t *map, uint32_t stride_px) {
+    const uint32_t bg = 0xFF121316u, card_bg = 0xFF1E2024u, card_line = 0xFF33363Cu;
+    const uint32_t ink = 0xFFF2F2F0u, ink_dim = 0xFF9A9CA3u;
+    const uint32_t amber = 0xFFF2A93Bu, green_ok = 0xFF5FD068u;
+
+    char title[sizeof(toast_title)], fname[sizeof(toast_file)],
+         folder[sizeof(toast_folder)], sub[sizeof(toast_sub)];
+    pthread_mutex_lock(&toast_mu);
+    snprintf(title, sizeof(title), "%s", toast_title);
+    snprintf(fname, sizeof(fname), "%s", toast_file);
+    snprintf(folder, sizeof(folder), "%s", toast_folder);
+    snprintf(sub, sizeof(sub), "%s", toast_sub);
+    pthread_mutex_unlock(&toast_mu);
+
+    fill_rect_land(map, stride_px, 0, 0, LAND_W, LAND_H, bg);
+
+    int32_t cw = 760, ch = 360;
+    int32_t cx0 = (LAND_W - cw) / 2, cy0 = (LAND_H - ch) / 2;
+    fill_rrect_land(map, stride_px, cx0 + 4, cy0 + 8, cw, ch, 22, 0xFF000000u);
+    fill_rrect_land(map, stride_px, cx0, cy0, cw, ch, 22, card_bg);
+    fill_rect_land(map, stride_px, cx0 + 22, cy0, cw - 44, 2, card_line);
+
+    int32_t gx = cx0 + cw / 2, gy = cy0 + 86;
+    draw_ring_land(map, stride_px, gx, gy, 44, 4, amber);
+    draw_line_land(map, stride_px, gx - 20, gy + 2, gx - 6, gy + 18, 7, green_ok);
+    draw_line_land(map, stride_px, gx - 6, gy + 18, gx + 24, gy - 16, 7, green_ok);
+
+    if (title[0]) draw_text_land_c(map, stride_px, cx0 + cw / 2, gy + 64, title, 2.5f, ink);
+
+    if (fname[0]) {
+        float sc = 1.5f;
+        while (text_width_land(fname, sc) > cw - 80 && sc > 0.8f) sc -= 0.1f;
+        draw_text_land_c(map, stride_px, cx0 + cw / 2, gy + 64 + 52, fname, sc, amber);
+    }
+    if (folder[0]) draw_text_land_c(map, stride_px, cx0 + cw / 2, gy + 64 + 52 + 34, folder, 1.5f, ink_dim);
+
+    if (sub[0]) {
+        fill_rect_land(map, stride_px, cx0 + 40, cy0 + ch - 56, cw - 80, 1, card_line);
+        draw_text_land_c(map, stride_px, cx0 + cw / 2, cy0 + ch - 40, sub, 1.5f, ink_dim);
+    }
+}
+
 /* Redraws the shadow buffer if (and only if) a knob value has changed
  * since the last redraw -- skips the full-canvas repaint on the large
  * majority of commits where the screen's contents are already correct.
@@ -2850,10 +2968,27 @@ int __ioctl_time64(int fd, unsigned long request, ...) __attribute__((alias("ioc
  * yet live-tested: writing into a buffer that's actively the scanned-out
  * FB_ID, synchronously on MPC's own commit thread, is new territory for
  * this project (see DESIGN.md's "Not yet done" -- this was deliberately
- * held back from live load test #9 for exactly this reason). */
+ * held back from live load test #9 for exactly this reason).
+ *
+ * toast_on short-circuits all of the above (no addon/page snapshot, no
+ * render_shadow_page call) -- a toast is content-independent of whatever
+ * page is otherwise active. */
 static void maybe_redraw_shadow(void) {
     if (!shadow_map) return;
     if (!__atomic_exchange_n(&shadow_redraw_needed, 0, __ATOMIC_RELAXED)) return;
+
+    if (toast_on) {
+        static uint32_t *toast_back = NULL;
+        static pthread_mutex_t toast_paint_mu = PTHREAD_MUTEX_INITIALIZER;
+        size_t fb_bytes = (size_t)shadow_stride_px * SHADOW_H * 4;
+        pthread_mutex_lock(&toast_paint_mu);
+        if (!toast_back) toast_back = malloc(fb_bytes);
+        uint32_t *target = toast_back ? toast_back : shadow_map;
+        render_toast_page(target, shadow_stride_px);
+        if (toast_back) memcpy(shadow_map, toast_back, fb_bytes);
+        pthread_mutex_unlock(&toast_paint_mu);
+        return;
+    }
 
     static ui_widget_t widgets_snap[MAX_WIDGETS];
     static ui_frame_t frames_snap[MAX_FRAMES];
@@ -2924,7 +3059,7 @@ static void maybe_redraw_shadow(void) {
 }
 
 static void maybe_substitute_fb(struct drm_mode_atomic *req) {
-    if (!shadow_ready || !shadow_on) return;
+    if (!shadow_ready || !(shadow_on || toast_on)) return;
     maybe_redraw_shadow();
     if (req->count_objs == 0) return;
 
@@ -4127,6 +4262,7 @@ static void *refresh_thread_fn(void *arg) {
             int was_on = shadow_on;
             poll_toggle(0);
             if (shadow_on != was_on) logline("shadow mode toggled %s (fast poll)", shadow_on ? "ON" : "off");
+            poll_toast();
         }
         if (!shadow_on) { seen_epoch = (unsigned)-1; idle_ms = 0; continue; }
         idle_ms += 50;
@@ -4283,7 +4419,7 @@ int ioctl(int fd, unsigned long request, ...) {
             }
         }
 
-        if (shadow_ready && shadow_on && argp) {
+        if (shadow_ready && (shadow_on || toast_on) && argp) {
             maybe_substitute_fb((struct drm_mode_atomic *)argp);
         }
 
@@ -4291,7 +4427,7 @@ int ioctl(int fd, unsigned long request, ...) {
             pthread_mutex_lock(&log_mu);
             fprintf(logf, "[%ld] atomic commit #%llu seen on fd=%d (%s)\n",
                     (long)time(NULL), (unsigned long long)c, fd,
-                    (shadow_ready && shadow_on) ? "SUBSTITUTING" : "pass-through");
+                    (shadow_ready && (shadow_on || toast_on)) ? "SUBSTITUTING" : "pass-through");
             pthread_mutex_unlock(&log_mu);
         }
     }

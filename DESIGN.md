@@ -190,6 +190,53 @@ the new add-on's first tab and resets tab position to the first tab.
     running -- not just the ones the launcher's current tab happens to
     show.
 
+## Toast notifications (any add-on)
+
+Separate from the `addon_table`/`shadow_page.conf` system above: any
+process (not just an add-on with its own shadow page — e.g. Skipback,
+which has no screen UI of its own at all) can trigger a brief full-screen
+confirmation card by writing a 4-line message to `/tmp/force_shadow_toast`
+(title, filename, folder, subtitle) as tmpfile+rename. `poll_toast()`
+(called every ~50ms from `refresh_thread_fn`, independent of `shadow_on`)
+picks it up, and `render_toast_page()` draws it for `TOAST_MS` (1.5s)
+before automatically reverting.
+
+Deliberately kept outside `shadow_on`/`active_addon`: a toast must not
+grab touch input (`touch_thread_fn`'s grab loop keys only off `shadow_on`,
+so a toast never triggers it) and must not disturb whatever page — or no
+page — was already open when it fires. `maybe_substitute_fb()`'s
+substitute-or-passthrough guard is `shadow_on || toast_on`, so the two
+states layer independently: a toast can fire while an add-on's own page
+is showing (it briefly covers it, then the add-on's page reappears) or
+while nothing is showing at all.
+
+Uses its own palette (near-black/amber, not the amber/orange "vintage
+synth" chassis skin `THEME_DEFAULT` and the td3/dsp themes use elsewhere
+in this file) — the design goal was a card that reads as a native MPC OS
+confirmation dialog, not as another Force Shadow addon skin. Verified
+offline first, matching this project's own convention of never touching
+the device for a first look at a new render (see `tools/`'s own preview
+tools) — a standalone mockup using the same primitives/palette, iterated
+with the user, was rendered to PNG and reviewed before writing the real
+`render_toast_page()`.
+
+Inherits the pre-existing, not-yet-solved toggle-off unreliability noted
+under "Known limitations" below: reverting after `TOAST_MS` just stops
+substituting the framebuffer and waits for MPC's own next atomic commit
+to show its real one again, same as any other shadow-mode exit — there's
+a small chance of a visible glitch on dismiss, accepted for this feature
+rather than blocked on a real fix.
+
+The character set drawn on-screen was extended for this feature:
+`font8x8.h`/`font_hi.h` only had uppercase+digits+a few symbols before
+(`tools/gen_font_hi.py`'s `CHARS`), and skipback's real filenames use
+lowercase and underscores (`Skipback_MyProject_128bpm_....wav`). Both
+`tools/gen_font8x8.py` (new) and `tools/gen_font_hi.py` now bake
+`" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-/_>%+:"`
+— rerun both (same Docker+Pillow recipe) if `CHARS` changes again; they
+must stay in sync since `font_glyph_index()` indexes both tables by the
+same string position.
+
 ## Rendering engine
 
 - **Software rasterizer, no `libm`.** Every draw call (filled rects,

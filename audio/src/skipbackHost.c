@@ -323,6 +323,31 @@ static void mkdir_p(const char *dir)
 }
 
 /* ---- trigger handling --------------------------------------------------- */
+/* Drops a trigger file for force_shadow.c's toast notification (see its
+ * own TOAST_TRIGGER_FILE comment in src/force_shadow.c) -- a brief
+ * full-screen "Skipback Saved" confirmation naming the file and folder,
+ * shown whether or not force_shadow's own shadow-page UI is open right
+ * now. Written to a tmp path then renamed into place (same directory,
+ * so the rename is atomic) rather than written directly, so force_shadow
+ * polling every ~50ms never reads a half-written file. Best-effort: if
+ * force_shadow.so isn't loaded into MPC, nothing reads this file and it's
+ * simply overwritten/ignored next time.
+ */
+static void write_toast_trigger(const char *full_path, const char *folder,
+                                 double seconds)
+{
+    const char *fname = strrchr(full_path, '/');
+    fname = fname ? fname + 1 : full_path;
+
+    char tmp_path[64];
+    snprintf(tmp_path, sizeof(tmp_path), "/tmp/.force_shadow_toast.%d", (int)getpid());
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return;
+    fprintf(f, "Skipback Saved\n%s\n%s\n%.1f sec captured\n", fname, folder, seconds);
+    fclose(f);
+    rename(tmp_path, "/tmp/force_shadow_toast");
+}
+
 static void *save_worker(void *unused)
 {
     (void)unused;
@@ -367,10 +392,13 @@ static void *save_worker(void *unused)
     else
         snprintf(path, sizeof(path), "%s/Skipback_%s_%s.wav", g_output_dir, project, stamp);
 
-    if (write_wav(path, snap, n_frames, g_rate) == 0)
-        printf("[skipbackHost] saved %.1fs -> %s\n", (double)n_frames / g_rate, path);
-    else
+    double secs = (double)n_frames / g_rate;
+    if (write_wav(path, snap, n_frames, g_rate) == 0) {
+        printf("[skipbackHost] saved %.1fs -> %s\n", secs, path);
+        write_toast_trigger(path, g_output_dir, secs);
+    } else {
         fprintf(stderr, "[skipbackHost] failed to write %s\n", path);
+    }
 
     free(snap);
     return NULL;

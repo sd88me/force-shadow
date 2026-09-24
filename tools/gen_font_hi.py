@@ -10,7 +10,8 @@ Each glyph sits in an advance cell of (int)(6.8*scale+.5) x (int)(9*scale+.5) px
 """
 from PIL import Image, ImageDraw, ImageFont
 
-CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-/>%+:"   # == font_chars in font8x8.h
+CHARS = (" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+         "0123456789.-/_>%+:")   # == font_chars in font8x8.h / tools/gen_font8x8.py
 SCALES = [1.0, 1.5, 2.0, 2.5, 3.0]
 FONT = "/fonts/DejaVuSansMono-Bold.ttf"
 CAP = 0.729  # DejaVu cap height / em
