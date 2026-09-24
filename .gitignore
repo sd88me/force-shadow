@@ -12,3 +12,5 @@ tools/render_conf_preview
 tools/preview*.ppm
 tools/preview*.png
 tools/seq_watch
+# build output; the shipped copy is addon/force_shadow.so
+src/force_shadow.so
