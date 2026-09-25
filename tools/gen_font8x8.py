@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Keep in sync with tools/gen_font_hi.py's CHARS -- font_glyph_index() in
 # force_shadow.c indexes both tables by the same position in this string.
 CHARS = (" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-         "0123456789.-/_>%+:")
+         "0123456789.-/_>%+:#")
 FONT = "/fonts/DejaVuSansMono-Bold.ttf"
 CELL = 9
 SUPER = 8  # supersample factor before Lanczos downsample to CELL x CELL
